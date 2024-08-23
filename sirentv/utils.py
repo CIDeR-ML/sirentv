@@ -1,11 +1,12 @@
-import torch
-import torch.nn.functional as F
-import torch.nn as nn
-import os
-from functools import partial
 import glob
 import importlib
+import os
 from abc import ABC, abstractmethod
+from functools import partial
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 wandb = None
 import matplotlib.pyplot as plt
@@ -14,36 +15,34 @@ import numpy as np
 try:
     from fast_histogram import histogram1d
 except ImportError:
-    print('fast_histogram not installed, using numpy')
-    histogram1d = lambda *args,**kwargs: np.histogram(*args,**kwargs)[0]
-    
-    
-    
+    print("fast_histogram not installed, using numpy")
+    histogram1d = lambda *args, **kwargs: np.histogram(*args, **kwargs)[0]
+
+
 def hist(a, bins=None, **kwargs):
     log = False
-    if bins[1]-bins[0] != bins[2]-bins[1]:
+    if bins[1] - bins[0] != bins[2] - bins[1]:
         log = True
-        
-    data = np.log10(a+a[a!=0].min()/10) if log else a
-        
-    range = [bins.min(),bins.max()]
+
+    data = np.log10(a + a[a != 0].min() / 10) if log else a
+
+    range = [bins.min(), bins.max()]
     if log:
         range = list(map(np.log10, range))
-    bins  = len(bins)
-    
+    bins = len(bins)
+
     counts = histogram1d(data, bins=bins, range=range).astype(float)
-    edges = np.linspace(*range, bins+1)
-    
-    if kwargs.pop('density', False):
+    edges = np.linspace(*range, bins + 1)
+
+    if kwargs.pop("density", False):
         counts /= np.diff(edges) * counts.sum()
 
     if log:
         edges = 10**edges
-    centers = (edges[1:]+edges[:-1])/2
-        
-    plt.gca().plot(centers, counts, drawstyle='steps-mid', **kwargs)
-        
-    
+    centers = (edges[1:] + edges[:-1]) / 2
+
+    plt.gca().plot(centers, counts, drawstyle="steps-mid", **kwargs)
+
 
 class WeightedL2Loss(nn.Module):
     """
@@ -58,6 +57,7 @@ class WeightedL2Loss(nn.Module):
         loss = weight * (pred - target) ** 2
         return self.reduce(loss)
 
+
 class L2Loss(nn.Module):
     """
     A simple loss module that implements a regular MSE loss
@@ -71,7 +71,7 @@ class L2Loss(nn.Module):
         loss = (pred - target) ** 2
         return self.reduce(loss)
 
-    
+
 class WeightedCosineDissimilarity(nn.Module):
     """
     A simple loss module that implements a weighted cosine dissimilarity loss
@@ -83,27 +83,29 @@ class WeightedCosineDissimilarity(nn.Module):
     def __init__(self, reduce_method=torch.mean):
         super().__init__()
         self.reduce = reduce_method
-    
+
     def forward(self, pred, target, weight=1.0):
         pred_norm = F.normalize(pred, p=2, dim=-1)
         target_norm = F.normalize(target, p=2, dim=-1)
         # normalize_weights = F.normalize(weight, p=2, dim=-1) if hasattr(weight, 'norm') else weight
         loss = (weight * (1 - (pred_norm * target_norm))).mean(dim=-1)
         return self.reduce(loss)
-    
+
 
 class LNRegularization(nn.Module):
     def __init__(self, weight_decay, p=2):
         super().__init__()
         self.weight_decay = weight_decay
         self.p = p
-    
+
     def forward(self, net):
         return self.weight_decay * torch.norm(net.parameters(), p=self.p)
+
 
 class L2Regularization(LNRegularization):
     def __init__(self, weight_decay):
         super().__init__(weight_decay, p=2)
+
 
 class L1Regularization(LNRegularization):
     def __init__(self, weight_decay):
@@ -113,10 +115,10 @@ class L1Regularization(LNRegularization):
 class UncertainMSE(nn.Module):
     def __init__(self):
         super().__init__()
-    
+
     def forward(self, pred, target, weights, log_sigma):
         sigma = torch.exp(log_sigma)
-        loss = torch.mean(weights * (((target - pred) ** 2) / (sigma ** 2) + log_sigma))
+        loss = torch.mean(weights * (((target - pred) ** 2) / (sigma**2) + log_sigma))
         return loss
 
 
@@ -136,8 +138,6 @@ class Logger(ABC):
     @abstractmethod
     def write(self):
         pass
-
-
 
 
 class WandbLogger(Logger):
@@ -273,7 +273,7 @@ class WandbLogger(Logger):
         os.makedirs(logdir)
 
         return logdir
-    
+
     def watch_grad(self, net):
         wandb.watch(net, log="all", log_freq=100)
 
@@ -424,4 +424,3 @@ class CSVLogger(Logger):
         """
         if self._str is not None:
             self._fout.close()
-

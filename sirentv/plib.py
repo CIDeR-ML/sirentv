@@ -4,9 +4,7 @@ from photonlib.meta import VoxelMeta
 import h5py
 
 class TVPhotonLib:
-    def __init__(self, meta: VoxelMeta, vis: torch.Tensor, eff: float = 1.0,
-                 vis_slice =slice(None, 48),
-                 time_slice=slice(48, None)):
+    def __init__(self, meta: VoxelMeta, vis: torch.Tensor, eff: float = 1.0):
         """
         Constructor
 
@@ -64,7 +62,7 @@ class TVPhotonLib:
     def to(self, device=None):
         if device is None or self.device == torch.device(device):
             return self
-        return TPhotonLib(self.meta, self.vis.to(device), self.eff.to(device))
+        return TVPhotonLib(self.meta, self.vis.to(device), self.eff.to(device))
 
     def visibility(self, x):
         """
