@@ -280,79 +280,32 @@ class BatchedLightSimulation(nn.Module):
         downsample = waveform.view(ninput, ndet, ntick_down, ns_per_tick).sum(dim=3)
         return downsample
 
-    def forward(self, timing_dist, differentiable=True, fused=False):
+    def forward(self, timing_dist, differentiable=True):
+        reshaped = False
         if timing_dist.ndim == 1:  # ndet=1, ninput=1; (ntick) -> (1, 1, ntick)
             timing_dist = timing_dist[None, None, :]
+            reshaped = True
         elif timing_dist.ndim == 2:  # ndet>1, ninput=1; (ndet, ntick) -> (1, ndet, ntick)
             timing_dist = timing_dist[None, :, :]
-        ninput, ndet, ntick = timing_dist.shape
-
-        if fused:
-            return self.fused_forward(timing_dist, differentiable)
+            reshaped = True
 
         x = self.fft_conv(timing_dist, partial(self.scintillation_model, relax_cut=differentiable))
         x = self.fft_conv(x, partial(self.sipm_response_model, relax_cut=differentiable))
         x = self.light_gain * x
         x = self.downsample_waveform(x)
 
-        if ninput == ndet == 1:
-            return x[0, 0, :]
-        elif ninput == 1:
-            return x[0, :, :]
+        if reshaped:
+            return x.squeeze(0).squeeze(0)
 
         return x
 
-    def fused_forward(self, timing_dist, differentiable=True):
-        if timing_dist.ndim == 1: # ndet=1, ninput=1
-            timing_dist = timing_dist.unsqueeze(0).unsqueeze(0)
-        elif timing_dist.ndim == 2: # ndet>1, ninput=1
-            timing_dist = timing_dist.unsqueeze(0)
-
-        ninput, ndet, ntick = timing_dist.shape
-        pad_size = self.conv_ticks - 1
-        padded_input = F.pad(timing_dist, (0, pad_size))
-
-        # Compute both kernels and their FFTs separately
-        scintillation_kernel = self.scintillation_model(self.time_ticks, relax_cut=differentiable)
-        sipm_kernel = self.sipm_response_model(self.time_ticks, relax_cut=differentiable)
-
-        scintillation_fft = torch.fft.rfft(scintillation_kernel, n=ntick + pad_size)
-        sipm_fft = torch.fft.rfft(sipm_kernel, n=ntick + pad_size)
-
-        # Combine kernel FFTs through multiplication
-        combined_kernel_fft = scintillation_fft * sipm_fft
-
-        # Reshape for batched FFT convolution
-        padded_input = padded_input.reshape(ninput * ndet, ntick + pad_size)
-
-        # Perform FFT convolution
-        input_fft = torch.fft.rfft(padded_input)
-        output_fft = input_fft * combined_kernel_fft.unsqueeze(0)
-        output = torch.fft.irfft(output_fft, n=ntick + pad_size)
-
-        # Reshape and trim the result to match the input shape
-        output = output.reshape(ninput, ndet, -1)[:, :, :ntick]
-
-        # Apply light gain to the output
-        output *= self.light_gain
-
-        # Downsample the waveform
-        output = self.downsample_waveform(output)
-
-        if ninput == ndet == 1:
-            return output[0,0,:]
-        elif ninput == 1:
-            return output[0,:,:]
-        else:
-            return output
-
 class TimingDistributionSampler:
-    def __init__(self, cdf, output_shape):
+    def __init__(self, cdf: np.ndarray, output_shape: tuple):
         super().__init__()
         self.cdf = cdf
         self.output_shape = tuple(output_shape)
 
-    def __call__(self, num_photon):
+    def __call__(self, num_photon: int):
         u = torch.rand(num_photon)
         sampled_idx = torch.searchsorted(torch.tensor(self.cdf), u)
 
@@ -368,7 +321,7 @@ class TimingDistributionSampler:
         )
         return output
     
-    def batch_sample(self, nphoton, nbatch):
+    def batch_sample(self, nphoton: int, nbatch: int) -> torch.Tensor:
         return torch.stack([self(nphoton) for _ in range(nbatch)])
 
 
