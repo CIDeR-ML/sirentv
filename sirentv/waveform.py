@@ -34,9 +34,8 @@ class Config(Dict[str, T]):
         self[name] = value
 
 class BatchedLightSimulation(nn.Module):
-    def __init__(self, ndet=48, cfg=light, verbose=False):
+    def __init__(self, cfg=light, verbose=False):
         super().__init__()
-        self.ndet = ndet
 
         if isinstance(cfg, str):
             cfg = yaml.safe_load(open(cfg,'r').read())
@@ -46,37 +45,36 @@ class BatchedLightSimulation(nn.Module):
         self.cfg = cfg
 
         # Load in and transform parameters
-        singlet_logit = np.log(cfg.SINGLET_FRACTION / (1 - cfg.SINGLET_FRACTION))
-        self.nominal_singlet_fraction_logit = np.log(cfg.NOMINAL_SINGLET_FRACTION / (1 - cfg.NOMINAL_SINGLET_FRACTION))
-        log_tau_s = np.log10(cfg.TAU_S)
-        self.nominal_log_tau_s = np.log10(cfg.NOMINAL_TAU_S)
-        log_tau_t = np.log10(cfg.TAU_T)
-        self.nominal_log_tau_t = np.log10(cfg.NOMINAL_TAU_T)
-        log_light_oscillation_period = np.log10(cfg.LIGHT_OSCILLATION_PERIOD)
-        self.nominal_log_light_oscillation_period = np.log10(cfg.NOMINAL_LIGHT_OSCILLATION_PERIOD)
-        log_light_response_time = np.log10(cfg.LIGHT_RESPONSE_TIME)
-        self.nominal_log_light_response_time = np.log10(cfg.NOMINAL_LIGHT_RESPONSE_TIME)
-        light_gain = cfg.LIGHT_GAIN
-        self.nominal_light_gain = cfg.NOMINAL_LIGHT_GAIN
+        def logit(x):
+            return np.log(x / (1 - x))
 
-        # Set up parameters
-        self.singlet_fraction_logit = nn.Parameter(
-            torch.tensor(
-                singlet_logit / self.nominal_singlet_fraction_logit, dtype=torch.float32
-            )
-        )
-        self.log_tau_s = nn.Parameter(torch.tensor(log_tau_s / self.nominal_log_tau_s, dtype=torch.float32))
-        self.log_tau_t = nn.Parameter(torch.tensor(log_tau_t / self.nominal_log_tau_t, dtype=torch.float32))
-        self.log_light_oscillation_period = nn.Parameter(
-            torch.tensor(log_light_oscillation_period / self.nominal_log_light_oscillation_period, dtype=torch.float32)
-        )
-        self.log_light_response_time = nn.Parameter(
-            torch.tensor(log_light_response_time / self.nominal_log_light_response_time, dtype=torch.float32)
-        )
+        def create_parameter(value, nominal):
+            return nn.Parameter(torch.tensor(value / nominal, dtype=torch.float32))
 
-        self.light_gain = nn.Parameter(
-            torch.tensor(light_gain / self.nominal_light_gain, dtype=torch.float32)
-        )
+        # Calculate and store nominal values
+        self.nominal_values = {
+            'singlet_fraction_logit': logit(cfg.NOMINAL_SINGLET_FRACTION),
+            'log_tau_s': np.log10(cfg.NOMINAL_TAU_S),
+            'log_tau_t': np.log10(cfg.NOMINAL_TAU_T),
+            'log_light_oscillation_period': np.log10(cfg.NOMINAL_LIGHT_OSCILLATION_PERIOD),
+            'log_light_response_time': np.log10(cfg.NOMINAL_LIGHT_RESPONSE_TIME),
+            'light_gain': cfg.NOMINAL_LIGHT_GAIN
+        }
+
+        # Calculate current values
+        current_values = {
+            'singlet_fraction_logit': logit(cfg.SINGLET_FRACTION),
+            'log_tau_s': np.log10(cfg.TAU_S),
+            'log_tau_t': np.log10(cfg.TAU_T),
+            'log_light_oscillation_period': np.log10(cfg.LIGHT_OSCILLATION_PERIOD),
+            'log_light_response_time': np.log10(cfg.LIGHT_RESPONSE_TIME),
+            'light_gain': cfg.LIGHT_GAIN
+        }
+
+        # Create parameters
+        for name in self.nominal_values.keys():
+            setattr(self, name, create_parameter(current_values[name], self.nominal_values[name]))
+            setattr(self, 'nominal_' + name, self.nominal_values[name])
 
         # Constants
         self.light_tick_size = light.LIGHT_TICK_SIZE
@@ -283,15 +281,28 @@ class BatchedLightSimulation(nn.Module):
         return downsample
 
     def forward(self, timing_dist, differentiable=True, fused=False):
+        if timing_dist.ndim == 1:  # ndet=1, ninput=1; (ntick) -> (1, 1, ntick)
+            timing_dist = timing_dist[None, None, :]
+        elif timing_dist.ndim == 2:  # ndet>1, ninput=1; (ndet, ntick) -> (1, ndet, ntick)
+            timing_dist = timing_dist[None, :, :]
+        ninput, ndet, ntick = timing_dist.shape
+
         if fused:
             return self.fused_forward(timing_dist, differentiable)
 
         x = self.fft_conv(timing_dist, partial(self.scintillation_model, relax_cut=differentiable))
-        x = self.light_gain * self.fft_conv(x, partial(self.sipm_response_model, relax_cut=differentiable))
+        x = self.fft_conv(x, partial(self.sipm_response_model, relax_cut=differentiable))
+        x = self.light_gain * x
         x = self.downsample_waveform(x)
-        return x
+
+        return x.squeeze(0) if ninput == 1 else x
 
     def fused_forward(self, timing_dist, differentiable=True):
+        if timing_dist.ndim == 1: # ndet=1, ninput=1
+            timing_dist = timing_dist.unsqueeze(0).unsqueeze(0)
+        elif timing_dist.ndim == 2: # ndet>1, ninput=1
+            timing_dist = timing_dist.unsqueeze(0)
+
         ninput, ndet, ntick = timing_dist.shape
         pad_size = self.conv_ticks - 1
         padded_input = F.pad(timing_dist, (0, pad_size))
@@ -323,7 +334,7 @@ class BatchedLightSimulation(nn.Module):
         # Downsample the waveform
         output = self.downsample_waveform(output)
 
-        return output
+        return output.squeeze(0) if ninput == 1 else output
 
     
 
