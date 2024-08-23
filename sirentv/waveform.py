@@ -38,8 +38,9 @@ class BatchedLightSimulation(nn.Module):
         super().__init__()
 
         if isinstance(cfg, str):
-            cfg = yaml.safe_load(open(cfg,'r').read())
-            print(cfg)
+            cfg_txt = open(cfg,'r').readlines()
+            print("BatchedLightSimulation Config:\n\t%s" % '\t'.join(cfg_txt))
+            cfg = yaml.safe_load(''.join(cfg_txt))
             cfg = Config(**cfg)
 
         self.cfg = cfg
