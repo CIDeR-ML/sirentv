@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import yaml
 import os
-from larndsim.const import light
+from larndsim.consts import light
 
 
 def print_grad(name):
@@ -34,7 +34,7 @@ class Config(Dict[str, T]):
         self[name] = value
 
 class BatchedLightSimulation(nn.Module):
-    def __init__(self, cfg=light, verbose=False):
+    def __init__(self, cfg=os.path.join(os.path.dirname(__file__), "../templates/waveform_sim.yaml"), verbose=False):
         super().__init__()
 
         if isinstance(cfg, str):
@@ -295,7 +295,12 @@ class BatchedLightSimulation(nn.Module):
         x = self.light_gain * x
         x = self.downsample_waveform(x)
 
-        return x.squeeze(0) if ninput == 1 else x
+        if ninput == ndet == 1:
+            return x[0, 0, :]
+        elif ninput == 1:
+            return x[0, :, :]
+
+        return x
 
     def fused_forward(self, timing_dist, differentiable=True):
         if timing_dist.ndim == 1: # ndet=1, ninput=1
@@ -334,9 +339,12 @@ class BatchedLightSimulation(nn.Module):
         # Downsample the waveform
         output = self.downsample_waveform(output)
 
-        return output.squeeze(0) if ninput == 1 else output
-
-    
+        if ninput == ndet == 1:
+            return output[0,0,:]
+        elif ninput == 1:
+            return output[0,:,:]
+        else:
+            return output
 
 class TimingDistributionSampler:
     def __init__(self, cdf, output_shape):
