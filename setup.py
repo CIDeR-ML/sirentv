@@ -10,7 +10,6 @@ setup(
         "pyyaml",
         "tqdm",
         "wandb",
-        "larndsim",
     ],
     entry_points={
         "console_scripts": [
