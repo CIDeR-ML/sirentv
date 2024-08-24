@@ -11,3 +11,6 @@ NOMINAL_LIGHT_RESPONSE_TIME: 0.055         # us^-1
 NOMINAL_TAU_S: 0.001                       # us
 NOMINAL_TAU_T: 1.530                       # us
 NOMINAL_LIGHT_GAIN: -45.0                  # ADC us/pe
+
+LIGHT_TICK_SIZE: 0.001
+LIGHT_WINDOW: [1, 10]

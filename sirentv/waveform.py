@@ -8,8 +8,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import yaml
 import os
-from larndsim.consts import light
-
 
 def print_grad(name):
     def hook(grad):
@@ -78,8 +76,8 @@ class BatchedLightSimulation(nn.Module):
             setattr(self, 'nominal_' + name, self.nominal_values[name])
 
         # Constants
-        self.light_tick_size = light.LIGHT_TICK_SIZE
-        self.light_window = [1, 100]
+        self.light_tick_size = cfg.LIGHT_TICK_SIZE
+        self.light_window = cfg.LIGHT_WINDOW
 
         self.conv_ticks = math.ceil(
             (self.light_window[1] - self.light_window[0]) / self.light_tick_size
