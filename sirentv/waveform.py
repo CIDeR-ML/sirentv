@@ -34,7 +34,7 @@ class Config(Dict[str, T]):
         self[name] = value
 
 class BatchedLightSimulation(nn.Module):
-    def __init__(self, cfg=os.path.join(os.path.dirname(__file__), "../templates/waveform_sim.yaml"), verbose=False):
+    def __init__(self, cfg: str = os.path.join(os.path.dirname(__file__), "../templates/waveform_sim.yaml"), verbose: bool =False):
         super().__init__()
 
         if isinstance(cfg, str):
@@ -109,7 +109,7 @@ class BatchedLightSimulation(nn.Module):
         for name, p in self.named_parameters():
             p.register_hook(print_grad(name))
 
-    def scintillation_model(self, time_tick, relax_cut=True) -> torch.Tensor:
+    def scintillation_model(self, time_tick: torch.Tensor, relax_cut: bool=True) -> torch.Tensor:
         """
         Calculates the fraction of scintillation photons emitted
         during time interval `time_tick` to `time_tick + 1`
@@ -264,7 +264,7 @@ class BatchedLightSimulation(nn.Module):
 
         return output
 
-    def downsample_waveform(self, waveform, ns_per_tick=16):
+    def downsample_waveform(self, waveform: torch.Tensor, ns_per_tick: int = 16) -> torch.Tensor:
         """
         Downsample the input waveform by summing over groups of ticks.
         This effectively compresses the waveform in the time dimension while preserving the total signal.
@@ -281,7 +281,7 @@ class BatchedLightSimulation(nn.Module):
         downsample = waveform.view(ninput, ndet, ntick_down, ns_per_tick).sum(dim=3)
         return downsample
 
-    def forward(self, timing_dist, differentiable=True):
+    def forward(self, timing_dist: torch.Tensor, relax_cut: bool=True):
         reshaped = False
         if timing_dist.ndim == 1:  # ndet=1, ninput=1; (ntick) -> (1, 1, ntick)
             timing_dist = timing_dist[None, None, :]
@@ -290,9 +290,11 @@ class BatchedLightSimulation(nn.Module):
             timing_dist = timing_dist[None, :, :]
             reshaped = True
 
-        x = self.fft_conv(timing_dist, partial(self.scintillation_model, relax_cut=differentiable))
-        x = self.fft_conv(x, partial(self.sipm_response_model, relax_cut=differentiable))
-        x = self.light_gain * x
+        x = self.fft_conv(
+            timing_dist, partial(self.scintillation_model, relax_cut=relax_cut)
+        )
+        x = self.fft_conv(x, partial(self.sipm_response_model, relax_cut=relax_cut))
+        x = self.light_gain * self.nominal_light_gain * x
         x = self.downsample_waveform(x)
 
         if reshaped:
@@ -304,13 +306,13 @@ class TimingDistributionSampler:
     def __init__(self, cdf: np.ndarray, output_shape: tuple):
         super().__init__()
         self.cdf = cdf
-        self.output_shape = tuple(output_shape)
+        self.shape = tuple(output_shape)
 
     def __call__(self, num_photon: int):
         u = torch.rand(num_photon)
         sampled_idx = torch.searchsorted(torch.tensor(self.cdf), u)
 
-        output = torch.zeros(self.output_shape)
+        output = torch.zeros(self.shape)
         unique_idx, counts = torch.unique(sampled_idx, return_counts=True)
         output.view(-1)[unique_idx] = counts.float()
 
