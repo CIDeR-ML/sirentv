@@ -3,6 +3,7 @@ from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
 from slar.transform import partial_xform_vis
 from .plib import TVPhotonLib
+from photonlib.photonlib import PhotonLib
 
 class PLibDataLoader:
     '''
@@ -27,11 +28,13 @@ class PLibDataLoader:
         ```
 		photonlib:
 			filepath: plib_file.h5
+			[optional]lazyload: True
 
 		data:
 			dataset:
 				weight:
 					method: vis
+					n_photon: 200000
 					factor: 1000000.0
 					threshold: 1.0e-08
 			loader:
@@ -63,7 +66,12 @@ class PLibDataLoader:
         '''
 
         # load plib to device
-        self._plib = TVPhotonLib.load(cfg).to(device)
+        self._lazy_load = cfg['photonlib'].get('lazyload',False)
+
+        if not self._lazy_load:
+            self._plib = TVPhotonLib.load(cfg).to(device)
+        else:
+            self._plib = PhotonLib.load(cfg, self._lazy_load).to(device)
         
         # get weighting scheme
         weight_cfg = cfg.get('data',{}).get('dataset',{}).get('weight', {})
@@ -81,9 +89,17 @@ class PLibDataLoader:
                 self.get_weight = lambda vis : torch.tensor(1., device=device)
                 # raise NotImplementedError(f'Weight method {method} is invalid')
             self._weight_cfg = weight_cfg
+
+            self._n_photon = weight_cfg.get('n_photon', None)
+            assert self._n_photon is not None, "Key n_photon is missing from the config file! Double check the input."
+
         else:
             print('[PLibDataLoader] weight = 1')
             self.get_weight = lambda vis : torch.tensor(1., device=device)
+
+        model_cfg = cfg.get('model')
+        self._n_pmt = model_cfg['network'].get('out_features')[0]
+        assert self._n_pmt > 0, "out_features of the model doesn't agree with the actual n_pmt config"
 
         # tranform visiblity in pseudo-log scale (default: False)
         xform_params = cfg.get('transform_vis')
@@ -110,10 +126,16 @@ class PLibDataLoader:
         pos = meta.norm_coord(meta.voxel_to_coord(vox_ids))
 
         vis = self._plib.vis
-        w = self.get_weight(vis)
-        target = self.xform_vis(vis)
-
-        self._cache = dict(position=pos, value=vis, weight=w, target=target)
+        if not self._lazy_load:
+            vis /= self._n_photon
+            w = self.get_weight(vis)
+            vis_adapt = torch.cat([vis.view(vis.shape[0], self._n_pmt, -1).sum(-1), vis.view(vis.shape[0], -1)], dim=1)
+            target = self.xform_vis(vis_adapt)
+        else:
+            vis_adapt = vis
+            w = None
+            target = None
+        self._cache = dict(position=pos, value=vis_adapt, weight=w, target=target)
 
     @property
     def device(self):
@@ -187,14 +209,35 @@ class PLibDataLoader:
                 # vis = self._plib[vox_ids]
                 # w = self.get_weight(vis)
                 # target = self.xform_vis(vis)
-                output = dict(
-                    position=self._cache["position"][vox_ids],
-                    value=self._cache["value"][vox_ids],
-                    weight=self._cache["weight"][vox_ids],
-                    target=self._cache["target"][vox_ids],
-                )
+                if not self._lazy_load:
+                    output = dict(
+                        position=self._cache["position"][vox_ids],
+                        value=self._cache["value"][vox_ids],
+                        weight=self._cache["weight"][vox_ids],
+                        target=self._cache["target"][vox_ids],
+                    )
+                else:
+                    vis = self._cache["value"][vox_ids]/self._n_photon
+                    vis_adapt = torch.cat([vis.view(vis.shape[0], self._n_pmt, -1).sum(-1), vis.view(vis.shape[0], -1)], dim=1)
+                    output = dict(
+                        position=self._cache["position"][vox_ids],
+                        value=vis_adapt,
+                        weight=self.get_weight(vis_adapt),
+                        target=self.xform_vis(vis_adapt),
+                    )
 
                 # output = dict(position=pos, value=vis, weight=w, target=target)
                 yield output
         else:
-            yield self._cache
+            if not self._lazy_load:
+                yield self._cache
+            else:
+                out_vis = self._cache["value"]/self._n_photon
+                vis_adapt = torch.cat([out_vis.view(vis.shape[0], self._n_pmt, -1).sum(-1), out_vis.view(out_vis.shape[0], -1)], dim=1)
+                output = dict(
+                    position=self._cache["position"],
+                    value=vis_adapt,
+                    weight=self.get_weight(out_vis),
+                    target=self.xform_vis(out_vis)
+                )
+                yield output

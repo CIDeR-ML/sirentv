@@ -10,7 +10,7 @@ from slar.utils import CSVLogger, get_device
 
 from .io import PLibDataLoader
 from .analysis import get_pred_target, log_pred_target
-from .sirentv import SirenTV
+from .core import SirenTV
 from .utils import CSVLogger, WandbLogger
 from . import utils
 
@@ -80,6 +80,8 @@ def train(cfg: str = None):
         cfg = yaml.safe_load(
             open(os.path.join(os.path.dirname(__file__), "../templates/bvis-4848.yaml"))
         )
+    else:
+        cfg = yaml.safe_load(open(cfg))
 
     # Initialize wandb
     wandb.init()
@@ -173,10 +175,10 @@ def train(cfg: str = None):
             iteration_ctr += 1
 
             # Input data prep
-            x = data["position"].contiguous()  # .to(DEVICE)
-            weights = data["weight"].contiguous().squeeze()  # .to(DEVICE)
-            target = data["target"].contiguous().squeeze()  # .to(DEVICE)
-            target_linear = data["value"].contiguous().squeeze()  # .to(DEVICE)
+            x = data["position"].contiguous().to(DEVICE)
+            weights = data["weight"].contiguous().squeeze().to(DEVICE)
+            target = data["target"].contiguous().squeeze().to(DEVICE)
+            target_linear = data["value"].contiguous().squeeze().to(DEVICE)
 
             twait = time.time() - twait
             # Running the model, compute the loss, back-prop gradients to optimize.
