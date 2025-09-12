@@ -210,14 +210,15 @@ class SirenTV(BranchedSiren):
         self._meta.update(ranges)
 
     def visibility(self, x):
-        device = x.device
+        #device = x.device
         x = x.to(self.device)
         pos = x.unsqueeze(0) if x.dim() == 1 else x
         vis = torch.zeros(
             pos.shape[0], self.n_outs, dtype=torch.float32, device=self.device
         )
         mask = self.meta.contain(pos)
-        vis[mask] = self(self.meta.norm_coord(pos[mask]).to(self.device)).to(device)
+        #vis[mask] = self(self.meta.norm_coord(pos[mask]).to(self.device)).to(device)
+        vis[mask] = self.meta.norm_coord(pos[mask]).to(self.device)
         vis[mask] = self._inv_xform_vis(vis[mask])
         return vis.squeeze() if x.dim() == 1 else vis
 

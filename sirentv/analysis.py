@@ -5,23 +5,18 @@ from matplotlib.colors import LogNorm
 import wandb
 import torch
 
-def get_pred_target(dataloader, net):
-    cache = dataloader._cache
-    n_voxels = len(dataloader._plib)
-    vox_ids = torch.arange(n_voxels, device=dataloader._plib.device)
-    positions = dataloader._plib.meta.voxel_to_coord(vox_ids)
+def get_pred_target(batch, net):
+    target = batch['value'].squeeze().detach().cpu()
+    #n_voxels = len(dataloader._plib)
+    #vox_ids = torch.arange(n_voxels, device=dataloader._plib.device)
+    positions = batch['position'].to(net.device)
 
-    batch_size = 2048
-    pred = []
-    curr_idx = 0
-    for i in range(len(positions) // batch_size):
-        curr_idx = i * batch_size
-        out_vis = net.visibility(positions[curr_idx : curr_idx + batch_size])
-        pred.append(out_vis.detach().cpu())
-    pred = torch.cat(pred).unsqueeze(-1)
-    target = cache["value"].squeeze().detach().cpu()
+    #batch_size = 2048
+    #pred = []
+    #curr_idx = 0
+    #for i in range(len(positions)):
+    pred = net.visibility(positions).detach().cpu()
     return pred, target
-
 
 def log_pred_target(pred, target, name="pred_vs_target"):
     # get bounds
