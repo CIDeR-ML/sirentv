@@ -208,13 +208,10 @@ class PLibDataLoader:
 
         t_shift = (tof/0.1).unsqueeze(-1).long().to(vis.device) # hardcoded 100ps per bin for 100ns window
         vis_shifted = torch.zeros_like(vis)
-        # Vectorized approach using advanced indexing
-        # Create source indices for each position in the output
-        source_t_idx = t_idx + t_shift  # Add shift to get source positions [V, N, T]
-        # Create mask for valid source positions
-        valid_mask = (source_t_idx < T)  # Source must be within original tensor bounds
 
-        # Create coordinate tensors for advanced indexing
+        source_t_idx = t_idx + t_shift  
+        valid_mask = (source_t_idx>=0)&(source_t_idx < T)  # Source must be within original tensor bounds
+
         v_coords = torch.arange(V, device=vis.device).view(V, 1, 1).expand(V, N, T)
         n_coords = torch.arange(N, device=vis.device).view(1, N, 1).expand(V, N, T)
 
