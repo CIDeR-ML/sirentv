@@ -1,6 +1,5 @@
 photonlib:
     filepath: /sdf/home/y/youngsam/sw/dune/siren-t/data/plib_2x2_module0_06052024_4848.h5
-    lazyload: True
 device: 
     type: 'cuda:1'    
 model:
