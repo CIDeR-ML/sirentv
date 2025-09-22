@@ -4,6 +4,7 @@ photonlib:
 device: 
     type: 'cuda:1'    
 model:
+  ckpt_file: null
   network:
     type: BranchedSiren # or ConditionalSiren
     in_features: 3

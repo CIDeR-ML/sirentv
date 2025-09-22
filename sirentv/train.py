@@ -271,8 +271,9 @@ def train(cfg: dict):
     # logging after training.
     logger.write()
     pred, target = get_pred_target(dl, net)
-    log_pred_target(pred[:,48:], target[:,48:], name="timing_comparison")
-    log_pred_target(pred[:,:48], target[:,:48], name="visibility_comparison")
+    feature_ctr = 0
+    for idx, features in enumerate(net.out_features):
+        log_pred_target(pred[:,feature_ctr:feature_ctr+features], target[:,feature_ctr:feature_ctr+features], name=f"comparison_{idx}")
 
     if hasattr(net, "log_sigmas"):
         log_line(torch.exp(net.log_sigmas[0]).detach().cpu().numpy(), name=f"log_sigma_999")
