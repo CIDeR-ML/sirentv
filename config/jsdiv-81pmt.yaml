@@ -4,7 +4,7 @@ photonlib:
 device: 
     type: 'cuda:1'    
 model:
-    network:
+  network:
     type: BranchedSiren # or ConditionalSiren
     in_features: 3
     hidden_features: [4096, 256, 2048]
