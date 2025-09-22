@@ -1,0 +1,85 @@
+device:
+  type: cuda:0
+data:
+  dataset:
+    weight:
+      factor: [1000000, 5000]
+    idx_slices:
+      - [null, 48]
+      - [48, null]
+    method: bivis
+    threshold:
+      - 1.0e-08
+      - 1.0e-08
+  loader:
+    batch_size: 4096
+    drop_last: true
+    num_workers: 4
+    pin_memory: true
+    shuffle: true
+logger:
+  analysis:
+    time_bias:
+      idx_slice: [48, null]
+      normalize: false
+      threshold: 0.0001
+    vis_bias:
+      idx_slice: [null, 48]
+      threshold: 1.0e-06
+  dir_name: /sdf/home/y/youngsam/sw/dune/siren-t/data/results/logs_xyz_4848_bivis_weighting_csirentv
+  file_name: log.csv
+  log_every_nstep: 8
+  name: csirentv_4848-bivis-module0-linearout-dense
+  project: siren-2x2
+  type: wandb
+model:
+  ckpt_file: null
+  network:
+    type: ConditionalSiren # or BranchedSiren
+    use_low_rank_fusion: true
+    rank_vis: 128
+    rank_time: 512
+    final_activation: sigmoid
+    fusion_omega0: 30.0
+    in_features: 3
+    hidden_features_pos: 4096
+    hidden_layers_pos: 3
+    hidden_features_time: 2048
+    hidden_layers_time: 3
+    embedding_dim: 512
+    n_pmts: 48
+    n_time_steps: 100
+  output_scale:
+    fix: true
+photonlib:
+  filepath: /sdf/home/y/youngsam/sw/dune/siren-t/data/plib_2x2_module0_06052024_4848_unnormalized.h5
+train:
+  # time_smoothness: 
+  #   weight: 1.0
+  #   order: 1
+  loss_fn:
+    functions:
+    - WeightedL2Loss
+    - WeightedL2Loss
+    reduction: geometric_mean
+    uncertainty:
+    - false
+    - false
+    weights:
+    - 1.0
+    - 1.0
+  max_epochs: 500
+  optimizer_class: AdamW
+  optimizer_param:
+    lr: 1.0e-06
+  resume: false
+  save_every_epochs: 500
+  scheduler_class: ReduceLROnPlateau
+  scheduler_param:
+    patience: 10
+    factor: 0.5
+    verbose: true
+transform_vis:
+  eps: 1.0e-08
+  sin_out: false
+  vmax: 0.01

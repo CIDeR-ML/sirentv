@@ -1,0 +1,43 @@
+photonlib:
+        filepath: /lscratch/youngsam/tmp/plib/plib_2x2_module0_06052024_vxyzt48.h5
+                
+model:
+    network:
+        in_features: 4
+        hidden_features: 1024
+        hidden_layers: 5
+        out_features: 48
+    ckpt_file: '/sdf/home/y/youngsam/sw/dune/siren-t/scripts/logs_vxyzt48/version-04/iteration-1600000-epoch-2000.ckpt'
+    output_scale:
+        fix: True
+transform_vis:
+    vmax: 1.0
+    eps: 1.e-8
+    sin_out: True
+data:
+    dataset:
+        #device: ''
+        weight:
+            method: "vis"
+            threshold: 1.e-8
+            factor: 1.e+6
+    loader:
+            batch_size: 32768
+            num_workers: 4
+            pin_memory: True
+            drop_last: True
+            shuffle: true
+logger:
+    dir_name: /sdf/home/y/youngsam/sw/dune/siren-t/scripts/logs_vxyzt48
+    file_name: log.csv
+    log_every_nstep: 5
+    analysis:
+        vis_bias:
+            threshold: 1.e-6
+train:
+    max_epochs: 5000
+    save_every_epochs: 10
+    optimizer_class: Adam
+    optimizer_param:
+        lr: 1.e-7
+    resume: True

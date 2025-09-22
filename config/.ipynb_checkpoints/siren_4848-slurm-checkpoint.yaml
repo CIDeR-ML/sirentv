@@ -1,0 +1,54 @@
+photonlib:
+        filepath: /lscratch/youngsam/tmp/plib/plib_2x2_module0_06052024_4848.h5
+model:
+    network:
+        in_features: 3
+        hidden_features: [512, 512, 4096]
+        hidden_layers: [4, 1, 2]
+        out_features: [48, 4800]
+    ckpt_file: 
+    output_scale:
+        fix: True
+transform_vis:
+    vmax: 1.0
+    eps: 1.e-8
+    sin_out: True
+data:
+    dataset:
+        # device: ''
+        weight:
+            method: "vis"
+            threshold: 1.e-8
+            factor: 1.e+6
+    loader:
+            batch_size: 32768
+            num_workers: 4
+            pin_memory: True
+            drop_last: True
+            shuffle: true
+logger:
+    dir_name: /sdf/home/y/youngsam/sw/dune/siren-t/logs_4848
+    file_name: log.csv
+    log_every_nstep: 5
+    analysis:
+        vis_bias:
+            threshold: 1.e-6
+            idx_slice: [null, 48]
+        time_bias:
+            threshold: 1.e-6
+            idx_slice: [48, null]
+            normalize: True       # only compare shape
+train:
+    max_epochs: 5000
+    save_every_epochs: 10
+    optimizer_class: Adam
+    optimizer_param:
+        lr: 3.e-6
+    resume: False
+    loss_fn:
+        functions:
+            - WeightedL2Loss
+            - L2Loss
+        weights:
+            - 1.
+            - 1. # downweight time cosine similarity because its ~1e10 ...
