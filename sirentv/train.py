@@ -6,7 +6,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import yaml
-from slar.io import PLibDataLoader
+from sirentv.data.io import PLibDataLoader
 from slar.optimizers import optimizer_factory
 from slar.utils import get_device
 from tqdm import tqdm
