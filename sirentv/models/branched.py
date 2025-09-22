@@ -70,6 +70,8 @@ class BranchedSiren(nn.Module):
         self.check_outputs()
         self.init_weights()
 
+        self.out_features = [self.visibility_decoder.net[-1].out_features, self.waveform_decoder.net[-1].out_features]
+
     def init_weights(self):
         """
         Siren initializes all first layer weights with a uniform distribution, and not the
@@ -158,12 +160,3 @@ class BranchedSiren(nn.Module):
         n_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
         memory_mb = n_params * 4 / (1024 * 1024)  # assume fp32
         return f"{n_params:,} trainable parameters\n{memory_mb:2f} MB\n{super().__repr__()}"
-
-    @property
-    def n_outs(self):
-        return sum(self._out_features)
-
-    @property
-    def out_features(self):
-        self._out_features = [self.visibility_decoder.net[-1].linear.out_features, self.waveform_decoder.net[-1].linear.out_features]
-        return self._out_features
