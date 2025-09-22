@@ -275,10 +275,10 @@ def train(cfg: dict):
     for idx, features in enumerate(net.out_features):
         log_pred_target(pred[:,feature_ctr:feature_ctr+features], target[:,feature_ctr:feature_ctr+features], name=f"comparison_{idx}")
 
-    if hasattr(net, "log_sigmas"):
-        log_line(torch.exp(net.log_sigmas[0]).detach().cpu().numpy(), name=f"log_sigma_999")
-        log_imshow(torch.exp(net.log_sigmas[1]).reshape(100,48).detach().cpu().numpy(), name=f"log_sigma_1_vis")
-        log_line(torch.exp(net.log_sigmas[1]).detach().cpu().numpy(), name=f"log_sigma_1_linear")
+    # if hasattr(net, "log_sigmas"):
+    #     log_line(torch.exp(net.log_sigmas[0]).detach().cpu().numpy(), name=f"log_sigma_999")
+    #     log_imshow(torch.exp(net.log_sigmas[1]).reshape(100,48).detach().cpu().numpy(), name=f"log_sigma_1_vis")
+    #     log_line(torch.exp(net.log_sigmas[1]).detach().cpu().numpy(), name=f"log_sigma_1_linear")
 
     logger.close()
 
