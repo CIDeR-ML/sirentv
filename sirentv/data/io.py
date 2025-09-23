@@ -106,6 +106,7 @@ class PLibDataLoader:
         loader_cfg = cfg.get("data", {}).get("loader")
         geom_cfg = cfg.get("data", {}).get("geometry")
         self._batch_mode = loader_cfg is not None
+        self._n_photons = cfg["data"]["dataset"]["weight"].get("n_photon", 200000)
 
         if self._batch_mode:
             # dataloader in batches
@@ -208,9 +209,10 @@ class PLibDataLoader:
                     pos = meta.norm_coord(pos_raw)
                     # try fast item access first
                     try:
-                        vis = self._plib[vox_ids]
+                        vis = self._plib[vox_ids] / self._n_photons
                     except Exception:
                         vis = self._plib.vis[vox_ids] * self._plib.eff
+
                     vis = vis.view(vis.shape[0], self._n_pmt, -1)
                     w = self.get_weight(vis)
                     target = self.xform_vis(vis)

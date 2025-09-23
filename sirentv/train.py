@@ -124,8 +124,6 @@ def substract_tof(vis, tof):
     # Summary statistics
     print(f"Percentage of shifts that match exactly: {shift_matches.float().mean().item() * 100:.1f}%")
     """
-    vis_shifted = vis_shifted.view(V, -1)
-
     return vis_shifted
 
 def train(cfg: dict):
@@ -268,16 +266,13 @@ def train(cfg: dict):
                 pred = net(x)
                 # compute linear-domain prediction once for losses that need it
                 pred_linear = dl.inv_xform_vis(pred)
-
                 target_linear_sum = torch.sum(target_linear, dim=-1).unsqueeze(-1)
                 target_linear_for_loss = torch.cat([target_linear_sum, torch.cumsum(target_linear, dim=-1)], dim=-1)
                 target_linear_for_loss = target_linear_for_loss.view(-1, n_ticks+1)
                 target_for_loss = dl.xform_vis(target_linear_for_loss)
-                print(target_for_loss[0])
 
-                #weights_for_loss = torch.cat([torch.ones_like(target_linear_sum), weights], dim=-1)
-                #weights_for_loss = weights_for_loss.view(-1, n_ticks+1)
-                weights_for_loss = dl.get_weight(target_for_loss)
+                weights_for_loss = torch.cat([dl.get_weight(target_linear_sum), weights], dim=-1)
+                weights_for_loss = weights_for_loss.view(-1, n_ticks+1)
 
                 losses = compute_loss(
                     pred={"transformed": pred, "linear":pred_linear},

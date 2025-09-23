@@ -66,7 +66,7 @@ train:
         # factor: 0.1
         # patience: 10
     resume: False
-    correct_tof: False
+    correct_tof: True
     loss_fn:
         functions:
             - WeightedL2Loss
