@@ -149,7 +149,7 @@ def train(cfg: dict):
     iteration_max = train_cfg.get("max_iterations", int(1e20))
     save_every_iterations = train_cfg.get("save_every_iterations", -1)
     save_every_epochs = train_cfg.get("save_every_epochs", -1)
-    reduction = cfg.get("train", dict()).get('loss', dict()).get("reduction", "mean")
+    reduction = cfg.get("train", dict()).get("reduction", "mean")
 
     # amp flag
     amp = train_cfg.get("amp", False)
@@ -203,6 +203,7 @@ def train(cfg: dict):
                 # OUTPUTS:
                 # v: visibilities, (B, N_pmt)
                 # t: CDF/PDF, (B, N_pmt, N_time)
+                # t0 (possibly)
 
                 losses = compute_loss(
                     pred,

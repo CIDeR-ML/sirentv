@@ -65,8 +65,8 @@ train:
     - type: SmoothL1Loss
       key: v
       weight: 1.0
-    regularization: null
-    reduction: sum
+  regularization: null
+  reduction: sum
   max_epochs: 500
   optimizer_class: AdamW
   optimizer_param:
