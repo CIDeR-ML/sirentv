@@ -1,4 +1,4 @@
-from typing import Union
+from typing import Union, Literal
 
 import numpy as np
 import torch
@@ -7,6 +7,7 @@ from photonlib import AABox
 from slar.transform import partial_xform_vis
 
 from sirentv.models.builder import build_model
+from sirentv.utils.transform import cdf_to_pdf, pdf_to_cdf
 
 
 class SirenTV(nn.Module):
@@ -40,6 +41,8 @@ class SirenTV(nn.Module):
         # Extensions for visibility model
         self._init_output_scale(self.config_model)
         self._do_hardsigmoid = self.config_model.get("hardsigmoid", False)
+        self.mode = self.config_model.get("mode", "pdf")
+        self.tick_size = self.config_model.get("tick_size", 0.1) # ns
 
     def to(self, device):
         self._meta.to(device)
@@ -59,32 +62,57 @@ class SirenTV(nn.Module):
     def update_meta(self, ranges: torch.Tensor):
         self._meta.update(ranges)
 
-    def visibility(self, x):
+    def forward(self, x, return_type: Literal["pdf", "cdf"] = "pdf"):
+        """
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input in unnormalized coordinates.
+        return_pdf : bool
+            If True, return the PDF of the waveform. If False, return the CDF.
+
+        Returns
+        -------
+        out : dict
+            Dictionary containing the PDF/CDF of the waveform and the visibility.
+            The keys are "t" and "v".
+        """
         device = x.device
         x = x.to(self.device)
         pos = x.unsqueeze(0) if x.dim() == 1 else x
-        vis = torch.zeros(
-            pos.shape[0], self.n_outs, dtype=torch.float32, device=self.device
-        )
+
         mask = self.meta.contain(pos)
-        vis[mask] = self(self.meta.norm_coord(pos[mask]).to(self.device)).to(device)
-        vis[mask] = self._inv_xform_vis(vis[mask])
-        return vis.squeeze() if x.dim() == 1 else vis
+        out = self.model(self.meta.norm_coord(pos[mask]).to(self.device))#.to(device)
 
-    def forward(self, x):
-        assert torch.all((x >= -1) & (x <= 1)), (
-            f"The input contains a value out of range [-1,1]"
+        v = torch.zeros(
+            pos.shape[0], out['v'].shape[-1], dtype=torch.float32, device=self.device
         )
-        assert hasattr(self, "model"), "Model is not initialized"
+        v[mask] = out['v'].to(device)
 
-        out = self.model(x)
+        t = torch.zeros(
+            pos.shape[0], *out['t'].shape[1:], dtype=torch.float32, device=self.device
+        )
+        t[mask] = out['t'].to(device)
 
-        if self._do_hardsigmoid:
-            out = torch.nn.functional.hardsigmoid(out)
+        if self.mode == "cdf" and return_type == "pdf":
+            # if cdf is returned, then it's in linear domain.
+            # we just return pdf via diff/tick size.
+            t = cdf_to_pdf(t, self.tick_size)
+        elif self.mode == "pdf":
+            # if pdf is returned by model, it's in log domain
+            # so we need to convert it to linear domain
+            t[mask] = self._inv_xform_vis(t[mask])
+            if return_type == "cdf":
+                t = pdf_to_cdf(t)
 
-        out = out * self.output_scale
+        # TODO: we probably shouldn't use same transform rules
+        # for both v and t as t << v.
+        v[mask] = self._inv_xform_vis(v[mask]) # (B, N_pmt)
+        return {"t": t, "v": v}
 
-        return out
+    def visibility(self, x):
+        out = self.forward(x, return_pdf=True)
+        return out['v'].expand_as(out['t']) * out['t'] # (B, N_pmt, N_time)
 
     def model_dict(self, opt=None, sch=None, epoch=-1, scaler=None):
         model_dict = {
