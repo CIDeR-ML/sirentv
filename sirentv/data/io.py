@@ -112,13 +112,14 @@ class PLibDataLoader:
             # dataloader in batches
             self._batch_size = loader_cfg.get("batch_size", 1)
             self._shuffle = loader_cfg.get("shuffle", False)
+            self._drop_last = loader_cfg.get("drop_last", True)
             self._n_pmt = geom_cfg.get("n_pmts", 48)
         # else:
         # returns the whole plib in a single batch
         if not self._is_lazy:
             print("[PLibDataLoader] precomputing full-cache")
             # precompute full-cache only when non-lazy
-            n_voxels = len(self._plib)
+            n_voxels = len(self._plib) - 1 if self._drop_last else len(self._plib)
             vox_ids = torch.arange(n_voxels, device=device)
 
             meta = self._plib.meta
@@ -180,8 +181,11 @@ class PLibDataLoader:
         from math import ceil
 
         if self._batch_mode:
-            return ceil(len(self._plib) / self._batch_size)
-
+            if self._drop_last:
+                return len(self._plib) // self._batch_size
+            else:
+                return ceil(len(self._plib) / self._batch_size)
+            
         return 1
 
     def __iter__(self):
