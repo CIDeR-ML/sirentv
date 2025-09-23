@@ -6,7 +6,7 @@ from slar.base import Siren
 from torch import nn
 
 from sirentv.models import MODELS
-from sirentv.utils import t0_mask
+from sirentv.utils.misc import t0_mask
 @MODELS.register_module()
 class ParallelSiren(nn.Module):
     def __init__(self,
@@ -17,7 +17,7 @@ class ParallelSiren(nn.Module):
                  first_omega_0: float = 30.0,
                  hidden_omega_0: float = 30.0,
                  steepness_factor: float = 10.0,
-                 use_CDF: True
+                 use_CDF: bool = True,
     ):
         super().__init__()
 
@@ -61,7 +61,7 @@ class ParallelSiren(nn.Module):
     def forward(self, x):
         out_v = self.v_net(x)
         out_t0cdf = self.t0_cdf_net(x)
-        out_t0, out_cdf = out_t0cdf[:, :1], out_t0cdf[:, 1:]
+        out_t0, out_cdf = out_t0cdf[:, :, 1], out_t0cdf[:, :, 1:]
         #out_v = out_v - 8  # <-- initalize guess with 1e-8 offset
         n_ticks = self.out_features[1]-1
         t0 = torch.sigmoid(out_t0)*n_ticks  # t0 between 0 and 1000
@@ -69,7 +69,7 @@ class ParallelSiren(nn.Module):
         out_cdf = t0_mask(n_ticks, t0, out_cdf, self._steepness_factor, self._use_CDF)
 
         output = dict(
-            v=out_v,
+            v=out_v.squeeze(0),
             t=out_cdf,
             t0=t0
         )
