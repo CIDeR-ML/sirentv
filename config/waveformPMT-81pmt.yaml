@@ -1,0 +1,80 @@
+photonlib:
+    filepath: /sdf/data/neutrino/pubdata/lut/optical/waveform_map/batch02/consolidated/plib.h5
+    lazy: True
+device: 
+    type: 'cuda:0'    
+model:
+  ckpt_file: null
+  network:
+    type: WaveformSiren # or BranchedSiren
+    in_features: 6
+    hidden_features: 256
+    hidden_layers: 4
+    out_features: 1000
+    outermost_linear: True
+  output_scale:
+      fix: True
+transform_vis:
+    vmax: 1.0
+    eps: 1.e-7
+    sin_out: False
+data:
+    dataset:
+        weight:
+            method: "vis"
+            n_photon: 200000
+            threshold: 1.e-8
+            factor: 1.e+6
+    geometry:
+        pmt_coords: /sdf/home/j/junjie/SIREN/sirentv/templates/pmt_coords_central_x.csv
+        n_pmts: 81
+        detector_y: [-2160, 2160]
+        detector_z: [-2160, 2160]
+    physics:
+        lar_Rindex: 1.374
+    loader:
+        batch_size: 512
+        num_workers: 4
+        pin_memory: True
+        drop_last: True
+        shuffle: true
+logger:
+    type: wandb
+    dir_name: logs_xyz_81_vis_weighting
+    file_name: log.csv
+    log_every_nstep: 8
+    project: siren-81
+    name: siren_81-vis
+
+    analysis:
+        vis_bias:
+            threshold: 1.e-6
+            idx_slice: [null, 1]
+        time_bias:
+            threshold: 1.e-3
+            idx_slice: [1, null]
+            normalize: True
+train:
+    max_epochs: 10
+    save_every_epochs: 1
+    optimizer_class: Adam
+    optimizer_param:
+        lr: 2.e-6
+    scheduler_class: ReduceLROnPlateau
+    scheduler_param:
+        verbose: True
+        # factor: 0.1
+        # patience: 10
+    resume: False
+    correct_tof: False
+    loss_fn:
+        functions:
+            - WeightedL2Loss
+            - WeightedL2Loss
+        weights:
+            - 1.
+            - 1.
+        uncertainty:
+            - False
+            - False
+        reduction: geometric_mean

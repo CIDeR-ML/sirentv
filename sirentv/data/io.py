@@ -110,6 +110,7 @@ class PLibDataLoader:
             # dataloader in batches
             self._batch_size = loader_cfg.get("batch_size", 1)
             self._shuffle = loader_cfg.get("shuffle", False)
+            self._n_pmt = loader_cfg['geometry'].get("n_pmts", 48)
         # else:
         # returns the whole plib in a single batch
         if not self._is_lazy:
@@ -119,14 +120,15 @@ class PLibDataLoader:
             vox_ids = torch.arange(n_voxels, device=device)
 
             meta = self._plib.meta
-            pos = meta.norm_coord(meta.voxel_to_coord(vox_ids))
+            pos_raw = meta.voxel_to_coord(vox_ids)
+            pos = meta.norm_coord(pos_raw)
 
             vis = self._plib.vis * self._plib.eff
-            vis[:, :48] = vis[:, 48:].reshape(-1, 48, 100).sum(-1)
+            vis[:, :self._n_pmt] = vis[:, self._n_pmt:].reshape(vis.shape[0], self._n_pmt, -1).sum(-1)
             w = self.get_weight(vis)
             target = self.xform_vis(vis)
 
-            self._cache = dict(position=pos, value=vis, weight=w, target=target)
+            self._cache = dict(norm_position=pos, raw_position=pos_raw, value=vis, weight=w, target=target)
         else:
             # in lazy mode, do not create full-cache
             self._cache = None
@@ -201,7 +203,8 @@ class PLibDataLoader:
                 vox_ids = vox_list[sel]
                 if self._is_lazy or self._cache is None:
                     # fetch per-batch on the fly
-                    pos = meta.norm_coord(meta.voxel_to_coord(vox_ids))
+                    pos_raw = meta.voxel_to_coord(vox_ids)
+                    pos = meta.norm_coord(pos_raw)
                     # try fast item access first
                     try:
                         vis = self._plib[vox_ids]
@@ -210,12 +213,13 @@ class PLibDataLoader:
 
                     w = self.get_weight(vis)
                     target = self.xform_vis(vis)
-                    yield dict(position=pos, value=vis, weight=w, target=target)
+                    yield dict(norm_position=pos, raw_position=pos_raw, value=vis, weight=w, target=target)
                 else:
-                    vis = self._cache["value"][vox_ids]
+                    #vis = self._cache["value"][vox_ids]
                     # print(self._cache["target"][vox_ids][0,48:])
                     output = dict(
-                        position=self._cache["position"][vox_ids],
+                        norm_position=self._cache["norm_position"][vox_ids],
+                        raw_position=self._cache["raw_position"][vox_ids],
                         value=self._cache["value"][vox_ids],
                         weight=self._cache["weight"][vox_ids],
                         target=self._cache["target"][vox_ids],
@@ -236,7 +240,8 @@ class PLibDataLoader:
                 w = self.get_weight(vis)
                 target = self.xform_vis(vis)
                 yield dict(
-                    position=pos.to(self.device),
+                    norm_position=pos.to(self.device),
+                    raw_position=pos_raw.to(self.device),
                     value=vis.to(self.device),
                     weight=w.to(self.device),
                     target=target.to(self.device),
