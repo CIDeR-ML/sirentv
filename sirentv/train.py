@@ -70,12 +70,12 @@ def compute_loss(
         losses: list[nn.Module],
         weights: dict[str, torch.Tensor],
     ):
-    losses = []
+    losses_out = []
     for loss in losses:
         curr_loss = loss(pred, target, weights)
-        losses.append(curr_loss)
-    losses = torch.stack(losses)
-    return losses
+        losses_out.append(curr_loss)
+    losses_out = torch.stack(losses_out)
+    return losses_out
 
 def train(cfg: dict):
     """
