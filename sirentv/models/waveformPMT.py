@@ -15,10 +15,10 @@ from sirentv.models import MODELS
 class WaveformSiren(nn.Module):
     def __init__(
         self,
-        in_features: int,
-        hidden_features: int = 256,
-        hidden_layers: int = 3,
-        out_features: int = 1000,
+        in_features: int = 6,
+        hidden_features: List[int] = [256, 256, 1024],
+        hidden_layers: List[int] = [2, 3, 3],
+        out_features: list = [1, 1000],
         outermost_linear: bool = False,
         first_omega_0: float = 30.0,
         hidden_omega_0: float = 30.0,
@@ -34,7 +34,7 @@ class WaveformSiren(nn.Module):
         )
         out_features = [out_features] if isinstance(out_features, int) else out_features
 
-        print("=" * 20, "Encoder", "=" * 20)
+        print("=" * 20, "visibility encoder", "=" * 20)
         self.encoder = Siren(
             in_features=in_features,
             hidden_features=hidden_features[0],
@@ -44,22 +44,43 @@ class WaveformSiren(nn.Module):
             first_omega_0=first_omega_0,
             hidden_omega_0=hidden_omega_0,
         )
-        print("=" * 20, "Waveform decoder", "=" * 20)
-        self.waveform_decoder = Siren(
+        print("=" * 20, "Visibility decoder", "=" * 20)
+        self.vis_decoder = Siren(
             in_features=hidden_features[0],
-            hidden_features=hidden_features[0],
-            hidden_layers=hidden_layers[0] - 1,
+            hidden_features=hidden_features[1],
+            hidden_layers=hidden_layers[1] - 1,
             out_features=out_features[0],
             outermost_linear=outermost_linear,
             first_omega_0=first_omega_0,
             hidden_omega_0=hidden_omega_0,
         )
 
+        print("=" * 20, "Waveform decoder", "=" * 20)
+        self.waveform_decoder = Siren(
+            in_features=hidden_features[0],
+            hidden_features=hidden_features[2],
+            hidden_layers=hidden_layers[2] - 1,
+            out_features=out_features[1],
+            outermost_linear=outermost_linear,
+            first_omega_0=first_omega_0,
+            hidden_omega_0=hidden_omega_0,
+        )
+
         self.hidden_omega_0 = hidden_omega_0
+        self.check_outputs()
 
         self.init_weights()
-        self.out_features = self.waveform_decoder.net[-1].out_features
+        self.out_features = [self.vis_decoder.net[-1].out_features, self.waveform_decoder.net[-1].out_features]
 
+    def check_outputs(self):
+        assert (
+            self.encoder.net[-1].linear.out_features
+            == self.vis_decoder.net[0].linear.in_features
+        )
+        assert (
+            self.encoder.net[-1].linear.out_features
+            == self.waveform_decoder.net[0].linear.in_features
+        )
     def init_weights(self):
         """
         Siren initializes all first layer weights with a uniform distribution, and not the
@@ -75,7 +96,7 @@ class WaveformSiren(nn.Module):
                 else:
                     layer.init_weights()
 
-            for decoder in [self.waveform_decoder]:
+            for decoder in [self.vis_decoder, self.waveform_decoder]:
                 for layer in decoder.net:
                     if isinstance(layer, nn.Linear):
                         layer.weight.uniform_(
@@ -99,8 +120,9 @@ class WaveformSiren(nn.Module):
             coords = coords.clone().detach().requires_grad_(True)
 
         x = self.encoder(coords)
+
         waveform = self.waveform_decoder(x)
-        visibility = torch.sum(waveform, dim=-1)
+        visibility = self.vis_decoder(x)
         return torch.cat([visibility, waveform], dim=-1)
 
     def unfreeze_all(self):
@@ -114,9 +136,9 @@ class WaveformSiren(nn.Module):
 
     def freeze_all_but_(self, decoder: Literal["timing", "visibility"] = "timing"):
         self.unfreeze_all()
-        self.position_encoder.requires_grad_(False)
+        self.encoder.requires_grad_(False)
         if decoder == "timing":
-            self.visibility_decoder.requires_grad_(False)
+            self.vis_decoder.requires_grad_(False)
         elif decoder == "visibility":
             self.waveform_decoder.requires_grad_(False)
         else:

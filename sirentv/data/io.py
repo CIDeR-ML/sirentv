@@ -65,14 +65,14 @@ class PLibDataLoader:
         [Optional] The `transform_vis` subsection uses `log(vis+eps)` in the
         training. The final output is scaled to `[0,1]`.
         """
-
-        # load plib to device
-        self._plib = PhotonLib.load(cfg).to(device)
         # determine lazy mode from PhotonLib or config
-        self._is_lazy = bool(
-            getattr(self._plib, "lazy", False)
-            or cfg.get("photonlib", {}).get("lazy", False)
-        )
+        self._is_lazy = cfg.get("photonlib", {}).get("lazy", False)
+        #bool(
+        #getattr(self._plib, "lazy", False)
+        #or cfg.get("photonlib", {}).get("lazy", False)
+        #))
+        # load plib to device
+        self._plib = PhotonLib.load(cfg, self._is_lazy).to(device)
 
         # get weighting scheme
         weight_cfg = cfg.get("data", {}).get("dataset", {}).get("weight", {})
@@ -104,13 +104,14 @@ class PLibDataLoader:
 
         # prepare dataloader
         loader_cfg = cfg.get("data", {}).get("loader")
+        geom_cfg = cfg.get("data", {}).get("geometry")
         self._batch_mode = loader_cfg is not None
 
         if self._batch_mode:
             # dataloader in batches
             self._batch_size = loader_cfg.get("batch_size", 1)
             self._shuffle = loader_cfg.get("shuffle", False)
-            self._n_pmt = loader_cfg['geometry'].get("n_pmts", 48)
+            self._n_pmt = geom_cfg.get("n_pmts", 48)
         # else:
         # returns the whole plib in a single batch
         if not self._is_lazy:
@@ -210,7 +211,7 @@ class PLibDataLoader:
                         vis = self._plib[vox_ids]
                     except Exception:
                         vis = self._plib.vis[vox_ids] * self._plib.eff
-
+                    vis = vis.view(vis.shape[0], self._n_pmt, -1)
                     w = self.get_weight(vis)
                     target = self.xform_vis(vis)
                     yield dict(norm_position=pos, raw_position=pos_raw, value=vis, weight=w, target=target)

@@ -6,11 +6,11 @@ device:
 model:
   ckpt_file: null
   network:
-    type: WaveformSiren # or BranchedSiren
+    type: WaveformSiren # or ConditionalSiren
     in_features: 6
-    hidden_features: 256
-    hidden_layers: 4
-    out_features: 1000
+    hidden_features: [256, 256, 1024]
+    hidden_layers: [2, 3, 3]
+    out_features: [1, 1000]
     outermost_linear: True
   output_scale:
       fix: True
@@ -33,7 +33,7 @@ data:
     physics:
         lar_Rindex: 1.374
     loader:
-        batch_size: 512
+        batch_size: 1024
         num_workers: 4
         pin_memory: True
         drop_last: True
