@@ -62,7 +62,7 @@ class SirenTV(nn.Module):
     def update_meta(self, ranges: torch.Tensor):
         self._meta.update(ranges)
 
-    def forward(self, x, return_type: Literal["pdf", "cdf"] = "pdf"):
+    def forward(self, x):
         """
         Parameters
         ----------
@@ -93,26 +93,28 @@ class SirenTV(nn.Module):
             pos.shape[0], *out['t'].shape[1:], dtype=torch.float32, device=self.device
         )
         t[mask] = out['t'].to(device)
+        return {"t": t, "v": v, "correct_mask": mask}
 
+    def visibility(self, x, return_type: Literal["pdf", "cdf"] = "pdf"):
+        out = self.forward(x)
+        t = out['t']
+        v = out['v']
+        mask = out['correct_mask']
         if self.mode == "cdf" and return_type == "pdf":
             # if cdf is returned, then it's in linear domain.
             # we just return pdf via diff/tick size.
             t = cdf_to_pdf(t, self.tick_size)
         elif self.mode == "pdf":
-            # if pdf is returned by model, it's in log domain
-            # so we need to convert it to linear domain
-            t[mask] = self._inv_xform_vis(t[mask])
+            # if pdf is returned by model, it's NOT in log domain
+            # so we DO NOT need to convert it to linear domain
+            # t[mask] = self._inv_xform_vis(t[mask])
             if return_type == "cdf":
                 t = pdf_to_cdf(t)
 
         # TODO: we probably shouldn't use same transform rules
         # for both v and t as t << v.
         v[mask] = self._inv_xform_vis(v[mask]) # (B, N_pmt)
-        return {"t": t, "v": v}
-
-    def visibility(self, x):
-        out = self.forward(x, return_pdf=True)
-        return out['v'].expand_as(out['t']) * out['t'] # (B, N_pmt, N_time)
+        return v.expand_as(t) * t # (B, N_pmt, N_time)
 
     def model_dict(self, opt=None, sch=None, epoch=-1, scaler=None):
         model_dict = {
