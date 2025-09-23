@@ -9,20 +9,19 @@ from slar.transform import partial_xform_vis
 from torch import nn
 
 from sirentv.models import MODELS
-
-
+from sirentv.utils import t0_mask
 @MODELS.register_module()
 class BranchedSiren(nn.Module):
-    def __init__(
-        self,
-        in_features: int,
-        hidden_features: List[int] = [8192, 256, 256],
-        hidden_layers: List[int] = [2, 3, 3],
-        out_features: List[int] = [48, 4800],
-        outermost_linear: bool = False,
-        first_omega_0: float = 30.0,
-        hidden_omega_0: float = 30.0,
-        xform_vis: dict = {}, # no op, but always required
+    def __init__(self,
+                 in_features: int = 6,
+                 hidden_features: List[int] = [256, 256, 1024],
+                 hidden_layers: List[int] = [2, 3, 3],
+                 out_features: list = [1, 1001],
+                 outermost_linear: bool = False,
+                 first_omega_0: float = 30.0,
+                 hidden_omega_0: float = 30.0,
+                 steepness_factor: float = 10.0,
+                 use_CDF = True,
     ):
         super().__init__()
 
@@ -32,10 +31,10 @@ class BranchedSiren(nn.Module):
         hidden_layers = (
             [hidden_layers] if isinstance(hidden_layers, int) else hidden_layers
         )
-        out_features = [out_features] if isinstance(out_features, int) else out_features
+        assert isinstance(out_features, list) and len(out_features)==2, "WaveformSiren needs exactly list of 2 output features"
 
-        print("=" * 20, "Position encoder", "=" * 20)
-        self.position_encoder = Siren(
+        print("=" * 20, "visibility encoder", "=" * 20)
+        self.encoder = Siren(
             in_features=in_features,
             hidden_features=hidden_features[0],
             hidden_layers=hidden_layers[0] - 1,
@@ -45,15 +44,16 @@ class BranchedSiren(nn.Module):
             hidden_omega_0=hidden_omega_0,
         )
         print("=" * 20, "Visibility decoder", "=" * 20)
-        self.visibility_decoder = Siren(
+        self.vis_decoder = Siren(
             in_features=hidden_features[0],
             hidden_features=hidden_features[1],
             hidden_layers=hidden_layers[1] - 1,
             out_features=out_features[0],
             outermost_linear=outermost_linear,
-            first_omega_0=hidden_omega_0,
+            first_omega_0=first_omega_0,
             hidden_omega_0=hidden_omega_0,
         )
+
         print("=" * 20, "Waveform decoder", "=" * 20)
         self.waveform_decoder = Siren(
             in_features=hidden_features[0],
@@ -66,11 +66,41 @@ class BranchedSiren(nn.Module):
         )
 
         self.hidden_omega_0 = hidden_omega_0
-
         self.check_outputs()
-        self.init_weights()
 
-        self.out_features = [self.visibility_decoder.net[-1].out_features, self.waveform_decoder.net[-1].out_features]
+        self.init_weights()
+        self.out_features = out_features
+
+        self._steepness_factor = steepness_factor
+        self._use_CDF= use_CDF
+
+    def check_outputs(self):
+        assert (
+            self.encoder.net[-1].linear.out_features
+            == self.vis_decoder.net[0].linear.in_features
+        )
+        assert (
+            self.encoder.net[-1].linear.out_features
+            == self.waveform_decoder.net[0].linear.in_features
+        )
+
+    def forward(self, x):
+        x = self.encoder(x)
+        out_t0cdf = self.waveform_decoder(x)
+        out_t0, out_cdf = out_t0cdf[:, :1], out_t0cdf[:, 1:]
+        out_v = self.vis_decoder(x)
+        n_ticks = self.out_features[1]-1
+        t0 = torch.sigmoid(out_t0)*n_ticks
+
+        out_cdf = t0_mask(n_ticks, t0, out_cdf, self._steepness_factor, self._use_CDF)
+
+        output = dict(
+            v=out_v,
+            t=out_cdf,
+            t0=t0
+        )
+
+        return output
 
     def init_weights(self):
         """
@@ -78,7 +108,7 @@ class BranchedSiren(nn.Module):
         custom distribution often used for SIREN layers.
         """
         with torch.no_grad():
-            for layer in self.position_encoder.net:
+            for layer in self.encoder.net:
                 if isinstance(layer, nn.Linear):
                     layer.weight.uniform_(
                         -np.sqrt(6 / layer.in_features) / self.hidden_omega_0,
@@ -87,7 +117,7 @@ class BranchedSiren(nn.Module):
                 else:
                     layer.init_weights()
 
-            for decoder in [self.visibility_decoder, self.waveform_decoder]:
+            for decoder in [self.vis_decoder, self.waveform_decoder]:
                 for layer in decoder.net:
                     if isinstance(layer, nn.Linear):
                         layer.weight.uniform_(
@@ -98,65 +128,10 @@ class BranchedSiren(nn.Module):
                         layer.is_first = False
                         layer.init_weights()
 
-            assert all(not layer.is_first for layer in self.position_encoder.net[1:])
-            assert all(
-                not layer.is_first
-                for layer in self.visibility_decoder.net
-                if not isinstance(layer, nn.Linear)
-            )
+            assert all(not layer.is_first for layer in self.encoder.net[1:])
+
             assert all(
                 not layer.is_first
                 for layer in self.waveform_decoder.net
                 if not isinstance(layer, nn.Linear)
             )
-
-    def check_outputs(self):
-        assert (
-            self.position_encoder.net[-1].linear.out_features
-            == self.visibility_decoder.net[0].linear.in_features
-        )
-        assert (
-            self.position_encoder.net[-1].linear.out_features
-            == self.waveform_decoder.net[0].linear.in_features
-        )
-
-    def forward(self, coords, clone=False):
-        if clone:
-            coords = coords.clone().detach().requires_grad_(True)
-
-        x = self.position_encoder(coords)
-        visibility = self.visibility_decoder(x)
-        waveform = self.waveform_decoder(x)
-        return torch.cat([visibility, waveform], dim=-1)
-
-    def unfreeze_all(self):
-        """Unfreeze all parameters in the network"""
-        for param in self.parameters():
-            param.requires_grad = True
-
-    def get_trainable_params(self):
-        """Return only the parameters that require gradients"""
-        return filter(lambda p: p.requires_grad, self.parameters())
-
-    def freeze_all_but_(self, decoder: Literal["timing", "visibility"] = "timing"):
-        self.unfreeze_all()
-        self.position_encoder.requires_grad_(False)
-        if decoder == "timing":
-            self.visibility_decoder.requires_grad_(False)
-        elif decoder == "visibility":
-            self.waveform_decoder.requires_grad_(False)
-        else:
-            raise ValueError(f"Invalid decoder: {decoder}")
-
-    def print_trainable_params(self):
-        """Print the names of trainable parameters"""
-        for name, param in self.named_parameters():
-            if param.requires_grad:
-                print(f"Trainable: {name}")
-            else:
-                print(f"Frozen: {name}")
-
-    def __repr__(self):
-        n_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        memory_mb = n_params * 4 / (1024 * 1024)  # assume fp32
-        return f"{n_params:,} trainable parameters\n{memory_mb:2f} MB\n{super().__repr__()}"

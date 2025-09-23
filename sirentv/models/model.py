@@ -206,3 +206,36 @@ class SirenTV(nn.Module):
     @property
     def n_outs(self):
         return sum(self.out_features) if isinstance(self.out_features, (list, tuple)) else self.out_features
+
+    def unfreeze_all(self):
+        """Unfreeze all parameters in the network"""
+        for param in self.model.parameters():
+            param.requires_grad = True
+    def get_trainable_params(self):
+        """Return only the parameters that require gradients"""
+        return filter(lambda p: p.requires_grad, self.model.parameters())
+
+    """
+    def freeze_all_but_(self, part: Literal["timing", "visibility"] = "timing"):
+        self.unfreeze_all()
+        self.encoder.requires_grad_(False)
+        if decoder == "timing":
+            self.vis_decoder.requires_grad_(False)
+        elif decoder == "visibility":
+            self.waveform_decoder.requires_grad_(False)
+        else:
+            raise ValueError(f"Invalid decoder: {decoder}")
+    """
+
+    def print_trainable_params(self):
+        """Print the names of trainable parameters"""
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                print(f"Trainable: {name}")
+            else:
+                print(f"Frozen: {name}")
+
+    def __repr__(self):
+        n_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        memory_mb = n_params * 4 / (1024 * 1024)  # assume fp32
+        return f"{n_params:,} trainable parameters\n{memory_mb:2f} MB\n{super().__repr__()}"

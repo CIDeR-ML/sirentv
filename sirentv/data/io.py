@@ -185,7 +185,7 @@ class PLibDataLoader:
                 return len(self._plib) // self._batch_size
             else:
                 return ceil(len(self._plib) / self._batch_size)
-            
+
         return 1
 
     def __iter__(self):
