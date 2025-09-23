@@ -64,7 +64,7 @@ class WandbLogger(Logger):
         for key, kwargs in log_cfg.get("analysis", dict()).items():
             print("[WandbLogger] adding analysis function:", key)
             self._analysis_dict[key] = partial(
-                getattr(importlib.import_module("slar.analysis"), key), **kwargs
+                getattr(importlib.import_module("sirentv.analysis"), key), **kwargs
             )
 
     def record(self, keys: list, vals: list):
@@ -197,7 +197,7 @@ class CSVLogger(Logger):
         for key, kwargs in log_cfg.get("analysis", dict()).items():
             print("[CSVLogger] adding analysis function:", key)
             self._analysis_dict[key] = partial(
-                getattr(importlib.import_module("slar.analysis"), key), **kwargs
+                getattr(importlib.import_module("sirentv.analysis"), key), **kwargs
             )
 
     @property

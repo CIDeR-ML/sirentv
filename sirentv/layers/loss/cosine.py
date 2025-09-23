@@ -1,8 +1,10 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from sirentv.loss.builder import LOSSES
 
 
+@LOSSES.register_module()
 class WeightedCosineDissimilarity(nn.Module):
     """
     A simple loss module that implements a weighted cosine dissimilarity loss
@@ -11,14 +13,19 @@ class WeightedCosineDissimilarity(nn.Module):
     the explicit values.
     """
 
-    def __init__(self, reduce_method=torch.mean):
+    def __init__(self, key: str, weight=1.0, reduce_method="mean"):
         super().__init__()
-        self.reduce = reduce_method
-    
-    def forward(self, pred, target, weight=1.0):
+        assert reduce_method in ["mean", "sum", "none"], f"Invalid reduction method: {reduce_method}"
+        self.reduce = getattr(torch, reduce_method) if reduce_method != "none" else lambda x: x
+        self.key = key
+        self.weight = weight
+
+    def forward(self, pred: dict[str, torch.Tensor], target: dict[str, torch.Tensor], weight: torch.Tensor):
+        pred = pred[self.key]
+        target = target[self.key]
         pred_norm = F.normalize(pred, p=2, dim=-1)
         target_norm = F.normalize(target, p=2, dim=-1)
         # normalize_weights = F.normalize(weight, p=2, dim=-1) if hasattr(weight, 'norm') else weight
         loss = (weight * (1 - (pred_norm * target_norm))).mean(dim=-1)
-        return self.reduce(loss)
+        return self.weight * self.reduce(loss)
     
