@@ -70,6 +70,62 @@ def compute_loss(pred, target, weights, loss_fns, loss_fn_weights, loss_fn_uncer
     losses = torch.stack(losses)
     return losses
 
+def compute_tof(source_pos, pmt_coords, r_index=1.374):
+    """
+    Function to compute time of flight of photon traversing in the medium with given refractive index r_index
+    Parameters
+    ----------
+    source_pos : tensor (N, 3)
+    pmt_coords : tensor (N_pmt, 3)
+    r_index : float
+
+    Returns
+    -------
+    tof: tensor (N, N_pmt)
+    """
+
+    speed_c = 299.792 # mm/ns
+    dist = torch.cdist(source_pos, pmt_coords, p=2)  # (N, N_pmt)
+    tof = dist/speed_c*r_index
+    return tof
+
+def substract_tof(vis, tof):
+    assert len(vis) == len(tof), "Visibility and tof tensors length mismatched."
+
+    V, N, T = vis.shape
+    t_idx = torch.arange(T, device=vis.device).expand(V, N, T)
+
+    t_shift = (tof / 0.1).unsqueeze(-1).long().to(vis.device)  # hardcoded 100ps per bin for 100ns window
+    vis_shifted = torch.zeros_like(vis)
+
+    source_t_idx = t_idx + t_shift
+    valid_mask = (source_t_idx >= 0) & (source_t_idx < T)  # Source must be within original tensor bounds
+
+    v_coords = torch.arange(V, device=vis.device).view(V, 1, 1).expand(V, N, T)
+    n_coords = torch.arange(N, device=vis.device).view(1, N, 1).expand(V, N, T)
+
+    # Only copy where the source position is valid
+    vis_shifted[valid_mask] = vis[v_coords[valid_mask], n_coords[valid_mask], source_t_idx[valid_mask]]
+    """
+    vis_argmax = vis.argmax(dim=2)  # Shape: [V, N]
+    vis_shifted_argmax = vis_shifted.argmax(dim=2)  # Shape: [V, N]
+
+    # Calculate actual shift (difference in argmax positions)
+    actual_shift = vis_argmax - vis_shifted_argmax  # Should equal expected_shift
+    # Check if shifts match (accounting for cases where peak might be clipped)
+    shift_matches = (actual_shift == t_shift.squeeze(-1))
+
+    print(f"Original argmax positions (first 2x2): {vis_argmax[:2, :2]}")
+    print(f"Shifted argmax positions (first 2x2): {vis_shifted_argmax[:2, :2]}")
+    print(f"Expected shift (first 2x2): {t_shift[:2, :2]}")
+    print(f"Actual shift (first 2x2): {actual_shift[:2, :2]}")
+    print(f"Shifts match (first 2x2): {shift_matches[:2, :2]}")
+
+    # Summary statistics
+    print(f"Percentage of shifts that match exactly: {shift_matches.float().mean().item() * 100:.1f}%")
+    """
+    return vis_shifted
+
 def train(cfg: dict):
     """
     A function to run an optimization loop for SirenVis model.
@@ -114,6 +170,23 @@ def train(cfg: dict):
     net = SirenTV(cfg)
     # net = create_ddp_model(net) # TODO: add ddp
     dl = PLibDataLoader(cfg, device=DEVICE)
+
+    correct_tof = cfg['train'].get('correct_tof', False)
+    pmt_coord_file = cfg['data']['geometry'].get('pmt_coords', None)
+    detector_yrange = cfg['data']['geometry'].get('detector_y')
+    detector_zrange = cfg['data']['geometry'].get('detector_z')
+    assert len(detector_yrange)==2 and len(detector_zrange)==2, "Detector ranges not input correctly"
+    detector_ynorm = abs(detector_yrange[1]-detector_yrange[0])
+    detector_znorm = abs(detector_zrange[1]-detector_zrange[0])
+
+    assert pmt_coord_file is not None and os.path.isfile(pmt_coord_file), "PMT coord file is not loaded correctly"
+    pmt_coords = torch.tensor(np.loadtxt(pmt_coord_file, delimiter=','), dtype=torch.float32).to(DEVICE)
+    detector_xnorm = pmt_coords[:,0].max()
+
+    pmt_coords_norm = torch.stack(
+        [pmt_coords[:, 0] / detector_xnorm, pmt_coords[:, 1] / detector_ynorm, pmt_coords[:, 2] / detector_znorm],
+        dim=1).to(DEVICE)
+    pmt_coords_exp = torch.tile(pmt_coords_norm.unsqueeze(0), (dl._batch_size, 1, 1))
 
     num_outputs = net.n_outs
     reduction = cfg.get("train", dict()).get('loss_fn', dict()).get("reduction", "mean")
@@ -169,11 +242,23 @@ def train(cfg: dict):
         for batch_idx, data in enumerate(tqdm(dl, desc="Epoch %-3d; Loss %-3s" % (epoch_ctr, ",".join(["%.2e" % l for l in losses])))):
             iteration_ctr += 1
             with (torch.autocast(device_type=DEVICE.type, dtype=torch.bfloat16) if amp else nullcontext()):
+                x = data["norm_position"].contiguous().to(DEVICE)
+                if int(cfg['model']['network'].get('in_features')) > x.shape[-1]:
+                    x_exp = torch.tile(x.unsqueeze(1), (1, pmt_coords_exp.shape[1], 1))
+                    x = torch.cat([x_exp, pmt_coords_exp], dim=-1).contiguous().to(DEVICE)
+                    n_inputs = x.shape[-1]
+                    x = x.view(-1, n_inputs)
 
-                x = data["position"].contiguous().to(DEVICE)
+                raw_position = data["raw_position"].contiguous().to(DEVICE)
                 weights = data["weight"].contiguous().squeeze().to(DEVICE)
                 target = data["target"].contiguous().squeeze().to(DEVICE)
                 target_linear = data["value"].contiguous().squeeze().to(DEVICE)
+                n_ticks = target.shape[-1]
+
+                if (correct_tof):
+                    tof = compute_tof(raw_position, pmt_coords)
+                    target = substract_tof(target, tof)
+                    target_linear = substract_tof(target_linear, tof)
 
                 twait = time.time() - twait
                 # Running the model, compute the loss, back-prop gradients to optimize.
@@ -181,11 +266,18 @@ def train(cfg: dict):
                 pred = net(x)
                 # compute linear-domain prediction once for losses that need it
                 pred_linear = dl.inv_xform_vis(pred)
+                target_linear_sum = torch.sum(target_linear, dim=-1).unsqueeze(-1)
+                target_linear_for_loss = torch.cat([target_linear_sum, torch.cumsum(target_linear, dim=-1)], dim=-1)
+                target_linear_for_loss = target_linear_for_loss.view(-1, n_ticks+1)
+                target_for_loss = dl.xform_vis(target_linear_for_loss)
+
+                weights_for_loss = torch.cat([dl.get_weight(target_linear_sum), weights], dim=-1)
+                weights_for_loss = weights_for_loss.view(-1, n_ticks+1)
 
                 losses = compute_loss(
                     pred={"transformed": pred, "linear":pred_linear},
-                    target={"transformed": target, "linear":target_linear},
-                    weights=weights,
+                    target={"transformed": target_for_loss, "linear":target_linear_for_loss},
+                    weights=weights_for_loss,
                     loss_fns=loss_fns,
                     loss_fn_weights=loss_fn_weights,
                     loss_fn_uncertainty=loss_fn_uncertainty,
@@ -228,8 +320,9 @@ def train(cfg: dict):
             )
 
             # Step the logger
-            pred_linear = dl.inv_xform_vis(pred)
-            logger.step(iteration_ctr, target_linear, pred_linear)
+            #pred_linear = dl.inv_xform_vis(pred)
+            #logger.step(iteration_ctr, target_linear, pred_linear)
+            logger.step(iteration_ctr, target_linear_for_loss, pred_linear)
             twait = time.time()
 
             # Save the model parameters if the condition is met

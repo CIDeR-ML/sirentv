@@ -65,14 +65,14 @@ class PLibDataLoader:
         [Optional] The `transform_vis` subsection uses `log(vis+eps)` in the
         training. The final output is scaled to `[0,1]`.
         """
-
-        # load plib to device
-        self._plib = PhotonLib.load(cfg).to(device)
         # determine lazy mode from PhotonLib or config
-        self._is_lazy = bool(
-            getattr(self._plib, "lazy", False)
-            or cfg.get("photonlib", {}).get("lazy", False)
-        )
+        self._is_lazy = cfg.get("photonlib", {}).get("lazy", False)
+        #bool(
+        #getattr(self._plib, "lazy", False)
+        #or cfg.get("photonlib", {}).get("lazy", False)
+        #))
+        # load plib to device
+        self._plib = PhotonLib.load(cfg, self._is_lazy).to(device)
 
         # get weighting scheme
         weight_cfg = cfg.get("data", {}).get("dataset", {}).get("weight", {})
@@ -104,29 +104,34 @@ class PLibDataLoader:
 
         # prepare dataloader
         loader_cfg = cfg.get("data", {}).get("loader")
+        geom_cfg = cfg.get("data", {}).get("geometry")
         self._batch_mode = loader_cfg is not None
+        self._n_photons = cfg["data"]["dataset"]["weight"].get("n_photon", 200000)
 
         if self._batch_mode:
             # dataloader in batches
             self._batch_size = loader_cfg.get("batch_size", 1)
             self._shuffle = loader_cfg.get("shuffle", False)
+            self._drop_last = loader_cfg.get("drop_last", True)
+            self._n_pmt = geom_cfg.get("n_pmts", 48)
         # else:
         # returns the whole plib in a single batch
         if not self._is_lazy:
             print("[PLibDataLoader] precomputing full-cache")
             # precompute full-cache only when non-lazy
-            n_voxels = len(self._plib)
+            n_voxels = len(self._plib) - 1 if self._drop_last else len(self._plib)
             vox_ids = torch.arange(n_voxels, device=device)
 
             meta = self._plib.meta
-            pos = meta.norm_coord(meta.voxel_to_coord(vox_ids))
+            pos_raw = meta.voxel_to_coord(vox_ids)
+            pos = meta.norm_coord(pos_raw)
 
             vis = self._plib.vis * self._plib.eff
-            vis[:, :48] = vis[:, 48:].reshape(-1, 48, 100).sum(-1)
+            vis[:, :self._n_pmt] = vis[:, self._n_pmt:].reshape(vis.shape[0], self._n_pmt, -1).sum(-1)
             w = self.get_weight(vis)
             target = self.xform_vis(vis)
 
-            self._cache = dict(position=pos, value=vis, weight=w, target=target)
+            self._cache = dict(norm_position=pos, raw_position=pos_raw, value=vis, weight=w, target=target)
         else:
             # in lazy mode, do not create full-cache
             self._cache = None
@@ -176,8 +181,11 @@ class PLibDataLoader:
         from math import ceil
 
         if self._batch_mode:
-            return ceil(len(self._plib) / self._batch_size)
-
+            if self._drop_last:
+                return len(self._plib) // self._batch_size
+            else:
+                return ceil(len(self._plib) / self._batch_size)
+            
         return 1
 
     def __iter__(self):
@@ -201,21 +209,24 @@ class PLibDataLoader:
                 vox_ids = vox_list[sel]
                 if self._is_lazy or self._cache is None:
                     # fetch per-batch on the fly
-                    pos = meta.norm_coord(meta.voxel_to_coord(vox_ids))
+                    pos_raw = meta.voxel_to_coord(vox_ids)
+                    pos = meta.norm_coord(pos_raw)
                     # try fast item access first
                     try:
-                        vis = self._plib[vox_ids]
+                        vis = self._plib[vox_ids] / self._n_photons
                     except Exception:
                         vis = self._plib.vis[vox_ids] * self._plib.eff
 
+                    vis = vis.view(vis.shape[0], self._n_pmt, -1)
                     w = self.get_weight(vis)
                     target = self.xform_vis(vis)
-                    yield dict(position=pos, value=vis, weight=w, target=target)
+                    yield dict(norm_position=pos, raw_position=pos_raw, value=vis, weight=w, target=target)
                 else:
-                    vis = self._cache["value"][vox_ids]
+                    #vis = self._cache["value"][vox_ids]
                     # print(self._cache["target"][vox_ids][0,48:])
                     output = dict(
-                        position=self._cache["position"][vox_ids],
+                        norm_position=self._cache["norm_position"][vox_ids],
+                        raw_position=self._cache["raw_position"][vox_ids],
                         value=self._cache["value"][vox_ids],
                         weight=self._cache["weight"][vox_ids],
                         target=self._cache["target"][vox_ids],
@@ -236,7 +247,8 @@ class PLibDataLoader:
                 w = self.get_weight(vis)
                 target = self.xform_vis(vis)
                 yield dict(
-                    position=pos.to(self.device),
+                    norm_position=pos.to(self.device),
+                    raw_position=pos_raw.to(self.device),
                     value=vis.to(self.device),
                     weight=w.to(self.device),
                     target=target.to(self.device),
