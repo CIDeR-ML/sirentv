@@ -144,7 +144,7 @@ class DummyClass:
 
 def t0_mask(n_ticks, t0, t_profile, steepness_factor, use_CDF=True):
     # create time indices
-    time_indices = torch.arange(n_ticks, device=t_profile.device, dtype=torch.float32)[None, :]
+    time_indices = torch.arange(n_ticks, device=t_profile.device, dtype=torch.float32)[None, None, :]
     # create soft mask using sigmoid for smooth transition
     mask = torch.sigmoid((time_indices - t0) * steepness_factor)  # steepness factor of 10
 
