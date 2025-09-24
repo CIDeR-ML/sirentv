@@ -57,8 +57,6 @@ class SirenTV(nn.Module):
         self.tick_size = self.config_model.get("tick_size", 0.1) # ns
 
         self.n_pmts = len(self.norm_pmt_coords)
-        self.batch_size = self.config_loader.get("batch_size", 1024)
-        self.norm_pmt_tile = self.norm_pmt_coords.unsqueeze(0).expand(self.batch_size, self.n_pmts, 3)
 
 
     def to(self, device):
@@ -97,10 +95,12 @@ class SirenTV(nn.Module):
         #device = x.device
         x = x.to(self.device)
         pos = x.unsqueeze(0) if x.dim() == 1 else x
-        assert len(pos) == self.batch_size, "Loader batch size not consistent with config"
         mask = self.meta.contain(pos).to(self.device)
-        norm_pos = torch.tile(self.meta.norm_coord(pos[mask]).unsqueeze(1), (1, self.n_pmts, 1)).to(self.device)
-        input_to_net = torch.cat([norm_pos, self.norm_pmt_tile.to(self.device)], dim=-1).to(self.device)
+        norm_pos = self.meta.norm_coord(pos[mask]).to(self.device)
+        norm_pos = norm_pos.unsqueeze(1).expand(-1, self.n_pmts, -1)
+        norm_pmt_tile = self.norm_pmt_coords.to(self.device)
+        norm_pmt_tile = norm_pmt_tile.unsqueeze(0).expand_as(norm_pos)
+        input_to_net = torch.cat([norm_pos, norm_pmt_tile], dim=-1)
         out = self.model(input_to_net)#.to(device)
 
         v = torch.zeros(
