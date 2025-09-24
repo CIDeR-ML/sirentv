@@ -161,8 +161,8 @@ class WandbLogger(Logger):
         ax_cdf.plot(x, cdf[:, 1], label="Predicted", color="darkorange")
         if 't0' in inferred.keys():
             t0s = inferred['t0'].detach().cpu().numpy()
-            ax_cdf.axvline(t0s[0], color="navy")
-            ax_cdf.axvline(t0s[1], color="darkorange")
+            ax_cdf.axvline(t0s[0], linestyle='--', label="Target T0", color="navy", alpha=0.6)
+            ax_cdf.axvline(t0s[1], linestyle='--', label="Predicted T0", color="darkorange", alpha=0.6)
         ax_cdf.set_xlabel("Time (ns)")
         ax_cdf.set_ylabel("Value")
         ax_cdf.set_title("Waveform CDF")
