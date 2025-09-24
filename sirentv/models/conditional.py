@@ -26,7 +26,7 @@ class ConditionalSiren(nn.Module):
         fusion_omega0: float = 30.0,
         pmt_pos_path: str = None,
         steepness_factor: float = 10.0,
-        use_CDF: bool = True
+        use_CDF: bool = True,
     ):
         super().__init__()
         self.use_low_rank_fusion = use_low_rank_fusion

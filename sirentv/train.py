@@ -245,7 +245,8 @@ def train(cfg: dict):
 
             # Step the logger
             with torch.no_grad():
-                pred['t_linear'] = dl.inv_xform_vis(pred['t'])
+                pred['v_linear'] = dl.inv_xform_vis(pred['v'])
+                pred['t_linear'] = pred['t']
                 logger.step(iteration_ctr, target, pred)
 
             # Save the model parameters if the condition is met

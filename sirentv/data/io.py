@@ -106,14 +106,13 @@ class PLibDataLoader:
         loader_cfg = cfg.get("data", {}).get("loader")
         geom_cfg = cfg.get("data", {}).get("geometry")
         self._batch_mode = loader_cfg is not None
-        self._n_photons = cfg["data"]["dataset"]["weight"].get("n_photon", 200000)
-
+        self._n_photons = cfg["data"].get("n_photon", 200000)
+        self._n_pmt = cfg["data"].get("n_pmt", 81)
         if self._batch_mode:
             # dataloader in batches
             self._batch_size = loader_cfg.get("batch_size", 1)
             self._shuffle = loader_cfg.get("shuffle", False)
             self._drop_last = loader_cfg.get("drop_last", True)
-            self._n_pmt = geom_cfg.get("n_pmts", 48)
 
         # returns the whole plib in a single batch
         if not self._is_lazy:
@@ -204,16 +203,15 @@ class PLibDataLoader:
                         vis = self._plib.vis[vox_ids] * self._plib.eff
 
                     vis = vis.view(vis.shape[0], self._n_pmt, -1)
-                    w = self.get_weight(vis)
+                    #w = self.get_weight(vis)
                     target = self.xform_vis(vis)
-                    yield dict(position=pos_raw, value=vis, weight=w, target=target)
+                    yield dict(position=pos_raw, target_linear=vis, target=target)
                 else:
                     #vis = self._cache["value"][vox_ids]
                     # print(self._cache["target"][vox_ids][0,48:])
                     output = dict(
                         position=self._cache["position"][vox_ids],
-                        value=self._cache["value"][vox_ids],
-                        weight=self._cache["weight"][vox_ids],
+                        target_linear=self._cache["value"][vox_ids],
                         target=self._cache["target"][vox_ids],
                     )
                     yield output
@@ -229,12 +227,12 @@ class PLibDataLoader:
                 except Exception:
                     vis = self._plib.vis
 
-                w = self.get_weight(vis)
+                #w = self.get_weight(vis)
                 target = self.xform_vis(vis)
                 yield dict(
                     position=pos.to(self.device),  
-                    value=vis.to(self.device),
-                    weight=w.to(self.device),
+                    target_linear=vis.to(self.device),
+                    #weight=w.to(self.device),
                     target=target.to(self.device),
                 )
             else:
