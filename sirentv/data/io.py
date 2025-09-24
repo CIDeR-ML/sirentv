@@ -216,6 +216,9 @@ class PLibDataLoader:
                     vis = vis.view(vis.shape[0], self._n_pmt, -1)
                     #w = self.get_weight(vis)
                     target = self.xform_vis(vis)
+
+                    if pos_raw.dim() == 1:
+                        pos_raw = pos_raw.unsqueeze(0)
                     yield dict(position=pos_raw, target_linear=vis, target=target)
                 else:
                     #vis = self._cache["value"][vox_ids]
@@ -242,6 +245,9 @@ class PLibDataLoader:
 
                 #w = self.get_weight(vis)
                 target = self.xform_vis(vis)
+
+                if pos.dim() == 1:
+                    pos = pos.unsqueeze(0)
                 yield dict(
                     position=pos.to(self.device),  
                     target_linear=vis.to(self.device),
