@@ -111,6 +111,67 @@ class WandbLogger(Logger):
                 self.record([key], [f(label, pred)])
         self.write()
 
+    def plot(self, iteration, inferred: dict, kind="scatter"):
+        """
+        Log a plot of x vs y at the given iteration.
+
+        Parameters
+        ----------
+        iteration : int
+            Training iteration or epoch.
+        inferred : dict[torch.Tensor]
+        kind : str
+            Type of plot: "line" or "scatter" (default).
+        """
+
+        if inferred is None:
+            return
+
+        x = inferred['x_value'].detach().cpu().numpy()
+        visibility = inferred['visibility'].detach().cpu().numpy()
+        pdf = inferred['pdf'].detach().cpu().numpy()
+        cdf = inferred['cdf'].detach().cpu().numpy()
+
+        import matplotlib.pyplot as plt
+
+        # --- Visibility plot ---
+        fig_vis, ax_vis = plt.subplots()
+        ax_vis.scatter(visibility[:, 0], visibility[:, 1], label="Target vs Pred")
+        ax_vis.set_xlabel("Target Visibility")
+        ax_vis.set_ylabel("Predicted Visibility")
+        ax_vis.set_title("PMT Visibility")
+        ax_vis.legend()
+
+        # --- PDF plot ---
+        fig_pdf, ax_pdf = plt.subplots()
+        ax_pdf.plot(x, pdf[:, 0], label="Target")
+        ax_pdf.plot(x, pdf[:, 1], label="Predicted")
+        ax_pdf.set_xlabel("Time (ns)")
+        ax_pdf.set_ylabel("Value")
+        ax_pdf.set_title("Waveform PDF")
+        ax_pdf.legend()
+
+        # --- CDF plot ---
+        fig_cdf, ax_pdf = plt.subplots()
+        ax_pdf.plot(x, cdf[:, 0], label="Target")
+        ax_pdf.plot(x, cdf[:, 1], label="Predicted")
+        ax_pdf.set_xlabel("Time (ns)")
+        ax_pdf.set_ylabel("Value")
+        ax_pdf.set_title("Waveform CDF")
+        ax_pdf.legend()
+
+        # log both figures in a single step
+        wandb.log({
+            "PMT Visibility": wandb.Image(fig_vis),
+            "PDF": wandb.Image(fig_pdf),
+            "CDF": wandb.Image(fig_cdf),
+        }, step=iteration)
+
+        plt.close(fig_vis)
+        plt.close(fig_pdf)
+        plt.close(fig_cdf)
+
+
     def close(self):
         """
         Finish the wandb run.

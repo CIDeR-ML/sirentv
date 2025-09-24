@@ -264,6 +264,10 @@ class SirenTV(nn.Module):
     def n_outs(self):
         return sum(self.out_features) if isinstance(self.out_features, (list, tuple)) else self.out_features
 
+    def freeze_all(self):
+        """Unfreeze all parameters in the network"""
+        for param in self.model.parameters():
+            param.requires_grad = False
     def unfreeze_all(self):
         """Unfreeze all parameters in the network"""
         for param in self.model.parameters():

@@ -21,6 +21,7 @@ from sirentv.loss.builder import build_loss as build_loss_fn, build_regularizer 
 from sirentv.utils.comm import create_ddp_model
 from sirentv.utils.log import CSVLogger, WandbLogger, Logger
 from sirentv.utils.transform import pdf_to_cdf
+from sirentv.infer import infer_single_pos_single_pmt
 
 def get_weight_by_vis(vis, factor=None, threshold=1e-8):
     """
@@ -262,6 +263,11 @@ def train(cfg: dict):
                 pred['v_linear'] = dl.inv_xform_vis(pred['v'])
                 pred['t_linear'] = pred['t']
                 logger.step(iteration_ctr, target, pred)
+
+            if iteration_ctr % 10 == 0:
+                inferred_output = infer_single_pos_single_pmt(net, x, target, tick_size)
+                logger.plot(iteration_ctr, inferred_output)
+
 
             # Save the model parameters if the condition is met
             if save_every_iterations > 0 and iteration_ctr % save_every_iterations == 0:
