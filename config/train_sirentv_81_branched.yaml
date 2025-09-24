@@ -1,6 +1,9 @@
 photonlib:
     filepath: /sdf/data/neutrino/pubdata/lut/optical/waveform_map/batch02/consolidated/plib.h5
     lazy: True
+    time_tick_size: 0.1 #ns
+physics:
+    R_index: 1.233
 device: 
     type: cuda
 model:
@@ -54,6 +57,10 @@ logger:
         suffix: vis
         key: v_linear
         threshold: 1.0e-06
+      - func: bias
+        suffix: t0
+        key: t0
+        threshold: 1.0e-02
 train:
     loss:
       - type: SmoothL1Loss

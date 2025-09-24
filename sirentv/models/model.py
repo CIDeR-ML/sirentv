@@ -46,6 +46,7 @@ class SirenTV(nn.Module):
             self._meta = AABox.load(cfg["photonlib"]["filepath"])
 
         with h5py.File(cfg["photonlib"]["filepath"], 'r') as file:
+            self.pmt_coords = torch.tensor(file['pmt_pos'][:], dtype=torch.float32)
             self.norm_pmt_coords = torch.tensor(file['pmt_norm_pos'][:], dtype=torch.float32)
         # Transform functions
         self._xform_vis, self._inv_xform_vis = partial_xform_vis(self.config_xform)
@@ -111,6 +112,14 @@ class SirenTV(nn.Module):
             pos.shape[0], *out['t'].shape[1:], dtype=torch.float32, device=self.device
         )
         t[mask] = out['t'].to(self.device)
+
+        if 't0' in out:
+            t0 = torch.zeros(
+                pos.shape[0], *out['t0'].shape[1:], dtype=torch.float32, device=self.device
+            )
+            t0[mask] = out['t0'].to(self.device)
+            return {"t": t, "v": v, "t0": t0, "correct_mask": mask}
+
         return {"t": t, "v": v, "correct_mask": mask}
 
     def visibility(self, x, return_type: Literal["pdf", "cdf"] = "pdf"):
