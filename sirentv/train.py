@@ -208,12 +208,13 @@ def train(cfg: dict):
                 # OUTPUTS:
                 # v: visibilities, (B, N_pmt)
                 # t: CDF/PDF, (B, N_pmt, N_time)
-                # t0 (possibly)
+                # t0 (possibly, in the units of ticks)
 
                 if 't0' in pred.keys():
                     pmt_pos = net.pmt_coords
+                    pred['t0'] *= tick_size
                     distances = torch.cdist(x, pmt_pos)
-                    tof = distances / speed_of_light / tick_size # convert to ticks per tick_size
+                    tof = distances / speed_of_light # in ns
                     target["t0"] = tof
 
                 losses = compute_loss(
