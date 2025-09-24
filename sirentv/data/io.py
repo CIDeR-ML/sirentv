@@ -74,26 +74,6 @@ class PLibDataLoader:
         # load plib to device
         self._plib = PhotonLib.load(cfg, self._is_lazy).to(device)
 
-        # # get weighting scheme
-        # weight_cfg = cfg.get("data", {}).get("dataset", {}).get("weight", {})
-        # if weight_cfg:
-        #     method = weight_cfg.get("method")
-        #     if method == "vis":
-        #         self.get_weight = self.get_weight_by_vis
-        #         print("[PLibDataLoader] weighting using", method)
-        #         print("[PLibDataLoader] params:", weight_cfg)
-        #     elif method == "bivis":
-        #         self.get_weight = self.get_biweight_by_vis
-        #         print("[PLibDataLoader] weighting using", method)
-        #         print("[PLibDataLoader] params:", weight_cfg)
-        #     else:
-        #         self.get_weight = lambda vis: vis.new_ones(vis.shape, device=device)
-        #         # raise NotImplementedError(f'Weight method {method} is invalid')
-        #     self._weight_cfg = weight_cfg
-        # else:
-        #     print("[PLibDataLoader] weight = 1")
-        #     self.get_weight = lambda vis: vis.new_ones(vis.shape, device=device)
-
         # tranform visiblity in pseudo-log scale (default: False)
         xform_params = cfg.get("transform_vis")
         if xform_params:
@@ -103,22 +83,49 @@ class PLibDataLoader:
         self.xform_vis, self.inv_xform_vis = partial_xform_vis(xform_params)
 
         # prepare dataloader
-        loader_cfg = cfg.get("data", {}).get("loader")
-        geom_cfg = cfg.get("data", {}).get("geometry")
+        data_cfg = cfg["data"]
+        loader_cfg = data_cfg.get("loader")
+        geom_cfg = data_cfg.get("geometry")
         self._batch_mode = loader_cfg is not None
-        self._n_photons = cfg["data"].get("n_photon", 200000)
-        self._n_pmt = cfg["data"].get("n_pmt", 81)
+        self._n_photons = data_cfg.get("n_photon", 200000)
+        self._n_pmt = data_cfg.get("n_pmt", 81)
+        self._drop_last = False
         if self._batch_mode:
             # dataloader in batches
             self._batch_size = loader_cfg.get("batch_size", 1)
             self._shuffle = loader_cfg.get("shuffle", False)
             self._drop_last = loader_cfg.get("drop_last", True)
 
+        max_len = data_cfg.get("max_len", -1)
+        if max_len is None:
+            max_len = -1
+        try:
+            self._max_len = int(max_len)
+        except (TypeError, ValueError):
+            raise ValueError("max_len must be an integer, -1, or None") from None
+        if self._max_len < 0:
+            self._max_len = -1
+
+        self._total_voxels = len(self._plib)
+        if self._max_len == -1:
+            self._effective_voxels = self._total_voxels
+        else:
+            self._effective_voxels = min(self._total_voxels, self._max_len)
+
+        if self._batch_mode and self._drop_last and self._batch_size > 0:
+            remainder = self._effective_voxels % self._batch_size
+            if remainder:
+                self._effective_voxels -= remainder
+
+        if self._effective_voxels < 0:
+            self._effective_voxels = 0
+        
+
         # returns the whole plib in a single batch
         if not self._is_lazy:
             print("[PLibDataLoader] precomputing full-cache")
             # precompute full-cache only when non-lazy
-            n_voxels = len(self._plib) - 1 if self._drop_last else len(self._plib)
+            n_voxels = self._effective_voxels
             vox_ids = torch.arange(n_voxels, device=device)
 
             meta = self._plib.meta
@@ -167,11 +174,11 @@ class PLibDataLoader:
 
         if self._batch_mode:
             if self._drop_last:
-                return len(self._plib) // self._batch_size
+                return self._effective_voxels // self._batch_size
             else:
-                return ceil(len(self._plib) / self._batch_size)
+                return ceil(self._effective_voxels / self._batch_size) if self._effective_voxels else 0
 
-        return 1
+        return 1 if self._effective_voxels else 0
 
     def __iter__(self):
         """
@@ -188,10 +195,14 @@ class PLibDataLoader:
             else:
                 vox_list = torch.arange(n_voxels, device=self.device)
 
+            vox_list = vox_list[: self._effective_voxels]
+
             for b in range(len(self)):
                 sel = slice(b * self._batch_size, (b + 1) * self._batch_size)
 
                 vox_ids = vox_list[sel]
+                if vox_ids.numel() == 0:
+                    break
                 if self._is_lazy or self._cache is None:
                     # fetch per-batch on the fly
                     pos_raw = meta.voxel_to_coord(vox_ids)
@@ -218,7 +229,9 @@ class PLibDataLoader:
         else:
             if self._is_lazy or self._cache is None:
                 # build on demand without precomputing entire cache in ctor
-                n_voxels = len(self._plib)
+                n_voxels = self._effective_voxels
+                if n_voxels == 0:
+                    return
                 vox_ids = torch.arange(n_voxels, device=self.device)
                 meta = self._plib.meta
                 pos = meta.voxel_to_coord(vox_ids)
