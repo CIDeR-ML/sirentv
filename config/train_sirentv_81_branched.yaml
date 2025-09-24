@@ -46,11 +46,11 @@ logger:
     project: branched-siren-81
     name: siren_81-vis
     analysis:
-      bias:
+      - func: bias
         suffix: time
         key: t_linear
         threshold: 1.0e-06
-      bias:
+      - func: bias
         suffix: vis
         key: v_linear
         threshold: 1.0e-06
