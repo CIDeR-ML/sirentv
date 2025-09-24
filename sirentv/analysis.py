@@ -153,6 +153,7 @@ def abs_bias(
     pred: dict[str, torch.Tensor],
     key: str,
     signed=False,
+    threshold: float = 0.0,
 ):
     """
     Function to compute the absolute bias (the mean of |target - pred|)
@@ -175,8 +176,13 @@ def abs_bias(
     pred = pred[key]
 
     target = target.to(pred.device)
+
+    mask = target > threshold
+    p = pred[mask]
+    t = target[mask]
+
     if target.shape != pred.shape:
         raise ValueError(
             f"target and pred must have the same shape {(*target.shape,)} != {(*pred.shape,)}"
         )
-    return torch.abs(target - pred).mean() if not signed else (target - pred).mean()
+    return torch.abs(t - p).mean() if not signed else (t - p).mean()

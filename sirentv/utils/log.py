@@ -49,12 +49,16 @@ class WandbLogger(Logger):
         log_cfg = cfg.get("logger", dict())
         self.project = log_cfg.get("project", "default-project")
         self.name = log_cfg.get("name", None)
+        self.entity = log_cfg.get("entity", None)
         self._log_every_nsteps = log_cfg.get("log_every_nsteps", 1)
         self._logdir = self.make_logdir(log_cfg.get("dir_name", "logs"))
         self._logfile = os.path.join(self._logdir, cfg.get("file_name", "log.csv"))
 
         # Initialize wandb
-        wandb.init(project=self.project, name=self.name, config=cfg)
+        proj_cfg = dict(project=self.project, name=self.name)
+        if self.entity:
+            proj_cfg["entity"] = self.entity
+        wandb.init(**proj_cfg, config=cfg)
 
         print(f"[WandbLogger] Initialized wandb project: {self.project}")
 
