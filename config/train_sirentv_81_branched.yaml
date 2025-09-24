@@ -47,9 +47,11 @@ logger:
     name: siren_81-vis
     analysis:
       bias:
+        suffix: time
         key: t_linear
         threshold: 1.0e-06
       bias:
+        suffix: vis
         key: v_linear
         threshold: 1.0e-06
 train:

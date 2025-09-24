@@ -63,7 +63,10 @@ class WandbLogger(Logger):
 
         for key, kwargs in log_cfg.get("analysis", dict()).items():
             print("[WandbLogger] adding analysis function:", key)
-            self._analysis_dict[key] = partial(
+            suffix = kwargs.pop("suffix", "")
+            if suffix:
+                suffix = f"_{suffix}"
+            self._analysis_dict[key + suffix] = partial(
                 getattr(importlib.import_module("sirentv.analysis"), key), **kwargs
             )
 
@@ -196,7 +199,10 @@ class CSVLogger(Logger):
 
         for key, kwargs in log_cfg.get("analysis", dict()).items():
             print("[CSVLogger] adding analysis function:", key)
-            self._analysis_dict[key] = partial(
+            suffix = kwargs.pop("suffix", "")
+            if suffix:
+                suffix = f"_{suffix}"
+            self._analysis_dict[key + suffix] = partial(
                 getattr(importlib.import_module("sirentv.analysis"), key), **kwargs
             )
 
