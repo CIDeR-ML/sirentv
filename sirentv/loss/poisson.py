@@ -26,6 +26,9 @@ class WeightedPoissonNLLLoss(nn.Module):
         ):
         if weight is None:
             weight = {self.key: torch.ones_like(pred[self.key])}
+        device = pred[self.key].device
+        weight[self.key] = weight[self.key].to(device)
+        target[self.key] = target[self.key].to(device)
         # ensure positivity and numerical stability
         pred_lin = torch.clamp(pred[self.key], min=self.eps)
         # poisson nll without constant term: lambda - k * log(lambda)

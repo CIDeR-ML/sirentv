@@ -23,6 +23,9 @@ class WeightedCosineDissimilarity(nn.Module):
     def forward(self, pred: dict[str, torch.Tensor], target: dict[str, torch.Tensor], weight: torch.Tensor):
         pred = pred[self.key]
         target = target[self.key]
+        device = pred.device
+        target = target.to(device)
+
         pred_norm = F.normalize(pred, p=2, dim=-1)
         target_norm = F.normalize(target, p=2, dim=-1)
         # normalize_weights = F.normalize(weight, p=2, dim=-1) if hasattr(weight, 'norm') else weight

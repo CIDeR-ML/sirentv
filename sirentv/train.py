@@ -70,12 +70,12 @@ def compute_loss(
         losses: list[nn.Module],
         weights: dict[str, torch.Tensor],
     ):
-    losses = []
+    losses_out = []
     for loss in losses:
         curr_loss = loss(pred, target, weights)
-        losses.append(curr_loss)
-    losses = torch.stack(losses)
-    return losses
+        losses_out.append(curr_loss)
+    losses_out = torch.stack(losses_out)
+    return losses_out
 
 def train(cfg: dict):
     """
@@ -245,7 +245,8 @@ def train(cfg: dict):
 
             # Step the logger
             with torch.no_grad():
-                pred['t_linear'] = dl.inv_xform_vis(pred['t'])
+                pred['v_linear'] = dl.inv_xform_vis(pred['v'])
+                pred['t_linear'] = pred['t']
                 logger.step(iteration_ctr, target, pred)
 
             # Save the model parameters if the condition is met

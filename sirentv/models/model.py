@@ -1,7 +1,9 @@
 from typing import Union, Literal
 
+import os
 import numpy as np
 import torch
+import h5py
 import torch.nn as nn
 from photonlib import AABox
 from slar.transform import partial_xform_vis
@@ -14,13 +16,20 @@ class SirenTV(nn.Module):
     def __init__(self, cfg: dict, meta=None):
         super().__init__()
         self.config_model = cfg["model"]
+        self.config_loader = cfg["data"]["loader"]
         self.config_xform = cfg.get("transform_vis", None)
         if self.config_xform is None:
             print("[SirenTV] transform_vis is not set, using default values")
             self.config_xform = {}
         self.config_model['network']['xform_vis'] = self.config_xform
 
-        self.model = build_model(self.config_model["network"])
+        self.mode = self.config_model.get("mode", "pdf")
+        self._use_cdf = (self.mode.lower() == "cdf")
+        model_config = self.config_model["network"]
+        model_config.update({
+            "use_CDF": self._use_cdf
+        })
+        self.model = build_model(model_config)
         self.out_features = self.model.out_features
         ckpt_file = self.config_model.get("ckpt_file")
         if ckpt_file:
@@ -35,14 +44,21 @@ class SirenTV(nn.Module):
             self._meta = meta
         elif "photonlib" in cfg:
             self._meta = AABox.load(cfg["photonlib"]["filepath"])
+
+        with h5py.File(cfg["photonlib"]["filepath"], 'r') as file:
+            self.norm_pmt_coords = torch.tensor(file['pmt_norm_pos'][:], dtype=torch.float32)
         # Transform functions
         self._xform_vis, self._inv_xform_vis = partial_xform_vis(self.config_xform)
 
         # Extensions for visibility model
         self._init_output_scale(self.config_model)
         self._do_hardsigmoid = self.config_model.get("hardsigmoid", False)
-        self.mode = self.config_model.get("mode", "pdf")
         self.tick_size = self.config_model.get("tick_size", 0.1) # ns
+
+        self.n_pmts = len(self.norm_pmt_coords)
+        self.batch_size = self.config_loader.get("batch_size", 1024)
+        self.norm_pmt_tile = torch.tile(self.norm_pmt_coords.unsqueeze(0), (self.batch_size, 1, 1))
+
 
     def to(self, device):
         self._meta.to(device)
@@ -77,22 +93,24 @@ class SirenTV(nn.Module):
             Dictionary containing the PDF/CDF of the waveform and the visibility.
             The keys are "t" and "v".
         """
-        device = x.device
+        #device = x.device
         x = x.to(self.device)
         pos = x.unsqueeze(0) if x.dim() == 1 else x
-
-        mask = self.meta.contain(pos)
-        out = self.model(self.meta.norm_coord(pos[mask]).to(self.device))#.to(device)
+        assert len(pos) == self.batch_size, "Loader batch size not consistent with config"
+        mask = self.meta.contain(pos).to(self.device)
+        norm_pos = torch.tile(self.meta.norm_coord(pos[mask]).unsqueeze(1), (1, self.n_pmts, 1)).to(self.device)
+        input_to_net = torch.cat([norm_pos, self.norm_pmt_tile.to(self.device)], dim=-1).to(self.device)
+        out = self.model(input_to_net)#.to(device)
 
         v = torch.zeros(
             pos.shape[0], out['v'].shape[-1], dtype=torch.float32, device=self.device
         )
-        v[mask] = out['v'].to(device)
+        v[mask] = out['v'].to(self.device)
 
         t = torch.zeros(
             pos.shape[0], *out['t'].shape[1:], dtype=torch.float32, device=self.device
         )
-        t[mask] = out['t'].to(device)
+        t[mask] = out['t'].to(self.device)
         return {"t": t, "v": v, "correct_mask": mask}
 
     def visibility(self, x, return_type: Literal["pdf", "cdf"] = "pdf"):
@@ -236,3 +254,36 @@ class SirenTV(nn.Module):
     @property
     def n_outs(self):
         return sum(self.out_features) if isinstance(self.out_features, (list, tuple)) else self.out_features
+
+    def unfreeze_all(self):
+        """Unfreeze all parameters in the network"""
+        for param in self.model.parameters():
+            param.requires_grad = True
+    def get_trainable_params(self):
+        """Return only the parameters that require gradients"""
+        return filter(lambda p: p.requires_grad, self.model.parameters())
+
+    """
+    def freeze_all_but_(self, part: Literal["timing", "visibility"] = "timing"):
+        self.unfreeze_all()
+        self.encoder.requires_grad_(False)
+        if decoder == "timing":
+            self.vis_decoder.requires_grad_(False)
+        elif decoder == "visibility":
+            self.waveform_decoder.requires_grad_(False)
+        else:
+            raise ValueError(f"Invalid decoder: {decoder}")
+    """
+
+    def print_trainable_params(self):
+        """Print the names of trainable parameters"""
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                print(f"Trainable: {name}")
+            else:
+                print(f"Frozen: {name}")
+
+    def __repr__(self):
+        n_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        memory_mb = n_params * 4 / (1024 * 1024)  # assume fp32
+        return f"{n_params:,} trainable parameters\n{memory_mb:2f} MB\n{super().__repr__()}"

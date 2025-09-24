@@ -9,9 +9,12 @@ class JSDivergenceLoss(nn.Module):
         self.reduce = reduce_method
 
     def forward(self, pred, target, eps=1.0e-10):
+
         batch_size = pred.size(0)
         n_pmts = pred.size(1)
         n_tbins = pred.size(2)
+        device = pred.device
+        target = target.to(device)
 
         pred_clamped = torch.clamp(pred, min=eps)
         P = (target / (target.sum(dim=-1, keepdim=True) + eps)).view(-1, n_tbins)

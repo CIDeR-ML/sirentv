@@ -25,6 +25,8 @@ class ConditionalSiren(nn.Module):
         rank_time=8,
         fusion_omega0: float = 30.0,
         pmt_pos_path: str = None,
+        steepness_factor: float = 10.0,
+        use_CDF: bool = True,
     ):
         super().__init__()
         self.use_low_rank_fusion = use_low_rank_fusion
@@ -96,7 +98,10 @@ class ConditionalSiren(nn.Module):
 
         self._xform_vis, self._inv_xform_vis = partial_xform_vis(xform_vis)
 
-        self.out_features = [n_pmts, n_pmts * n_time_steps]
+        #self.out_features = [n_pmts, n_pmts * n_time_steps]
+        self.out_features = [1, 1 + n_time_steps]
+        self._steepness_factor = steepness_factor
+        self._use_CDF = use_CDF
 
     def set_pmt_positions(self, pmt_pos: torch.Tensor):
         assert pmt_pos.shape == (self.n_pmts, 3)
@@ -146,11 +151,12 @@ class ConditionalSiren(nn.Module):
                 + self.output_bias
             )
         if self.final_activation == "sine":
-            out_t = torch.sin(self.fusion_omega0 * out_t).view(N, PMT * T)
+            out_t = torch.sin(self.fusion_omega0 * out_t).view(N*PMT, T)
         else:
-            out_t = out_t.sigmoid().view(N, PMT * T)
+            out_t = out_t.sigmoid().view(N*PMT,T)
 
         out_v = self._xform_vis(
-            self._inv_xform_vis(out_t.reshape(N, PMT, T)).sum(-1)
-        ).detach()
-        return torch.cat([out_v, out_t], dim=-1)
+            self._inv_xform_vis(out_t.reshape(N, PMT, T)).sum(-1)).unsqueeze(1)
+
+        output = dict(v=out_v, t=out_t)
+        return output

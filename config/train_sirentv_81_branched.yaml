@@ -1,0 +1,75 @@
+photonlib:
+    filepath: /sdf/data/neutrino/pubdata/lut/optical/waveform_map/batch02/consolidated/plib.h5
+    lazy: True
+device: 
+    type: cuda
+model:
+  ckpt_file: null
+  mode: cdf
+  network:
+    type: BranchedSiren # or ConditionalSiren or BranchedSiren
+    in_features: 6
+    hidden_features: [256, 256, 1024]
+    hidden_layers: [2, 3, 3]
+    out_features: [1, 1001]
+    outermost_linear: True
+    steepness_factor: 10.0
+  output_scale:
+      fix: True
+transform_vis:
+    vmax: 1.0
+    eps: 1.e-8
+    sin_out: False
+data:
+    n_photon: 200000
+    n_pmt: 81
+    weight:
+      t:
+        enable: false
+        factor: 1000000.0
+        threshold: 1.0e-08
+      v:
+        enable: true
+        factor: 5000.0
+        threshold: 1.0e-08
+    loader:
+      batch_size: 1024
+      drop_last: true
+      num_workers: 4
+      pin_memory: true
+      shuffle: true
+logger:
+    type: wandb
+    dir_name: logs_xyz_81_vis_weighting
+    file_name: log.csv
+    log_every_nstep: 8
+    project: branched-siren-81
+    name: siren_81-vis
+    analysis:
+      bias:
+        key: t_linear
+        threshold: 1.0e-06
+      bias:
+        key: v_linear
+        threshold: 1.0e-06
+train:
+    loss:
+      - type: SmoothL1Loss
+        key: t
+        weight: 1.0
+      - type: SmoothL1Loss
+        key: v
+        weight: 1.0
+    regularization: null
+    reduction: sum
+    max_epochs: 500
+    optimizer_class: AdamW
+    optimizer_param:
+      lr: 1.0e-06
+    resume: false
+    save_every_epochs: 500
+    scheduler_class: ReduceLROnPlateau
+    scheduler_param:
+      patience: 10
+      factor: 0.5
+      verbose: true

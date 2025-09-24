@@ -141,3 +141,18 @@ def import_modules_from_strings(imports, allow_failed_imports=False):
 class DummyClass:
     def __init__(self):
         pass
+
+def t0_mask(n_ticks, t0, t_profile, steepness_factor, use_CDF=True):
+    # create time indices
+    time_indices = torch.arange(n_ticks, device=t_profile.device, dtype=torch.float32)[None, None, :]
+    # create soft mask using sigmoid for smooth transition
+    mask = torch.sigmoid((time_indices - t0) * steepness_factor)  # steepness factor of 10
+
+    out_cdf = t_profile.softmax(-1)
+    # normalize and cumsum only the valid part
+    if use_CDF:
+        out_cdf = out_cdf.cumsum(-1)
+    # apply soft mask to make cdf smoothly transition from zero before t0
+    out_cdf = out_cdf * mask
+
+    return out_cdf

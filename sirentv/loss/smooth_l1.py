@@ -28,7 +28,11 @@ class WeightedSmoothL1Loss(nn.Module):
     ):
         if weight is None:
             weight = {self.key: torch.ones_like(pred[self.key])}
-        loss = weight[self.key] * F.smooth_l1_loss(pred[self.key] - target[self.key], **self.kwargs)
+
+        device = pred[self.key].device
+        weight[self.key] = weight[self.key].to(device)
+        target[self.key] = target[self.key].to(device)
+        loss = weight[self.key] * F.smooth_l1_loss(pred[self.key], target[self.key], **self.kwargs)
         return self.weight * self.reduce(loss)
 
 

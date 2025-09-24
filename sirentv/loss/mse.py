@@ -21,6 +21,10 @@ class WeightedL2Loss(nn.Module):
         ):
         if weight is None:
             weight = {self.key: torch.ones_like(pred[self.key])}
+        device = pred[self.key].device
+        weight[self.key] = weight[self.key].to(device)
+        target[self.key] = target[self.key].to(device)
+
         loss = weight[self.key] * (pred[self.key] - target[self.key]) ** 2
         return self.weight * self.reduce(loss)
 
