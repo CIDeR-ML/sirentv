@@ -112,7 +112,7 @@ class WandbLogger(Logger):
 
         if None not in (label, pred):
             for key, f in self._analysis_dict.items():
-                self.record([key], [f(label, pred)])
+                self.record(["analysis/"+key], [f(label, pred)])
         self.write()
 
     def plot(self, iteration, inferred: dict):
@@ -122,7 +122,7 @@ class WandbLogger(Logger):
         Parameters
         ----------
         iteration : int
-            Training iteration or epoch.
+            Training iteration or epozch.
         inferred : dict[torch.Tensor]
         kind : str
             Type of plot: "line" or "scatter" (default).
@@ -141,6 +141,10 @@ class WandbLogger(Logger):
         # --- Visibility plot ---
         fig_vis, ax_vis = plt.subplots()
         ax_vis.scatter(visibility[:, 0], visibility[:, 1], label="Target vs Pred")
+        max_val = max(visibility[:, 0].max(), visibility[:, 1].max())*1.1
+        ax_vis.set_xlim(0, max_val)
+        ax_vis.set_ylim(0, max_val)
+        ax_vis.plot([0, 1], [0, 1], 'r--', alpha=0.8, label="y=x")
         ax_vis.set_xlabel("Target Visibility")
         ax_vis.set_ylabel("Predicted Visibility")
         ax_vis.set_title("PMT Visibility")
