@@ -1,12 +1,10 @@
 from __future__ import annotations
 import os
-import time
 from contextlib import nullcontext
-from typing import Literal, List
+from typing import Literal
 
-import numpy as np
+
 import torch
-import torch.nn.functional as F
 import torch.nn as nn
 import yaml
 from sirentv.data.io import PLibDataLoader
@@ -171,10 +169,11 @@ def train(cfg: dict):
             with (torch.autocast(device_type=DEVICE.type, dtype=torch.bfloat16) if amp else nullcontext()):
 
                 x = data["position"].contiguous()#.to(DEVICE)
-                target_t_pdf = data["target"].contiguous().squeeze()#.to(DEVICE)
-                target_t_pdf_linear = data["target_linear"].contiguous().squeeze()#.to(DEVICE)
+                target_t_pdf = data["target"].contiguous()#.to(DEVICE)
+                target_t_pdf_linear = data["target_linear"].contiguous()#.to(DEVICE)
                 target_v_linear = target_t_pdf_linear.sum(-1)
                 target_v = dl.xform_vis(target_v_linear)
+
 
                 if mode == "cdf":
                     target_t_cdf = pdf_to_cdf(target_t_pdf_linear) # <-- in linear domain!
