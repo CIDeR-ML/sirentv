@@ -26,10 +26,8 @@ def get_pred_target(dataloader, net, max_voxels=pow(2, 18)): # 262144 vox max
 
     batch_size = 2048
     pred_t = []
-    curr_idx = 0
     for i in range(len(positions) // batch_size):
-        curr_idx = i * batch_size
-        pred_t_ = net.visibility(positions[curr_idx : curr_idx + batch_size]) # (B, N_pmt, N_tick)
+        pred_t_ = net.visibility(positions[i * batch_size : (i + 1) * batch_size]) # (B, N_pmt, N_tick)
         pred_t.append(pred_t_.cpu())
     pred_t_pdf_unnorm = torch.cat(pred_t, dim=0) # (B, N_pmt, N_tick)
     target_t_pdf_unnorm = dataloader._plib[vox_ids].squeeze().cpu() #
