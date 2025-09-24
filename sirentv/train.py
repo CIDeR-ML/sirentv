@@ -73,7 +73,8 @@ def compute_loss(
     losses_out = {}
     for loss in losses:
         curr_loss = loss(pred, target, weights)
-        losses_out[loss.key] = curr_loss
+        cls_name = loss.__class__.__name__.lower()
+        losses_out[f"{cls_name}_{loss.key}"] = curr_loss
     return losses_out
 
 def train(cfg: dict):
