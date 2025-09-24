@@ -19,7 +19,7 @@ from sirentv.analysis import get_pred_target, log_imshow, log_line, log_pred_tar
 from sirentv.models import SirenTV
 from sirentv.loss.builder import build_loss as build_loss_fn, build_regularizer as build_regularizer_fn
 from sirentv.utils.comm import create_ddp_model
-from sirentv.utils.log import CSVLogger, WandbLogger
+from sirentv.utils.log import CSVLogger, WandbLogger, Logger
 from sirentv.utils.transform import pdf_to_cdf
 
 def get_weight_by_vis(vis, factor=None, threshold=1e-8):
@@ -50,13 +50,13 @@ def build_losses(cfg):
         losses.append(build_loss_fn(cfg))
     return losses
 
-def build_regularizer(cfg):
+def build_regularizer(cfg) -> nn.Module | None:
     regularizer_cfg = cfg.get("train", dict()).get("regularization", None)
     if regularizer_cfg is None:
         return None
     return build_regularizer_fn(regularizer_cfg)
 
-def build_logger(cfg, net):
+def build_logger(cfg, net) -> Logger:
     logger_type = cfg.get("logger", dict()).get("type", "csv")
     logger = CSVLogger(cfg) if logger_type == "csv" else WandbLogger(cfg)
     if hasattr(logger, "watch_grad"):
@@ -69,12 +69,11 @@ def compute_loss(
         target: dict[str, torch.Tensor],
         losses: list[nn.Module],
         weights: dict[str, torch.Tensor],
-    ):
-    losses_out = []
+    ) -> dict[str, torch.Tensor]:
+    losses_out = {}
     for loss in losses:
         curr_loss = loss(pred, target, weights)
-        losses_out.append(curr_loss)
-    losses_out = torch.stack(losses_out)
+        losses_out[loss.key] = curr_loss
     return losses_out
 
 def train(cfg: dict):
@@ -212,6 +211,9 @@ def train(cfg: dict):
                     weights,
                 )
 
+                keys, losses = zip(*losses.items())
+                losses = torch.stack(losses)
+
                 if reduction == "mean":
                     loss = torch.mean(losses)
                 elif reduction == "geometric_mean":
@@ -239,7 +241,7 @@ def train(cfg: dict):
 
             # Log training parameters           
             logger.record(
-                ["iter", "epoch", "lr"] + [f'loss_{i}' for i in range(len(losses))] + ["loss"],
+                ["iter", "epoch", "lr"] + [f'loss_{k}' for k in keys] + ["loss"],
                 [iteration_ctr, epoch_ctr, current_lr] + losses.detach().cpu().tolist() + [loss.item()],
             )
 
