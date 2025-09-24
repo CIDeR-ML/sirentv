@@ -115,7 +115,7 @@ class WandbLogger(Logger):
                 self.record([key], [f(label, pred)])
         self.write()
 
-    def plot(self, iteration, inferred: dict, kind="scatter"):
+    def plot(self, iteration, inferred: dict):
         """
         Log a plot of x vs y at the given iteration.
 
@@ -148,21 +148,25 @@ class WandbLogger(Logger):
 
         # --- PDF plot ---
         fig_pdf, ax_pdf = plt.subplots()
-        ax_pdf.plot(x, pdf[:, 0], label="Target")
-        ax_pdf.plot(x, pdf[:, 1], label="Predicted")
+        ax_pdf.plot(x, pdf[:, 0], label="Target", color="navy")
+        ax_pdf.plot(x, pdf[:, 1], label="Predicted", color="darkorange")
         ax_pdf.set_xlabel("Time (ns)")
         ax_pdf.set_ylabel("Value")
         ax_pdf.set_title("Waveform PDF")
         ax_pdf.legend()
 
         # --- CDF plot ---
-        fig_cdf, ax_pdf = plt.subplots()
-        ax_pdf.plot(x, cdf[:, 0], label="Target")
-        ax_pdf.plot(x, cdf[:, 1], label="Predicted")
-        ax_pdf.set_xlabel("Time (ns)")
-        ax_pdf.set_ylabel("Value")
-        ax_pdf.set_title("Waveform CDF")
-        ax_pdf.legend()
+        fig_cdf, ax_cdf = plt.subplots()
+        ax_cdf.plot(x, cdf[:, 0], label="Target", color="navy")
+        ax_cdf.plot(x, cdf[:, 1], label="Predicted", color="darkorange")
+        if 't0' in inferred.keys():
+            t0s = inferred['t0'].detach().cpu().numpy()
+            ax_cdf.axvline(t0s[0], color="navy")
+            ax_cdf.axvline(t0s[1], color="darkorange")
+        ax_cdf.set_xlabel("Time (ns)")
+        ax_cdf.set_ylabel("Value")
+        ax_cdf.set_title("Waveform CDF")
+        ax_cdf.legend()
 
         # log both figures in a single step
         wandb.log({

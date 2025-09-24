@@ -43,7 +43,11 @@ def infer_single_pos_single_pmt(net: nn.Module, input_x: tensor, target: dict, t
     pred: dict[str, torch.Tensor] = net(input_x)
     pred_v_linear = net._inv_xform_vis(pred["v"][batch_id, :])
     target_v_linear = target["v_linear"][batch_id, :].to(pred_v_linear.device)
-
+    t0s = None
+    if "t0" in target.keys():
+        pred_t0 = pred['t0'][batch_id, pmt_id] * tick_size
+        target_t0 = target['t0'][batch_id, pmt_id].to(pred_t0.device)
+        t0s = torch.stack([target_t0, pred_t0], dim=-1)
     if use_CDF:
         pred_t_cdf = pred["t"][batch_id, pmt_id, :]
         target_t_cdf = target['t_linear'][batch_id, pmt_id, :].to(pred_t_cdf.device)
@@ -64,6 +68,7 @@ def infer_single_pos_single_pmt(net: nn.Module, input_x: tensor, target: dict, t
         "visibility": torch.stack([target_v_linear, pred_v_linear],dim=-1),
         "pdf": torch.stack([target_t_pdf, pred_t_pdf], dim=-1),
         "cdf": torch.stack([target_t_cdf, pred_t_cdf], dim=-1),
+        "t0": t0s
     }
 
     net.unfreeze_all()
