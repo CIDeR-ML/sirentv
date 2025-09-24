@@ -140,6 +140,8 @@ def bias(
             f"target and pred must have the same shape {(*target.shape,)} != {(*pred.shape,)}"
         )
 
+    target = target.to(pred.device)
+
     mask = target > threshold
     p = pred[mask]
     t = target[mask]
@@ -176,6 +178,7 @@ def abs_bias(
     target = target[key]
     pred = pred[key]
 
+    target = target.to(pred.device)
     if target.shape != pred.shape:
         raise ValueError(
             f"target and pred must have the same shape {(*target.shape,)} != {(*pred.shape,)}"
