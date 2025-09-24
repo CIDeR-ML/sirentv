@@ -60,14 +60,15 @@ class WandbLogger(Logger):
 
         self._dict = {}
         self._analysis_dict = {}
-
-        for key, kwargs in log_cfg.get("analysis", dict()).items():
-            print("[WandbLogger] adding analysis function:", key)
+        for kwargs in log_cfg.get("analysis", []):
+            func = kwargs.pop("func", "")
             suffix = kwargs.pop("suffix", "")
             if suffix:
                 suffix = f"_{suffix}"
-            self._analysis_dict[key + suffix] = partial(
-                getattr(importlib.import_module("sirentv.analysis"), key), **kwargs
+            print("[WandbLogger] adding analysis function:", func+suffix)
+
+            self._analysis_dict[func + suffix] = partial(
+                getattr(importlib.import_module("sirentv.analysis"), func), **kwargs
             )
 
     def record(self, keys: list, vals: list):

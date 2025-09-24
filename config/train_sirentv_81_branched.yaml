@@ -1,6 +1,9 @@
 photonlib:
     filepath: /sdf/data/neutrino/pubdata/lut/optical/waveform_map/batch02/consolidated/plib.h5
     lazy: True
+    time_tick_size: 0.1 #ns
+physics:
+    R_index: 1.233
 device: 
     type: cuda
 model:
@@ -46,14 +49,18 @@ logger:
     project: branched-siren-81
     name: siren_81-vis
     analysis:
-      bias:
+      - func: bias
         suffix: time
         key: t_linear
         threshold: 1.0e-06
-      bias:
+      - func: bias
         suffix: vis
         key: v_linear
         threshold: 1.0e-06
+      - func: bias
+        suffix: t0
+        key: t0
+        threshold: 1.0e-02
 train:
     loss:
       - type: SmoothL1Loss

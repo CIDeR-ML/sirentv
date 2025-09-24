@@ -97,7 +97,7 @@ class BranchedSiren(nn.Module):
         output = dict(
             v=out_v.squeeze(-1),
             t=out_cdf,
-            t0=t0
+            t0=t0,
         )
 
         return output

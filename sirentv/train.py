@@ -161,6 +161,11 @@ def train(cfg: dict):
     stop_training = False
     losses = [float('inf')] * len(loss_fns)
 
+    lAr_r_index = cfg.get("physics", {}).get("R_index", 1.233)
+    speed_of_light = 299.792458/lAr_r_index # mm/ns
+
+    tick_size = cfg.get("photonlib", {}).get("time_tick_size", 0.1)
+
     # through epochs
     while iteration_ctr < iteration_max and epoch_ctr < epoch_max:
         # through batches
@@ -203,6 +208,12 @@ def train(cfg: dict):
                 # v: visibilities, (B, N_pmt)
                 # t: CDF/PDF, (B, N_pmt, N_time)
                 # t0 (possibly)
+
+                if 't0' in pred.keys():
+                    pmt_pos = net.pmt_coords
+                    distances = torch.cdist(x, pmt_pos)
+                    tof = distances / speed_of_light / tick_size # convert to ticks per tick_size
+                    target["t0"] = tof
 
                 losses = compute_loss(
                     pred,
