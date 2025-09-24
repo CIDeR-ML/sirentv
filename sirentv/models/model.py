@@ -57,7 +57,7 @@ class SirenTV(nn.Module):
 
         self.n_pmts = len(self.norm_pmt_coords)
         self.batch_size = self.config_loader.get("batch_size", 1024)
-        self.norm_pmt_tile = torch.tile(self.norm_pmt_coords.unsqueeze(0), (self.batch_size, 1, 1))
+        self.norm_pmt_tile = self.norm_pmt_coords.unsqueeze(0).expand(self.batch_size, self.n_pmts, 3)
 
 
     def to(self, device):
