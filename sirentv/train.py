@@ -211,11 +211,11 @@ def train(cfg: dict):
                 # t0 (possibly, in the units of ticks)
 
                 if 't0' in pred.keys():
-                    pmt_pos = net.pmt_coords
+                    pmt_pos = net.pmt_coords.to(x.device)
                     pred['t0'] *= tick_size
                     distances = torch.cdist(x, pmt_pos)
                     tof = distances / speed_of_light # in ns
-                    target["t0"] = tof
+                    target["t0"] = tof.cpu()
 
                 losses = compute_loss(
                     pred,

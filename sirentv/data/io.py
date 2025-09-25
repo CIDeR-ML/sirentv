@@ -132,7 +132,7 @@ class PLibDataLoader:
             pos = meta.voxel_to_coord(vox_ids)
 
             vis = self._plib.vis * self._plib.eff
-            vis[:, :self._n_pmt] = vis[:, self._n_pmt:].reshape(vis.shape[0], self._n_pmt, -1).sum(-1)
+            vis = vis.reshape(vis.shape[0], self._n_pmt, -1)
             # w = self.get_weight(vis)
             target = self.xform_vis(vis)
 

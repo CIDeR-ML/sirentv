@@ -141,6 +141,9 @@ class SirenTV(nn.Module):
         # TODO: we probably shouldn't use same transform rules
         # for both v and t as t << v.
         v[mask] = self._inv_xform_vis(v[mask]) # (B, N_pmt)
+
+        if v.dim() != t.dim():
+            v = v.unsqueeze(-1)
         return v.expand_as(t) * t # (B, N_pmt, N_time)
 
     def model_dict(self, opt=None, sch=None, epoch=-1, scaler=None):
