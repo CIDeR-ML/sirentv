@@ -160,7 +160,15 @@ class WandbLogger(Logger):
         ax_pdf.legend()
 
         # --- CDF plot ---
-        fig_cdf, ax_cdf = plt.subplots()
+        # cdf plot with residual subplot below
+        import numpy as np
+        from matplotlib.gridspec import GridSpec
+
+        fig_cdf = plt.figure(constrained_layout=True, figsize=(6, 6))
+        gs = GridSpec(5, 1, figure=fig_cdf)
+        ax_cdf = fig_cdf.add_subplot(gs[:4, 0])
+        ax_res = fig_cdf.add_subplot(gs[4, 0], sharex=ax_cdf)
+
         ax_cdf.plot(x, cdf[:, 0], label="Target", color="navy")
         ax_cdf.plot(x, cdf[:, 1], label="Predicted", color="darkorange")
         if 't0' in inferred.keys():
@@ -171,6 +179,17 @@ class WandbLogger(Logger):
         ax_cdf.set_ylabel("Value")
         ax_cdf.set_title("Waveform CDF")
         ax_cdf.legend()
+
+        # residual plot
+        residual = cdf[:, 1] - cdf[:, 0]
+        ax_res.plot(x, np.zeros_like(x), color="grey", linewidth=1, alpha=0.7)
+        ax_res.plot(x, residual, color="red", linewidth=1)
+        ax_res.set_ylabel("Residual")
+        ax_res.set_xlabel("Time (ns)")
+        ax_res.set_ylim(-np.max(np.abs(residual))*1.1, np.max(np.abs(residual))*1.1)
+        ax_res.set_title("CDF Residual (Pred - Target)")
+        ax_res.spines['top'].set_visible(False)
+        ax_res.spines['right'].set_visible(False)
 
         # log both figures in a single step
         wandb.log({
