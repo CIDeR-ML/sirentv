@@ -2,6 +2,7 @@ from __future__ import annotations
 import os
 from contextlib import nullcontext
 from typing import Literal
+import time
 
 
 import torch
@@ -111,7 +112,6 @@ def train(cfg: dict):
     DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     if cfg.get("device"):
         DEVICE = get_device(cfg["device"]["type"])
-
     iteration_ctr = 0
     epoch_ctr = 0
 
@@ -170,16 +170,17 @@ def train(cfg: dict):
     # through epochs
     while iteration_ctr < iteration_max and epoch_ctr < epoch_max:
         # through batches
+        torch.cuda.synchronize()
+        data_loading_start = time.time()
         for batch_idx, data in enumerate(tqdm(dl, desc="Epoch %-3d; Loss %-3s" % (epoch_ctr, ",".join(["%.2e" % l for l in losses])))):
             iteration_ctr += 1
-            with (torch.autocast(device_type=DEVICE.type, dtype=torch.bfloat16) if amp else nullcontext()):
 
+            with (torch.autocast(device_type=DEVICE.type, dtype=torch.bfloat16) if amp else nullcontext()):
                 x = data["position"].contiguous()#.to(DEVICE)
                 target_t_pdf = data["target"].contiguous()#.to(DEVICE)
                 target_t_pdf_linear = data["target_linear"].contiguous()#.to(DEVICE)
                 target_v_linear = target_t_pdf_linear.sum(-1)
                 target_v = dl.xform_vis(target_v_linear)
-
 
                 if mode == "cdf":
                     target_t_cdf = pdf_to_cdf(target_t_pdf_linear) # <-- in linear domain!
@@ -202,15 +203,20 @@ def train(cfg: dict):
                     if (k in weight_cfg and weight_cfg[k]['enable']) else 1.0
                     for k in target.keys()
                 }
+                torch.cuda.synchronize()
+                data_loading_time = time.time() - data_loading_start
 
                 # Running the model, compute the loss, back-prop gradients to optimize.
+                torch.cuda.synchronize()
+                forward_start = time.time()
                 pred: dict[str, torch.Tensor] = net(x)
                 # OUTPUTS:
                 # v: visibilities, (B, N_pmt)
                 # t: CDF/PDF, (B, N_pmt, N_time)
                 # t0 (possibly, in the units of ticks)
+                mem_after_forward = torch.cuda.memory_allocated()/(1024**3) # in GB
 
-                if 't0' in pred.keys():
+                if net.load_pos:
                     pmt_pos = net.pmt_coords.to(x.device)
                     pred['t0'] *= tick_size
                     distances = torch.cdist(x, pmt_pos)
@@ -248,14 +254,16 @@ def train(cfg: dict):
                 else:
                     loss.backward()
                     opt.step()
+                torch.cuda.synchronize()
+                model_time_iter = time.time() - forward_start
 
             # get current learning rate
             current_lr = opt.param_groups[0]['lr']
 
             # Log training parameters           
             logger.record(
-                ["iter", "epoch", "lr"] + [f'loss_{k}' for k in keys] + ["loss"],
-                [iteration_ctr, epoch_ctr, current_lr] + losses.detach().cpu().tolist() + [loss.item()],
+                ["iter", "epoch", "lr", "data_loading_time", "model_iter_time", "model_forward_mem_usage"] + [f'loss_{k}' for k in keys] + ["loss"],
+                [iteration_ctr, epoch_ctr, current_lr, data_loading_time, model_time_iter, mem_after_forward] + losses.detach().cpu().tolist() + [loss.item()],
             )
 
             # Step the logger
@@ -280,6 +288,9 @@ def train(cfg: dict):
             if iteration_max <= iteration_ctr:
                 stop_training = True
                 break
+
+            torch.cuda.synchronize()
+            data_loading_start = time.time()
 
         if stop_training:
             break

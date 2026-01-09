@@ -171,7 +171,7 @@ class WandbLogger(Logger):
 
         ax_cdf.plot(x, cdf[:, 0], label="Target", color="navy")
         ax_cdf.plot(x, cdf[:, 1], label="Predicted", color="darkorange")
-        if 't0' in inferred.keys():
+        if 't0' in inferred.keys() and inferred['t0'] is not None:
             t0s = inferred['t0'].detach().cpu().numpy()
             ax_cdf.axvline(t0s[0], linestyle='--', label="Target T0", color="navy", alpha=0.6)
             ax_cdf.axvline(t0s[1], linestyle='--', label="Predicted T0", color="darkorange", alpha=0.6)
