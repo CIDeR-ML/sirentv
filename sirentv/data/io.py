@@ -7,6 +7,127 @@ from photonlib.meta import VoxelMeta
 import h5py
 import numpy as np
 
+class PLibDataset(Dataset):
+    """
+    Map-style dataset for PhotonLib.
+    Requires efficient random access to photon library.
+    """
+
+    def __init__(self, cfg, rank=0, world_size=1):
+        self.cfg = cfg
+        self.rank = rank
+        self.world_size = world_size
+
+        # Load photon library
+        self._is_lazy = cfg.get("photonlib", {}).get("lazy", False)
+        self._plib = PhotonLib.load(cfg, self._is_lazy)
+
+        # Transform
+        xform_params = cfg.get("transform_vis")
+        self.xform_vis, self.inv_xform_vis = partial_xform_vis(xform_params)
+
+        if xform_params and rank == 0:
+            print("[PLibDataset] using log scale transformation")
+            print("[PLibDataset] transformation params", xform_params)
+
+        # Data config
+        data_cfg = cfg["data"]
+        self._n_photons = data_cfg.get("n_photon", 200000)
+        self._n_pmt = data_cfg.get("n_pmt", 81)
+
+        total_voxels = len(self._plib)
+        max_len = data_cfg.get("max_len", -1)
+        if max_len is None or max_len < 0:
+            max_len = total_voxels
+        effective_voxels = min(total_voxels, max_len)
+
+        # Distribute across ranks
+        if world_size > 1:
+            voxels_per_rank = effective_voxels // world_size
+            remainder = effective_voxels % world_size
+
+            if rank < remainder:
+                voxels_per_rank += 1
+                start_idx = rank * voxels_per_rank
+            else:
+                start_idx = rank * voxels_per_rank + remainder
+
+            end_idx = start_idx + voxels_per_rank
+        else:
+            start_idx = 0
+            end_idx = effective_voxels
+
+        self.indices = torch.arange(start_idx, end_idx, dtype=torch.long)
+
+        if rank == 0:
+            print(f"[PLibDataset] Total voxels: {effective_voxels}")
+
+        print(f"[PLibDataset] Voxels on rank {self.rank}: {len(self.indices)}")
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        """
+        Get a single voxel's data.
+
+        Args:
+            idx: Local index (0 to len(self)-1)
+
+        Returns:
+            dict with position, target_linear, target
+        """
+        vox_ids = self.indices[idx].unsqueeze(0)
+
+        # Load data
+        meta = self._plib.meta
+        pos_raw = meta.voxel_to_coord(vox_ids)
+        if pos_raw.dim() == 1:
+            pos_raw = pos_raw.unsqueeze(0)
+
+        try:
+            vis = self._plib[vox_ids] / self._n_photons
+        except Exception:
+            vis = (self._plib.vis[vox_ids] * self._plib.eff)
+
+        vis = vis.view(self._n_pmt, -1)
+        target = self.xform_vis(vis)
+
+        return {
+            'position': pos_raw.squeeze(0),
+            'target_linear': vis,
+            'target': target
+        }
+
+
+def create_dataloader(cfg, rank=0, world_size=1):
+    """Create DataLoader with map-style dataset."""
+    # Create dataset
+    dataset = PLibDataset(cfg, rank=rank, world_size=world_size)
+    # Get loader config
+    loader_cfg = cfg.get("data", {}).get("loader", {})
+    batch_size = loader_cfg.get("batch_size", 1)
+    num_workers = loader_cfg.get("num_workers", 0)
+    pin_memory = loader_cfg.get("pin_memory", False)
+    drop_last = loader_cfg.get("drop_last", True)
+    shuffle = loader_cfg.get("shuffle", False)
+
+    # Create DataLoader
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        drop_last=drop_last,
+        shuffle=shuffle,
+        persistent_workers=True if num_workers > 0 else False,
+    )
+
+    dataloader.xform_vis = dataset.xform_vis
+    dataloader.inv_xform_vis = dataset.inv_xform_vis
+
+    return dataloader
+
 class PLibDataLoader:
     """
     A fast implementation of PhotonLib dataloader.

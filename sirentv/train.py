@@ -8,10 +8,11 @@ import time
 import torch
 import torch.nn as nn
 import torch.distributed as dist
-from torch.utils.data import DistributedSampler, DataLoader
 
 import yaml
 from sirentv.data.io import PLibDataLoader
+from sirentv.data.io import create_dataloader
+
 from slar.optimizers import optimizer_factory
 from slar.utils import get_device
 from tqdm import tqdm
@@ -24,6 +25,7 @@ from sirentv.utils.comm import create_ddp_model
 from sirentv.utils.log import CSVLogger, WandbLogger, Logger
 from sirentv.utils.transform import pdf_to_cdf
 from sirentv.infer import infer_single_pos_single_pmt
+
 
 def get_weight_by_vis(vis, factor=None, threshold=1e-8):
     """
@@ -141,7 +143,8 @@ def train(cfg: dict):
         )
     mode: Literal["pdf", "cdf"] = (net.module if is_distributed else net).mode
 
-    dl = PLibDataLoader(cfg, device=DEVICE, rank=rank, world_size=world_size)
+    #dl = PLibDataLoader(cfg, device=DEVICE, rank=rank, world_size=world_size)
+    dl = create_dataloader(cfg, rank=rank, world_size=world_size)
 
     opt, sch, epoch = optimizer_factory(list(p for p in net.parameters() if p.requires_grad), cfg)
     if epoch > 0:
@@ -204,9 +207,9 @@ def train(cfg: dict):
             iteration_ctr += 1
 
             with (torch.autocast(device_type=DEVICE.type, dtype=torch.bfloat16) if amp else nullcontext()):
-                x = data["position"].contiguous().to(DEVICE)
-                target_t_pdf = data["target"].contiguous().to(DEVICE)
-                target_t_pdf_linear = data["target_linear"].contiguous().to(DEVICE)
+                x = data["position"].contiguous().to(DEVICE, non_blocking=True)
+                target_t_pdf = data["target"].contiguous().to(DEVICE, non_blocking=True)
+                target_t_pdf_linear = data["target_linear"].contiguous().to(DEVICE, non_blocking=True)
                 target_v_linear = target_t_pdf_linear.sum(-1)
                 target_v = dl.xform_vis(target_v_linear)
 
@@ -310,9 +313,10 @@ def train(cfg: dict):
 
             if iteration_ctr % 10 == 0 and isinstance(logger, WandbLogger):
                 per_rank_metrics = {
-                    "gpu_memory_gb": torch.cuda.memory_allocated(local_rank) / (1024**3) if torch.cuda.is_available() else 0,
+                    "gpu_memory_gb": float(torch.cuda.memory_allocated(local_rank)/(1024**3)) if torch.cuda.is_available() else 0,
                     "loss": loss.detach(),
-                    "batch_size": x.shape[0],
+                    "data_loading_time": data_loading_time,
+                    "model_forward_time": model_time_iter,
                 }
                 logger.log_per_rank_metrics(iteration_ctr, per_rank_metrics)
 
