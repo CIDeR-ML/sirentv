@@ -1,6 +1,6 @@
 import torch
 from tqdm import tqdm
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, DistributedSampler
 from slar.transform import partial_xform_vis
 from photonlib import PhotonLib
 from photonlib.meta import VoxelMeta
@@ -12,7 +12,7 @@ class PLibDataLoader:
     A fast implementation of PhotonLib dataloader.
     """
 
-    def __init__(self, cfg, device=None):
+    def __init__(self, cfg, device=None, rank=0, world_size=1):
         """
         Constructor.
 
@@ -20,9 +20,12 @@ class PLibDataLoader:
         ---------
         cfg: dict
             Config dictionary. See "Examples" bewlow.
-
         device: torch.device (optional)
             Device for the returned data. Default: None.
+        rank: int
+            Process rank for distributed training
+        world_size: int
+            Total number of processes
 
         Examples
         --------
@@ -65,12 +68,13 @@ class PLibDataLoader:
         [Optional] The `transform_vis` subsection uses `log(vis+eps)` in the
         training. The final output is scaled to `[0,1]`.
         """
+
+        self.rank = rank
+        self.world_size = world_size
+        self._current_epoch = 0
+
         # determine lazy mode from PhotonLib or config
         self._is_lazy = cfg.get("photonlib", {}).get("lazy", False)
-        #bool(
-        #getattr(self._plib, "lazy", False)
-        #or cfg.get("photonlib", {}).get("lazy", False)
-        #))
         # load plib to device
         self._plib = PhotonLib.load(cfg, self._is_lazy).to(device)
 
@@ -112,34 +116,100 @@ class PLibDataLoader:
         else:
             self._effective_voxels = min(self._total_voxels, self._max_len)
 
+        if self.world_size > 1:
+            self._voxels_per_rank = self._effective_voxels // self.world_size
+            remainder = self._effective_voxels % self.world_size
+            # Distribute remainder to first few ranks
+            if self.rank < remainder:
+                self._voxels_per_rank += 1
+                self._start_idx = self.rank * self._voxels_per_rank
+            else:
+                self._start_idx = self.rank * self._voxels_per_rank + remainder
+
+            self._end_idx = self._start_idx + self._voxels_per_rank
+
+            if rank == 0:
+                print(f"[PLibDataLoader] Distributed mode: {world_size} processes")
+                print(f"[PLibDataLoader] Total voxels: {self._effective_voxels}")
+                print(f"[PLibDataLoader] Voxels per rank: ~{self._effective_voxels // world_size}")
+        else:
+            self._voxels_per_rank = self._effective_voxels
+            self._start_idx = 0
+            self._end_idx = self._effective_voxels
+
         if self._batch_mode and self._drop_last and self._batch_size > 0:
-            remainder = self._effective_voxels % self._batch_size
+            remainder = self._voxels_per_rank % self._batch_size
             if remainder:
-                self._effective_voxels -= remainder
+                self._voxels_per_rank -= remainder
+                self._end_idx = self._start_idx + self._voxels_per_rank
 
-        if self._effective_voxels < 0:
-            self._effective_voxels = 0
-        
+        if self._voxels_per_rank < 0:
+            self._voxels_per_rank = 0
 
+        self._create_indices()
         # returns the whole plib in a single batch
-        if not self._is_lazy:
-            print("[PLibDataLoader] precomputing full-cache")
+        if not self._is_lazy and not self._batch_mode:
+            if rank == 0:
+                print("[PLibDataLoader] precomputing full-cache")
             # precompute full-cache only when non-lazy
-            n_voxels = self._effective_voxels
-            vox_ids = torch.arange(n_voxels, device=device)
-
-            meta = self._plib.meta
-            pos = meta.voxel_to_coord(vox_ids)
-
-            vis = self._plib.vis * self._plib.eff
-            vis = vis.reshape(vis.shape[0], self._n_pmt, -1)
-            # w = self.get_weight(vis)
-            target = self.xform_vis(vis)
-
-            self._cache = dict(position=pos, value=vis, target=target)
+            self.cache = self._build_cache()
         else:
             # in lazy mode, do not create full-cache
             self._cache = None
+
+    def _create_indices(self):
+        """Create the list of voxel indices for this rank."""
+        # Full index range for this rank
+        self._full_indices = torch.arange(
+            self._start_idx,
+            self._end_idx,
+            dtype=torch.long
+        )
+
+    def set_epoch(self, epoch):
+        """
+        Set the epoch for the dataloader to ensure proper shuffling in distributed mode.
+
+        Arguments
+        ---------
+        epoch: int
+            Current epoch number
+        """
+        self._current_epoch = epoch
+
+    def _get_shuffled_indices(self):
+        """
+        Get shuffled indices based on current epoch.
+        Uses the same random seed across all ranks for consistency.
+        """
+        if self._shuffle:
+            # Create generator with epoch-based seed for reproducibility
+            generator = torch.Generator()
+            generator.manual_seed(self._current_epoch)
+
+            # Shuffle indices for this rank
+            perm = torch.randperm(len(self._full_indices), generator=generator)
+            return self._full_indices[perm]
+        else:
+            return self._full_indices
+
+    def _build_cache(self):
+        """Build cache for the voxels assigned to this rank."""
+        if self._voxels_per_rank == 0:
+            return None
+
+        vox_ids = self._full_indices
+        meta = self._plib.meta
+        pos = meta.voxel_to_coord(vox_ids)
+
+        vis = self._plib.vis * self._plib.eff
+        # Select only the voxels for this rank
+        vis = vis[vox_ids]
+        vis = vis.reshape(vis.shape[0], self._n_pmt, -1)
+
+        target = self.xform_vis(vis)
+
+        return dict(position=pos, value=vis, target=target)
 
     @property
     def device(self):
@@ -174,11 +244,11 @@ class PLibDataLoader:
 
         if self._batch_mode:
             if self._drop_last:
-                return self._effective_voxels // self._batch_size
+                return self._voxels_per_rank // self._batch_size
             else:
-                return ceil(self._effective_voxels / self._batch_size) if self._effective_voxels else 0
+                return ceil(self._voxels_per_rank / self._batch_size) if self._voxels_per_rank else 0
 
-        return 1 if self._effective_voxels else 0
+        return 1 if self._voxels_per_rank else 0
 
     def __iter__(self):
         """
@@ -189,14 +259,7 @@ class PLibDataLoader:
         """
         if self._batch_mode:
             meta = self._plib.meta
-            n_voxels = len(self._plib)
-            if self._shuffle:
-                vox_list = torch.randperm(n_voxels, device=self.device)
-            else:
-                vox_list = torch.arange(n_voxels, device=self.device)
-
-            vox_list = vox_list[: self._effective_voxels]
-
+            vox_list = self._get_shuffled_indices()
             for b in range(len(self)):
                 sel = slice(b * self._batch_size, (b + 1) * self._batch_size)
 
@@ -230,12 +293,12 @@ class PLibDataLoader:
                     )
                     yield output
         else:
+            # Non-batch mode: return all data for this rank
             if self._is_lazy or self._cache is None:
                 # build on demand without precomputing entire cache in ctor
-                n_voxels = self._effective_voxels
-                if n_voxels == 0:
+                if self._voxels_per_rank == 0:
                     return
-                vox_ids = torch.arange(n_voxels, device=self.device)
+                vox_ids = self._full_indices
                 meta = self._plib.meta
                 pos = meta.voxel_to_coord(vox_ids)
                 try:

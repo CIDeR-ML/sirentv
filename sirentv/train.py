@@ -7,6 +7,9 @@ import time
 
 import torch
 import torch.nn as nn
+import torch.distributed as dist
+from torch.utils.data import DistributedSampler, DataLoader
+
 import yaml
 from sirentv.data.io import PLibDataLoader
 from slar.optimizers import optimizer_factory
@@ -56,9 +59,12 @@ def build_regularizer(cfg) -> nn.Module | None:
         return None
     return build_regularizer_fn(regularizer_cfg)
 
-def build_logger(cfg, net) -> Logger:
+def build_logger(cfg, net, rank=0, world_size=1, is_distributed=False) -> Logger:
     logger_type = cfg.get("logger", dict()).get("type", "csv")
-    logger = CSVLogger(cfg) if logger_type == "csv" else WandbLogger(cfg)
+    if logger_type == "csv":
+        logger = CSVLogger(cfg, rank=rank, world_size=world_size, is_distributed=is_distributed)
+    else:
+        logger = WandbLogger(cfg, rank=rank, world_size=world_size, is_distributed=is_distributed)
     if hasattr(logger, "watch_grad"):
         logger.watch_grad(net)
     return logger
@@ -107,40 +113,56 @@ def train(cfg: dict):
         with the optimizer state restored from the last checkpoint step.
 
     """
+    # Initialize distributed process group
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    is_distributed = world_size > 1
 
-    # Initialize wandb
-    DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    if cfg.get("device"):
-        DEVICE = get_device(cfg["device"]["type"])
+    local_rank = int(os.environ.get('LOCAL_RANK', 0))
+    # Set device to local rank
+    if torch.cuda.is_available():
+        DEVICE = torch.device(f"cuda:{local_rank}")
+    else:
+        DEVICE = torch.device("cpu")
+
+    #print(f"[DEBUG] Rank {rank}/{world_size}, is_distributed={is_distributed}, "
+    #      f"dist.is_initialized()={dist.is_initialized()}")
+
     iteration_ctr = 0
     epoch_ctr = 0
 
     # Create necessary pieces: the model, optimizer, loss, logger.
     # Load the states if this is resuming.
-    net = SirenTV(cfg)
-    # net = create_ddp_model(net) # TODO: add ddp
-    dl = PLibDataLoader(cfg, device=DEVICE)
-    mode: Literal["pdf", "cdf"] = net.mode
+    net = SirenTV(cfg).to(DEVICE)
+    if is_distributed:
+        net = create_ddp_model(
+            net,
+            device_ids=[local_rank],
+        )
+    mode: Literal["pdf", "cdf"] = (net.module if is_distributed else net).mode
 
-    net.to(DEVICE)
+    dl = PLibDataLoader(cfg, device=DEVICE, rank=rank, world_size=world_size)
+
     opt, sch, epoch = optimizer_factory(list(p for p in net.parameters() if p.requires_grad), cfg)
     if epoch > 0:
         iteration_ctr = int(epoch * len(dl))
         epoch_ctr = int(epoch)
-        print(
-            "[train] resuming training from iteration",
-            iteration_ctr,
-            "epoch",
-            epoch_ctr,
-        )
+        if rank == 0:
+            print(
+                "[train] resuming training from iteration",
+                iteration_ctr,
+                "epoch",
+                epoch_ctr,
+            )
 
     loss_fns = build_losses(cfg)
     regularizer = build_regularizer(cfg)
-    logger = build_logger(cfg, net)
+    logger = build_logger(cfg, net, rank=rank, world_size=world_size, is_distributed=is_distributed)
 
-    # Store configuration   
-    with open(os.path.join(logger.logdir, "train_cfg.yaml"), "w") as f:
-        yaml.safe_dump(cfg, f)
+    # Store configuration (only on rank 0)
+    if rank == 0:
+        with open(os.path.join(logger.logdir, "train_cfg.yaml"), "w") as f:
+            yaml.safe_dump(cfg, f)
 
     # Set the control parameters for the training loop
     train_cfg = cfg.get("train", dict())
@@ -154,7 +176,9 @@ def train(cfg: dict):
     amp = train_cfg.get("amp", False)
     if amp:
         scaler = torch.amp.GradScaler('cuda')
-    print(f"[train] train for max iterations {iteration_max} or max epochs {epoch_max}")
+    if rank == 0:
+        print(f"[train] train for max iterations {iteration_max} or max epochs {epoch_max}")
+        print(f"[train] distributed training: {is_distributed}, world_size: {world_size}")
 
     weight_cfg = cfg.get("data", {}).get("weight", {})
 
@@ -169,16 +193,20 @@ def train(cfg: dict):
 
     # through epochs
     while iteration_ctr < iteration_max and epoch_ctr < epoch_max:
+        if is_distributed and hasattr(dl, 'set_epoch'):
+            dl.set_epoch(epoch_ctr)
+
         # through batches
-        torch.cuda.synchronize()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         data_loading_start = time.time()
-        for batch_idx, data in enumerate(tqdm(dl, desc="Epoch %-3d; Loss %-3s" % (epoch_ctr, ",".join(["%.2e" % l for l in losses])))):
+        for batch_idx, data in enumerate(tqdm(dl, desc="Epoch %-3d; Loss %-3s" % (epoch_ctr, ",".join(["%.2e" % l for l in losses])), disable=(rank != 0))):
             iteration_ctr += 1
 
             with (torch.autocast(device_type=DEVICE.type, dtype=torch.bfloat16) if amp else nullcontext()):
-                x = data["position"].contiguous()#.to(DEVICE)
-                target_t_pdf = data["target"].contiguous()#.to(DEVICE)
-                target_t_pdf_linear = data["target_linear"].contiguous()#.to(DEVICE)
+                x = data["position"].contiguous().to(DEVICE)
+                target_t_pdf = data["target"].contiguous().to(DEVICE)
+                target_t_pdf_linear = data["target_linear"].contiguous().to(DEVICE)
                 target_v_linear = target_t_pdf_linear.sum(-1)
                 target_v = dl.xform_vis(target_v_linear)
 
@@ -203,25 +231,30 @@ def train(cfg: dict):
                     if (k in weight_cfg and weight_cfg[k]['enable']) else 1.0
                     for k in target.keys()
                 }
-                torch.cuda.synchronize()
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
                 data_loading_time = time.time() - data_loading_start
 
                 # Running the model, compute the loss, back-prop gradients to optimize.
-                torch.cuda.synchronize()
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
                 forward_start = time.time()
-                pred: dict[str, torch.Tensor] = net(x)
+                pred: dict[str, torch.Tensor] = net.module(x) if is_distributed else net(x)
                 # OUTPUTS:
                 # v: visibilities, (B, N_pmt)
                 # t: CDF/PDF, (B, N_pmt, N_time)
                 # t0 (possibly, in the units of ticks)
-                mem_after_forward = torch.cuda.memory_allocated()/(1024**3) # in GB
+                mem_after_forward = torch.cuda.memory_allocated()/(1024**3) if torch.cuda.is_available() else 0 # in GB
 
-                if net.load_pos:
-                    pmt_pos = net.pmt_coords.to(x.device)
-                    pred['t0'] *= tick_size
-                    distances = torch.cdist(x, pmt_pos)
-                    tof = distances / speed_of_light # in ns
-                    target["t0"] = tof.cpu()
+                if hasattr(net.module if is_distributed else net, 'load_pos'):
+                    load_pos = (net.module if is_distributed else net).load_pos
+                    if load_pos:
+                        net_module = net.module if is_distributed else net
+                        pmt_pos = net_module.pmt_coords.to(x.device)
+                        pred['t0'] *= tick_size
+                        distances = torch.cdist(x, pmt_pos)
+                        tof = distances / speed_of_light # in ns
+                        target["t0"] = tof.cpu()
 
                 losses = compute_loss(
                     pred,
@@ -257,39 +290,51 @@ def train(cfg: dict):
                 torch.cuda.synchronize()
                 model_time_iter = time.time() - forward_start
 
-            # get current learning rate
-            current_lr = opt.param_groups[0]['lr']
+            if rank == 0:
+                # get current learning rate
+                current_lr = opt.param_groups[0]['lr']
+                # Log training parameters
+                logger.record(
+                    ["iter", "epoch", "lr", "data_loading_time", "model_iter_time", "model_forward_mem_usage"] + [f'loss_{k}' for k in keys] + ["loss"],
+                    [iteration_ctr, epoch_ctr, current_lr, data_loading_time, model_time_iter, mem_after_forward] + losses.detach().cpu().tolist() + [loss.item()],
+                )
 
-            # Log training parameters           
-            logger.record(
-                ["iter", "epoch", "lr", "data_loading_time", "model_iter_time", "model_forward_mem_usage"] + [f'loss_{k}' for k in keys] + ["loss"],
-                [iteration_ctr, epoch_ctr, current_lr, data_loading_time, model_time_iter, mem_after_forward] + losses.detach().cpu().tolist() + [loss.item()],
-            )
+                # Step the logger
+                with torch.no_grad():
+                    pred['v_linear'] = dl.inv_xform_vis(pred['v'])
+                    pred['t_linear'] = pred['t']
+                    logger.step(iteration_ctr, target, pred)
 
-            # Step the logger
-            with torch.no_grad():
-                pred['v_linear'] = dl.inv_xform_vis(pred['v'])
-                pred['t_linear'] = pred['t']
-                logger.step(iteration_ctr, target, pred)
+            if isinstance(logger, WandbLogger):
+                logger.log_aggregated_loss(iteration_ctr, loss)
 
-            if iteration_ctr % 10 == 0:
-                inferred_output = infer_single_pos_single_pmt(net, x, target, tick_size)
+            if iteration_ctr % 10 == 0 and isinstance(logger, WandbLogger):
+                per_rank_metrics = {
+                    "gpu_memory_gb": torch.cuda.memory_allocated(local_rank) / (1024**3) if torch.cuda.is_available() else 0,
+                    "loss": loss.detach(),
+                    "batch_size": x.shape[0],
+                }
+                logger.log_per_rank_metrics(iteration_ctr, per_rank_metrics)
+
+            if rank == 0 and iteration_ctr % 10 == 0:
+                inferred_output = infer_single_pos_single_pmt(net.module if is_distributed else net, x, target, tick_size)
                 logger.plot(iteration_ctr, inferred_output)
 
-
             # Save the model parameters if the condition is met
-            if save_every_iterations > 0 and iteration_ctr % save_every_iterations == 0:
+            if rank == 0 and save_every_iterations > 0 and iteration_ctr % save_every_iterations == 0:
                 filename = os.path.join(
                     logger.logdir,
                     "iteration-%06d-epoch-%04d.ckpt" % (iteration_ctr, epoch_ctr),
                 )
-                net.save_state(filename, opt, sch, iteration_ctr, scaler if amp else None)
+                model_to_save = net.module if is_distributed else net
+                model_to_save.save_state(filename, opt, sch, iteration_ctr, scaler if amp else None)
 
             if iteration_max <= iteration_ctr:
                 stop_training = True
                 break
 
-            torch.cuda.synchronize()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
             data_loading_start = time.time()
 
         if stop_training:
@@ -300,11 +345,12 @@ def train(cfg: dict):
 
         epoch_ctr += 1
 
-        if (save_every_epochs * epoch_ctr) > 0 and epoch_ctr % save_every_epochs == 0:
+        if rank == 0 and (save_every_epochs * epoch_ctr) > 0 and epoch_ctr % save_every_epochs == 0:
             filename = os.path.join(
                 logger.logdir, "iteration-%06d-epoch-%04d.ckpt" % (iteration_ctr, epoch_ctr)
             )
-            net.save_state(
+            model_to_save = net.module if is_distributed else net
+            model_to_save.save_state(
                 filename,
                 opt,
                 sch,
@@ -313,23 +359,38 @@ def train(cfg: dict):
             )
             # logger.save(filename)
 
+    if rank == 0:
+        print("[train] Stopped training at iteration", iteration_ctr, "epochs", epoch_ctr)
 
-    print("[train] Stopped training at iteration", iteration_ctr, "epochs", epoch_ctr)
+        # logging after training.
+        logger.write()
+        pred, target = get_pred_target(dl, net.module if is_distributed else net)
+        for k in pred.keys():
+            log_pred_target(pred[k], target[k], name=f"comparison_{k}")
+        logger.close()
 
-    # logging after training.
-    logger.write()
-    pred, target = get_pred_target(dl, net)
-    for k in pred.keys():
-        log_pred_target(pred[k], target[k], name=f"comparison_{k}")
-    logger.close()
+    if is_distributed:
+        dist.barrier()
 
 
 def main():
     import argparse
+    # Debug environment before anything else
+    #print(f"[DEBUG] Environment variables:")
+    #print(f"  RANK: {os.environ.get('RANK', 'NOT SET')}")
+    #print(f"  WORLD_SIZE: {os.environ.get('WORLD_SIZE', 'NOT SET')}")
+    #print(f"  LOCAL_RANK: {os.environ.get('LOCAL_RANK', 'NOT SET')}")
+    #print(f"  MASTER_ADDR: {os.environ.get('MASTER_ADDR', 'NOT SET')}")
+    #print(f"  MASTER_PORT: {os.environ.get('MASTER_PORT', 'NOT SET')}")
+    #print(f"  CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', 'NOT SET')}")
+    #print(f"  Available CUDA devices: {torch.cuda.device_count()}")
 
-    import yaml
-    
-    
+    dist.init_process_group(backend='nccl')
+
+    local_rank = int(os.environ.get('LOCAL_RANK', 0))
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+
     default_config_path = '/sdf/home/y/youngsam/sw/dune/siren-t/config/siren_4848-bivis.yaml'
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, default=default_config_path)
@@ -338,8 +399,7 @@ def main():
     cfg = yaml.safe_load(open(args.config))
     
     train(cfg)
-
-    
+    dist.destroy_process_group()
 
 
 if __name__ == "__main__":
