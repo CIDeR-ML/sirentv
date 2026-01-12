@@ -24,14 +24,12 @@ class Logger(ABC):
         pass
 
 
-
-
 class WandbLogger(Logger):
     """
     Logger class to log training progress using Weights & Biases (wandb).
     """
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, rank=0, world_size=1, is_distributed=False):
         """
         Constructor
 
@@ -40,44 +38,71 @@ class WandbLogger(Logger):
         cfg : dict
             A collection of configuration parameters. 'project' and 'name' specify
             the wandb project and run name respectively.
+        rank : int
+            Global rank of this process
+        world_size : int
+            Total number of processes
+        is_distributed : bool
+            Whether running in distributed mode
         """
-        global wandb
-        if wandb is None:
-            import wandb
-        wandb.require("core")
+        self.rank = rank
+        self.world_size = world_size
+        self.is_distributed = is_distributed
 
         log_cfg = cfg.get("logger", dict())
         self.project = log_cfg.get("project", "default-project")
         self.name = log_cfg.get("name", None)
         self.entity = log_cfg.get("entity", None)
         self._log_every_nsteps = log_cfg.get("log_every_nsteps", 1)
-        self._logdir = self.make_logdir(log_cfg.get("dir_name", "logs"))
-        self._logfile = os.path.join(self._logdir, cfg.get("file_name", "log.csv"))
 
-        # Initialize wandb
-        proj_cfg = dict(project=self.project, name=self.name)
-        if self.entity:
-            proj_cfg["entity"] = self.entity
-        wandb.init(**proj_cfg, config=cfg)
+        if self.rank == 0:
+            self._logdir = self.make_logdir(log_cfg.get("dir_name", "logs"))
+            self._logfile = os.path.join(self._logdir, cfg.get("file_name", "log.csv"))
+        else:
+            self._logdir = None
+            self._logfile = None
 
-        print(f"[WandbLogger] Initialized wandb project: {self.project}")
+        if self.rank == 0:
+            global wandb
+            if wandb is None:
+                import wandb
+            wandb.require("core")
+
+            # Initialize wandb
+            proj_cfg = dict(
+                project=self.project,
+                name=self.name,
+                config={**cfg,
+                        "world_size": world_size,
+                        "distributed": is_distributed}
+            )
+            if self.entity:
+                proj_cfg["entity"] = self.entity
+            wandb.init(**proj_cfg, settings=wandb.Settings(start_method="fork"))
+            self.wandb = wandb
+            print(f"[WandbLogger] Initialized wandb project: {self.project}")
+        else:
+            self.wandb = None
 
         self._dict = {}
         self._analysis_dict = {}
-        for kwargs in log_cfg.get("analysis", []):
-            func = kwargs.pop("func", "")
-            suffix = kwargs.pop("suffix", "")
-            if suffix:
-                suffix = f"_{suffix}"
-            print("[WandbLogger] adding analysis function:", func+suffix)
 
-            self._analysis_dict[func + suffix] = partial(
-                getattr(importlib.import_module("sirentv.analysis"), func), **kwargs
-            )
+        if self.rank == 0:
+            for kwargs in log_cfg.get("analysis", []):
+                func = kwargs.pop("func", "")
+                suffix = kwargs.pop("suffix", "")
+                if suffix:
+                    suffix = f"_{suffix}"
+                print("[WandbLogger] adding analysis function:", func+suffix)
+
+                self._analysis_dict[func + suffix] = partial(
+                    getattr(importlib.import_module("sirentv.analysis"), func), **kwargs
+                )
 
     def record(self, keys: list, vals: list):
         """
-        Function to register key-value pair to be logged
+        Function to register key-value pair to be logged.
+        Only rank 0 actually records.
 
         Parameters
         ----------
@@ -87,13 +112,15 @@ class WandbLogger(Logger):
         vals : list
             A list of parameter values to be logged.
         """
-        for i, key in enumerate(keys):
-            self._dict[key] = vals[i]
+        if self.rank == 0:
+            for i, key in enumerate(keys):
+                self._dict[key] = vals[i]
 
     def step(self, iteration, label=None, pred=None):
         """
         Function to take an iteration step during training/inference. If this step is
         subject for logging, this function logs the parameters registered through the record function.
+        Only rank 0 actually records.
 
         Parameters
         ----------
@@ -107,6 +134,10 @@ class WandbLogger(Logger):
         pred : torch.Tensor
             The predicted values from the model run for training/inference.
         """
+
+        if self.rank != 0:
+            return
+
         if not iteration % self._log_every_nsteps == 0:
             return
 
@@ -118,6 +149,7 @@ class WandbLogger(Logger):
     def plot(self, iteration, inferred: dict):
         """
         Log a plot of x vs y at the given iteration.
+        Only rank 0 actually records.
 
         Parameters
         ----------
@@ -128,7 +160,7 @@ class WandbLogger(Logger):
             Type of plot: "line" or "scatter" (default).
         """
 
-        if inferred is None:
+        if self.rank != 0 or inferred is None or self.wandb is None:
             return
 
         x = inferred['x_value'].detach().cpu().numpy()
@@ -171,7 +203,7 @@ class WandbLogger(Logger):
 
         ax_cdf.plot(x, cdf[:, 0], label="Target", color="navy")
         ax_cdf.plot(x, cdf[:, 1], label="Predicted", color="darkorange")
-        if 't0' in inferred.keys():
+        if 't0' in inferred.keys() and inferred['t0'] is not None:
             t0s = inferred['t0'].detach().cpu().numpy()
             ax_cdf.axvline(t0s[0], linestyle='--', label="Target T0", color="navy", alpha=0.6)
             ax_cdf.axvline(t0s[1], linestyle='--', label="Predicted T0", color="darkorange", alpha=0.6)
@@ -192,7 +224,7 @@ class WandbLogger(Logger):
         ax_res.spines['right'].set_visible(False)
 
         # log both figures in a single step
-        wandb.log({
+        self.wandb.log({
             "PMT Visibility": wandb.Image(fig_vis),
             "PDF": wandb.Image(fig_pdf),
             "CDF": wandb.Image(fig_cdf),
@@ -207,19 +239,23 @@ class WandbLogger(Logger):
         """
         Finish the wandb run.
         """
-        wandb.finish()
+        if self.wandb is not None:
+            self.wandb.finish()
 
     def write(self):
         """
         Log the key-value pairs provided through the record function to wandb.
         """
-        wandb.log(self._dict)
+        if self.wandb is not None:
+            self.wandb.log(self._dict)
+            self._dict = {}  # Clear dict after logging
 
     def save(self, path):
         """
         Save the wandb run to a file.
         """
-        wandb.save(path)
+        if self.wandb is not None:
+            self.wandb.save(path)
 
     @property
     def logfile(self):
@@ -257,15 +293,74 @@ class WandbLogger(Logger):
         return logdir
     
     def watch_grad(self, net):
-        wandb.watch(net, log="all", log_freq=100)
+        if self.wandb is not None:
+            self.wandb.watch(net, log="all", log_freq=100)
 
+    def log_aggregated_loss(self, iteration, loss_tensor):
+        """
+        Log loss aggregated across all ranks.
+        All ranks must call this, but only rank 0 logs.
+
+        Parameters
+        ----------
+        iteration : int
+            Current iteration
+        loss_tensor : torch.Tensor
+            Loss tensor (must be on GPU for all_reduce)
+
+        """
+        if self.is_distributed:
+            import torch.distributed as dist
+            loss_avg = loss_tensor.detach().clone()
+            dist.all_reduce(loss_avg, op=dist.ReduceOp.AVG)
+        else:
+            loss_avg = loss_tensor.detach()
+        if self.wandb is not None:
+            self.wandb.log({
+                "loss/avg_across_gpus": loss_avg.item(),
+                "loss/rank_0": loss_tensor.item(),
+            }, step=iteration)
+
+    def log_per_rank_metrics(self, iteration, metrics_dict):
+        """
+        Gather and log per-rank metrics.
+        All ranks must call this with their local metrics.
+
+        Parameters
+        ----------
+        iteration : int
+            Current iteration
+        metrics_dict : dict
+            Dict of {metric_name: tensor_value} for this rank
+        """
+        if not self.is_distributed:
+            if self.wandb is not None:
+                self.wandb.log(metrics_dict, step=iteration)
+            return
+        import torch
+        import torch.distributed as dist
+        log_dict = {}
+        for metric_name, metric_value in metrics_dict.items():
+            if not isinstance(metric_value, torch.Tensor):
+                metric_value = torch.tensor(metric_value).cuda()
+
+            gathered = [torch.zeros_like(metric_value) for _ in range(self.world_size)]
+            dist.all_gather(gathered, metric_value)
+
+            if self.wandb is not None:
+                for rank_id, val in enumerate(gathered):
+                    log_dict[f"{metric_name}/rank_{rank_id}"] = val.item()
+                avg_val = torch.stack(gathered).mean()
+                log_dict[f"{metric_name}/avg"] = avg_val.item()
+        if self.wandb is not None:
+            self.wandb.log(log_dict, step=iteration)
 
 class CSVLogger(Logger):
     """
     Logger class to store training progress in a CSV file.
     """
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, rank=0, world_size=1, is_distributed=False):
         """
         Constructor
 
@@ -275,29 +370,43 @@ class CSVLogger(Logger):
             A collection of configuration parameters. `dir_name` and `file_name` specify
             the output log file location. `analysis` specifies analysis function(s) to be
             created from the analysis module and run during the training.
+        rank : int
+            Global rank of this process
+        world_size : int
+            Total number of processes
+        is_distributed : bool
+            Whether running in distributed mode
         """
 
-        log_cfg = cfg.get("logger", dict())
-        self._logdir = self.make_logdir(log_cfg.get("dir_name", "logs"))
-        self._logfile = os.path.join(self._logdir, cfg.get("file_name", "log.csv"))
-        self._log_every_nsteps = log_cfg.get("log_every_nsteps", 1)
+        self.rank = rank
+        self.world_size = world_size
+        self.is_distributed = is_distributed
 
-        print("[CSVLogger] output log directory:", self._logdir)
-        print(f"[CSVLogger] recording a log every {self._log_every_nsteps} steps")
+        log_cfg = cfg.get("logger", dict())
+        self._log_every_nsteps = log_cfg.get("log_every_nsteps", 1)
+        if self.rank == 0:
+            self._logdir = self.make_logdir(log_cfg.get("dir_name", "logs"))
+            self._logfile = os.path.join(self._logdir, cfg.get("file_name", "log.csv"))
+            print("[CSVLogger] output log directory:", self._logdir)
+            print(f"[CSVLogger] recording a log every {self._log_every_nsteps} steps")
+        else:
+            self._logdir = None
+            self._logfile = None
+
         self._fout = None
         self._str = None
         self._dict = {}
-
         self._analysis_dict = {}
 
-        for key, kwargs in log_cfg.get("analysis", dict()).items():
-            print("[CSVLogger] adding analysis function:", key)
-            suffix = kwargs.pop("suffix", "")
-            if suffix:
-                suffix = f"_{suffix}"
-            self._analysis_dict[key + suffix] = partial(
-                getattr(importlib.import_module("sirentv.analysis"), key), **kwargs
-            )
+        if self.rank == 0:
+            for key, kwargs in log_cfg.get("analysis", dict()).items():
+                print("[CSVLogger] adding analysis function:", key)
+                suffix = kwargs.pop("suffix", "")
+                if suffix:
+                    suffix = f"_{suffix}"
+                self._analysis_dict[key + suffix] = partial(
+                    getattr(importlib.import_module("sirentv.analysis"), key), **kwargs
+                )
 
     @property
     def logfile(self):
@@ -346,8 +455,9 @@ class CSVLogger(Logger):
         vals : list
             A list of parameter values to be stored in a log file.
         """
-        for i, key in enumerate(keys):
-            self._dict[key] = vals[i]
+        if self.rank == 0:
+            for i, key in enumerate(keys):
+                self._dict[key] = vals[i]
 
     def step(self, iteration, label=None, pred=None):
         """
@@ -367,8 +477,10 @@ class CSVLogger(Logger):
         pred : torch.Tensor
             The predicted values from the model run for training/inference.
 
-
         """
+        if self.rank != 0:
+            return
+
         if not iteration % self._log_every_nsteps == 0:
             return
 
@@ -382,6 +494,8 @@ class CSVLogger(Logger):
         Function to write the key-value pairs provided through the record function
         to an output log file.
         """
+        if self.rank != 0:
+            return
         if self._str is None:
             self._fout = open(self._logfile, "w")
             self._str = ""

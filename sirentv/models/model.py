@@ -16,7 +16,10 @@ class SirenTV(nn.Module):
     def __init__(self, cfg: dict, meta=None):
         super().__init__()
         self.config_model = cfg["model"]
+        self.config_data = cfg["data"]
         self.config_loader = cfg["data"]["loader"]
+        self._load_pos = self.config_loader.get("load_pos", True)
+
         self.config_xform = cfg.get("transform_vis", None)
         if self.config_xform is None:
             print("[SirenTV] transform_vis is not set, using default values")
@@ -45,9 +48,11 @@ class SirenTV(nn.Module):
         elif "photonlib" in cfg:
             self._meta = AABox.load(cfg["photonlib"]["filepath"])
 
-        with h5py.File(cfg["photonlib"]["filepath"], 'r') as file:
-            self.pmt_coords = torch.tensor(file['pmt_pos'][:], dtype=torch.float32)
-            self.norm_pmt_coords = torch.tensor(file['pmt_norm_pos'][:], dtype=torch.float32)
+        if self._load_pos:
+            with h5py.File(cfg["photonlib"]["filepath"], 'r') as file:
+                self.pmt_coords = torch.tensor(file['pmt_pos'][:], dtype=torch.float32)
+                self.norm_pmt_coords = torch.tensor(file['pmt_norm_pos'][:], dtype=torch.float32)
+
         # Transform functions
         self._xform_vis, self._inv_xform_vis = partial_xform_vis(self.config_xform)
 
@@ -56,7 +61,7 @@ class SirenTV(nn.Module):
         self._do_hardsigmoid = self.config_model.get("hardsigmoid", False)
         self.tick_size = self.config_model.get("tick_size", 0.1) # ns
 
-        self.n_pmts = len(self.norm_pmt_coords)
+        self.n_pmts: int = self.config_data.get("n_pmt", 81)
 
 
     def to(self, device):
@@ -69,6 +74,10 @@ class SirenTV(nn.Module):
     @property
     def meta(self):
         return self._meta
+
+    @property
+    def load_pos(self):
+        return self._load_pos
 
     @property
     def device(self):
@@ -98,9 +107,11 @@ class SirenTV(nn.Module):
         mask = self.meta.contain(pos).to(self.device)
         norm_pos = self.meta.norm_coord(pos[mask]).to(self.device)
         norm_pos = norm_pos.unsqueeze(1).expand(-1, self.n_pmts, -1)
-        norm_pmt_tile = self.norm_pmt_coords.to(self.device)
-        norm_pmt_tile = norm_pmt_tile.unsqueeze(0).expand_as(norm_pos)
-        input_to_net = torch.cat([norm_pos, norm_pmt_tile], dim=-1)
+        input_to_net = norm_pos
+        if self._load_pos:
+            norm_pmt_tile = self.norm_pmt_coords.to(self.device).unsqueeze(0).expand_as(norm_pos)
+            input_to_net = torch.cat([norm_pos, norm_pmt_tile], dim=-1)
+
         out = self.model(input_to_net)#.to(device)
 
         v = torch.zeros(
