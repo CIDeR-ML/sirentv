@@ -48,11 +48,13 @@ class ExponentialTimingWeighting(nn.Module):
         A = self.exp_peak
         P = self.exp_const
 
-        # create weights propto tick amplitude:
+        # create weights propto tick amplitude. Same as
+        # `ConstVisibilityWeighting` but for timing bins.
         w = t * self.const
         w = w.clone()
         w[w < self.threshold] = 1.0
 
+        # Add exponential decay profile on top of the constant weight.
         ticks = torch.arange(n_time, device=device, dtype=t.dtype)
         w_1d = w + A * torch.exp(-P * ticks)
 
