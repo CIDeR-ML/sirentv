@@ -21,32 +21,22 @@ from sirentv.analysis import get_pred_target, log_imshow, log_line, log_pred_tar
 
 from sirentv.models import SirenTV
 from sirentv.loss.builder import build_loss as build_loss_fn, build_regularizer as build_regularizer_fn
+from sirentv.weighting import build_weighting
 from sirentv.utils.comm import create_ddp_model
 from sirentv.utils.log import CSVLogger, WandbLogger, Logger
 from sirentv.utils.transform import pdf_to_cdf
 from sirentv.infer import infer_single_pos_single_pmt
 
-
-def get_weight_by_vis(vis, factor=None, threshold=1e-8):
-    """
-    Weight by visibility, `weight  = vis * factor`.
-    Weights (after applying factor) below `threshold` are set to 1.
-
-    Arguments
-    ---------
-    vis: torch.Tensor
-        Visibility values.
-
-    Returns
-    -------
-    w: torch.Tensor
-        Weight values with `w.shape == vis.shape`.
-    """
-    if factor is None:
-        factor = 1 / torch.max(vis.clamp(min=1e-8))
-    w = vis * factor
-    w[w < threshold] = 1.0
-    return w
+def build_weightings(cfg):
+    """Build weighting modules from config."""
+    weight_cfg = cfg.get("data", {}).get("weight", {})
+    weightings = {}
+    for key, wcfg in weight_cfg.items():
+        if wcfg is None or not wcfg.get("enable", True):
+            weightings[key] = None
+        else:
+            weightings[key] = build_weighting(wcfg)
+    return weightings
 
 def build_losses(cfg):
     loss_cfg = cfg.get("train", dict()).get("loss", [])
@@ -160,6 +150,7 @@ def train(cfg: dict):
 
     loss_fns = build_losses(cfg)
     regularizer = build_regularizer(cfg)
+    weightings = build_weightings(cfg)
     logger = build_logger(cfg, net, rank=rank, world_size=world_size, is_distributed=is_distributed)
 
     # Store configuration (only on rank 0)
@@ -182,8 +173,6 @@ def train(cfg: dict):
     if rank == 0:
         print(f"[train] train for max iterations {iteration_max} or max epochs {epoch_max}")
         print(f"[train] distributed training: {is_distributed}, world_size: {world_size}")
-
-    weight_cfg = cfg.get("data", {}).get("weight", {})
 
     # Start the training loop
     stop_training = False
@@ -224,14 +213,9 @@ def train(cfg: dict):
                     "v_linear": target_v_linear,
                 }
 
-                # generate weights for just v! (and for t if mode==pdf; enable via config)
+                # generate weights using weighting modules
                 weights = {
-                    k: get_weight_by_vis(
-                        target[k],
-                        factor=weight_cfg[k].get("factor", None),
-                        threshold=weight_cfg[k].get("threshold", 1e-8),
-                    )
-                    if (k in weight_cfg and weight_cfg[k]['enable']) else 1.0
+                    k: weightings[k](target[k]) if k in weightings and weightings[k] is not None else 1.0
                     for k in target.keys()
                 }
                 if torch.cuda.is_available():
@@ -389,7 +373,10 @@ def main():
     #print(f"  CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', 'NOT SET')}")
     #print(f"  Available CUDA devices: {torch.cuda.device_count()}")
 
-    dist.init_process_group(backend='nccl')
+    # only initialize DDP if environment variables indicate it should be used
+    ddp_enabled = 'RANK' in os.environ or 'WORLD_SIZE' in os.environ
+    if ddp_enabled:
+        dist.init_process_group(backend='nccl')
 
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
     if torch.cuda.is_available():
@@ -403,7 +390,9 @@ def main():
     cfg = yaml.safe_load(open(args.config))
     
     train(cfg)
-    dist.destroy_process_group()
+    
+    if ddp_enabled:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

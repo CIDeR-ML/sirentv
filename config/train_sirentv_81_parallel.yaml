@@ -1,6 +1,8 @@
 photonlib:
-    filepath: /sdf/data/neutrino/pubdata/lut/optical/waveform_map/batch02/consolidated/plib.h5
+    filepath: /sdf/data/neutrino/pubdata/lut/optical/consolidated/full_wvfm_plib_b03_uncompressed.h5
     lazy: True
+    time_tick_size: 0.1 #ns
+
 device: 
     type: cuda
 model:
@@ -25,11 +27,12 @@ data:
     n_pmt: 81
     weight:
       t:
-        enable: false
-        factor: 1000000.0
-        threshold: 1.0e-08
+        type: ExponentialTimingWeighting # A exp(-C * t)
+        const: 5000.0
+        exp_peak: 500.0
+        exp_const: 0.005 # C = 0.005 --> ~exp(-5) at 1000 ticks
       v:
-        enable: true
+        type: ConstVisibilityWeighting
         factor: 5000.0
         threshold: 1.0e-08
     loader:
@@ -38,6 +41,7 @@ data:
       num_workers: 4
       pin_memory: true
       shuffle: true
+      load_pos: true
 logger:
     type: wandb
     dir_name: logs_xyz_81_vis_weighting

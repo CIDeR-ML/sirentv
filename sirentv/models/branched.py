@@ -22,6 +22,7 @@ class BranchedSiren(nn.Module):
                  hidden_omega_0: float = 30.0,
                  steepness_factor: float = 10.0,
                  use_CDF: bool = True,
+                 use_t0: bool = True,
                  xform_vis: dict ={},
     ):
         super().__init__()
@@ -33,6 +34,12 @@ class BranchedSiren(nn.Module):
             [hidden_layers] if isinstance(hidden_layers, int) else hidden_layers
         )
         assert isinstance(out_features, list) and len(out_features)==2, "WaveformSiren needs exactly list of 2 output features"
+
+        self._use_t0 = use_t0
+        
+        # adjust waveform decoder output size based on whether t0 is used
+        # if use_t0=False, only output CDF (1000), not t0+CDF (1001)
+        waveform_out_features = out_features[1] if use_t0 else out_features[1] - 1
 
         print("=" * 20, "visibility encoder", "=" * 20)
         self.encoder = Siren(
@@ -60,7 +67,7 @@ class BranchedSiren(nn.Module):
             in_features=hidden_features[0],
             hidden_features=hidden_features[2],
             hidden_layers=hidden_layers[2] - 1,
-            out_features=out_features[1],
+            out_features=waveform_out_features,
             outermost_linear=outermost_linear,
             first_omega_0=first_omega_0,
             hidden_omega_0=hidden_omega_0,
@@ -73,7 +80,7 @@ class BranchedSiren(nn.Module):
         self.out_features = out_features
 
         self._steepness_factor = float(steepness_factor)
-        self._use_CDF= use_CDF
+        self._use_CDF = use_CDF
 
     def check_outputs(self):
         assert (
@@ -87,12 +94,17 @@ class BranchedSiren(nn.Module):
 
     def forward(self, x):
         x = self.encoder(x)
-        out_t0cdf = self.waveform_decoder(x)
-        out_t0, out_cdf = out_t0cdf[:, :, 1], out_t0cdf[:, :, 1:]
         out_v = self.vis_decoder(x)
-        n_ticks = out_cdf.shape[-1]
-        t0 = torch.sigmoid(out_t0)*n_ticks
-        out_cdf = t0_mask(n_ticks, t0.unsqueeze(-1), out_cdf, self._steepness_factor, self._use_CDF)
+        
+        if self._use_t0:
+            out_t0cdf = self.waveform_decoder(x)
+            out_t0, out_cdf = out_t0cdf[:, :, 0], out_t0cdf[:, :, 1:]
+            n_ticks = out_cdf.shape[-1]
+            t0 = torch.sigmoid(out_t0) * n_ticks
+            t0 = t0_mask(n_ticks, t0.unsqueeze(-1), out_cdf, self._steepness_factor, self._use_CDF)
+        else:
+            out_cdf = self.waveform_decoder(x)
+            t0 = None
 
         output = dict(
             v=out_v.squeeze(-1),
