@@ -5,8 +5,8 @@ import torch.nn as nn
 @WEIGHTINGS.register_module()
 class ExponentialTimingWeighting(nn.Module):
     """
-    Weight by timing bin with constant + exponential decay profile.
-    weight[i] = const + A * exp(-P * i)
+    Weight by timing bin with some weight proportional to tick amplitude + exponential decay profile.
+    weight[i] = const * t[i] + A * exp(-P * i)
     where P = -log(const/A) / n_ticks and A is the peak value of the exponential at the start.
 
     Args
@@ -17,13 +17,16 @@ class ExponentialTimingWeighting(nn.Module):
         Constant weight applied to all ticks (default 1.0)
     exp_peak : float or None
         Peak value of exponential at tick 0. If None, defaults to 0.1 * const
+    threshold : float
+        Threshold for the weight. If the weight is less than this value, it will be set to 1.0
     """
 
-    def __init__(self, const=1.0, exp_peak=None, exp_const=1e-3):
+    def __init__(self, const=1.0, exp_peak=None, exp_const=1e-3, threshold=1.0e-8):
         super().__init__()
         self.const = const
         self.exp_peak = exp_peak
         self.exp_const = exp_const
+        self.threshold = threshold
 
     def forward(self, t):
         """
@@ -45,8 +48,13 @@ class ExponentialTimingWeighting(nn.Module):
         A = self.exp_peak
         P = self.exp_const
 
+        # create weights propto tick amplitude:
+        w = t * self.const
+        w = w.clone()
+        w[w < self.threshold] = 1.0
+
         ticks = torch.arange(n_time, device=device, dtype=t.dtype)
-        w_1d = self.const + A * torch.exp(-P * ticks)
+        w_1d = w + A * torch.exp(-P * ticks)
 
         # expand to match input shape
         w = w_1d.expand(t.shape)
