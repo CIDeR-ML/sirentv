@@ -235,7 +235,7 @@ def train(cfg: dict):
 
                 if hasattr(net.module if is_distributed else net, 'load_pos'):
                     load_pos = (net.module if is_distributed else net).load_pos
-                    if load_pos:
+                    if load_pos and 't0' in pred and pred['t0'] is not None:
                         net_module = net.module if is_distributed else net
                         pmt_pos = net_module.pmt_coords.to(x.device)
                         pred['t0'] *= tick_size
@@ -295,7 +295,7 @@ def train(cfg: dict):
             if isinstance(logger, WandbLogger):
                 logger.log_aggregated_loss(iteration_ctr, loss)
 
-            if iteration_ctr % 10 == 0 and isinstance(logger, WandbLogger):
+            if iteration_ctr % 50 == 0 and isinstance(logger, WandbLogger):
                 per_rank_metrics = {
                     "gpu_memory_gb": float(torch.cuda.memory_allocated(local_rank)/(1024**3)) if torch.cuda.is_available() else 0,
                     "loss": loss.detach(),
@@ -304,7 +304,7 @@ def train(cfg: dict):
                 }
                 logger.log_per_rank_metrics(iteration_ctr, per_rank_metrics)
 
-            if rank == 0 and iteration_ctr % 10 == 0:
+            if rank == 0 and iteration_ctr % 50 == 0:
                 inferred_output = infer_single_pos_single_pmt(net.module if is_distributed else net, x, target, tick_size)
                 logger.plot(iteration_ctr, inferred_output)
 

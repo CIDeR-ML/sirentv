@@ -124,7 +124,7 @@ class SirenTV(nn.Module):
         )
         t[mask] = out['t'].to(self.device)
 
-        if 't0' in out:
+        if 't0' in out and out['t0'] is not None:
             t0 = torch.zeros(
                 pos.shape[0], *out['t0'].shape[1:], dtype=torch.float32, device=self.device
             )
