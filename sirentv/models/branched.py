@@ -101,7 +101,7 @@ class BranchedSiren(nn.Module):
             out_t0, out_cdf = out_t0cdf[:, :, 0], out_t0cdf[:, :, 1:]
             n_ticks = out_cdf.shape[-1]
             t0 = torch.sigmoid(out_t0) * n_ticks
-            t0 = t0_mask(n_ticks, t0.unsqueeze(-1), out_cdf, self._steepness_factor, self._use_CDF)
+            out_cdf = t0_mask(n_ticks, t0.unsqueeze(-1), out_cdf, self._steepness_factor, self._use_CDF)
         else:
             out_cdf = self.waveform_decoder(x)
             t0 = None
