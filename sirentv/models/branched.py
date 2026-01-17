@@ -103,7 +103,10 @@ class BranchedSiren(nn.Module):
             t0 = torch.sigmoid(out_t0) * n_ticks
             out_cdf = t0_mask(n_ticks, t0.unsqueeze(-1), out_cdf, self._steepness_factor, self._use_CDF)
         else:
-            out_cdf = self.waveform_decoder(x)
+            out_cdf = self.waveform_decoder(x) # (B, N_pmt, N_time)
+            out_cdf = out_cdf.softmax(dim=-1) # (B, N_pmt, N_time)
+            if self._use_CDF:
+                out_cdf = out_cdf.cumsum(dim=-1)
             t0 = None
 
         output = dict(
