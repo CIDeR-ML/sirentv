@@ -41,7 +41,8 @@ class PLibDataset(Dataset):
             max_len = total_voxels
         effective_voxels = min(total_voxels, max_len)
 
-        # Distribute across ranks
+        '''
+        # Manually distribute across ranks
         if world_size > 1:
             voxels_per_rank = effective_voxels // world_size
             remainder = effective_voxels % world_size
@@ -56,17 +57,39 @@ class PLibDataset(Dataset):
         else:
             start_idx = 0
             end_idx = effective_voxels
-
+        
         self.indices = torch.arange(start_idx, end_idx, dtype=torch.long)
+        print(f"[PLibDataset] Voxels on rank {self.rank}: {len(self.indices)}, starting from {self.indices.min()} to {self.indices.max()}")
+        '''
+        self.indices = torch.arange(0, effective_voxels, dtype=torch.long)
 
         if rank == 0:
             print(f"[PLibDataset] Total voxels: {effective_voxels}")
 
-        print(f"[PLibDataset] Voxels on rank {self.rank}: {len(self.indices)}")
-
     def __len__(self):
         return len(self.indices)
 
+    def get_weight_by_vis(self, vis):
+        """
+        Weight by inverse visibility, `weight  = 1/vis * factor`.
+        Weights below `threshold` are set to 1.
+
+        Arguments
+        ---------
+        vis: torch.Tensor
+            Visibility values.
+
+        Returns
+        -------
+        w: torch.Tensor
+            Weight values with `w.shape == vis.shape`.
+        """
+        factor = self._weight_cfg.get("factor", 1.0)
+        threshold = self._weight_cfg.get("threshold", 1e-8)
+        w = vis * factor
+        w[w < threshold] = 1.0
+        return w
+    
     def __getitem__(self, idx):
         """
         Get a single voxel's data.
@@ -112,13 +135,26 @@ def create_dataloader(cfg, rank=0, world_size=1):
     drop_last = loader_cfg.get("drop_last", True)
     shuffle = loader_cfg.get("shuffle", False)
 
+    if world_size > 1:
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=shuffle,
+            drop_last=drop_last,
+            seed = 0
+        )
+        shuffle = False
+    else:
+        sampler = None
     # Create DataLoader
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
+        sampler=sampler,
         num_workers=num_workers,
         pin_memory=pin_memory,
-        drop_last=drop_last,
+        drop_last=drop_last if sampler is None else False,
         shuffle=shuffle,
         persistent_workers=True if num_workers > 0 else False,
     )

@@ -145,6 +145,30 @@ def train(cfg: dict):
 
     #dl = PLibDataLoader(cfg, device=DEVICE, rank=rank, world_size=world_size)
     dl = create_dataloader(cfg, rank=rank, world_size=world_size)
+    '''
+    if dist.is_initialized():
+        if hasattr(dl, 'sampler') and dl.sampler is not None:
+            # Get the indices the sampler will use
+            sampler_indices = list(iter(dl.sampler))[:10]
+        else:
+            # No sampler - getting sequential indices
+            sampler_indices = list(range(10))
+
+        all_indices = [None] * world_size
+        dist.all_gather_object(all_indices, sampler_indices)
+
+        if rank == 0:
+            print("First 10 SAMPLER indices per rank:")
+            for r, idx in enumerate(all_indices):
+                print(f"  Rank {r}: {idx}")
+
+            # Check for overlaps
+            all_flat = [i for sublist in all_indices for i in sublist]
+            if len(all_flat) != len(set(all_flat)):
+                print("WARNING: Duplicate indices across ranks!")
+            else:
+                print("No duplicates - distributed sampling working correctly!")
+    '''
 
     opt, sch, epoch = optimizer_factory(list(p for p in net.parameters() if p.requires_grad), cfg)
     if epoch > 0:
@@ -196,8 +220,8 @@ def train(cfg: dict):
 
     # through epochs
     while iteration_ctr < iteration_max and epoch_ctr < epoch_max:
-        if is_distributed and hasattr(dl, 'set_epoch'):
-            dl.set_epoch(epoch_ctr)
+        if is_distributed and hasattr(dl, 'sampler') and hasattr(dl.sampler, 'set_epoch'):
+            dl.sampler.set_epoch(epoch_ctr)
 
         # through batches
         if torch.cuda.is_available():
@@ -302,16 +326,11 @@ def train(cfg: dict):
                     [iteration_ctr, epoch_ctr, current_lr, data_loading_time, model_time_iter, mem_after_forward] + losses.detach().cpu().tolist() + [loss.item()],
                 )
 
-                # Step the logger
-                with torch.no_grad():
-                    pred['v_linear'] = dl.inv_xform_vis(pred['v'])
-                    pred['t_linear'] = pred['t']
-                    logger.step(iteration_ctr, target, pred)
-
             if isinstance(logger, WandbLogger):
-                logger.log_aggregated_loss(iteration_ctr, loss)
+                #logger.log_aggregated_loss(iteration_ctr, loss)
+                # Step the logger
 
-            if iteration_ctr % 10 == 0 and isinstance(logger, WandbLogger):
+                #if iteration_ctr % 10 == 0 and isinstance(logger, WandbLogger):
                 per_rank_metrics = {
                     "gpu_memory_gb": float(torch.cuda.memory_allocated(local_rank)/(1024**3)) if torch.cuda.is_available() else 0,
                     "loss": loss.detach(),
@@ -320,9 +339,16 @@ def train(cfg: dict):
                 }
                 logger.log_per_rank_metrics(iteration_ctr, per_rank_metrics)
 
-            if rank == 0 and iteration_ctr % 10 == 0:
+                #if rank == 0 and iteration_ctr % 10 == 0:
                 inferred_output = infer_single_pos_single_pmt(net.module if is_distributed else net, x, target, tick_size)
                 logger.plot(iteration_ctr, inferred_output)
+
+                with torch.no_grad():
+                    pred['v_linear'] = dl.inv_xform_vis(pred['v'])
+                    pred['t_linear'] = pred['t']
+                    logger.step(iteration_ctr, target, pred)
+
+                logger.commit(iteration_ctr)
 
             # Save the model parameters if the condition is met
             if rank == 0 and save_every_iterations > 0 and iteration_ctr % save_every_iterations == 0:
