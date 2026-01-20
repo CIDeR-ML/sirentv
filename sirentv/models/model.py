@@ -40,7 +40,7 @@ class SirenTV(nn.Module):
             with open(ckpt_file, "rb") as f:
                 model_dict = torch.load(f, map_location="cpu")
                 self.load_model_dict(model_dict)
-            return
+            #return
 
         # Create meta
         if meta is not None:
