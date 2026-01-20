@@ -68,7 +68,8 @@ def infer_single_pos_single_pmt(net: nn.Module, input_x: tensor, target: dict, t
         "visibility": torch.stack([target_v_linear, pred_v_linear],dim=-1),
         "pdf": torch.stack([target_t_pdf, pred_t_pdf], dim=-1),
         "cdf": torch.stack([target_t_cdf, pred_t_cdf], dim=-1),
-        "t0": t0s
+        "t0": t0s,
+        "position": input_x
     }
 
     net.unfreeze_all()

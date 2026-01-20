@@ -1,6 +1,10 @@
 import os
 from functools import partial
 import glob
+import numpy as np
+import torch
+import torch.distributed as dist
+
 import importlib
 from abc import ABC, abstractmethod
 
@@ -87,17 +91,17 @@ class WandbLogger(Logger):
         self._dict = {}
         self._analysis_dict = {}
 
-        if self.rank == 0:
-            for kwargs in log_cfg.get("analysis", []):
-                func = kwargs.pop("func", "")
-                suffix = kwargs.pop("suffix", "")
-                if suffix:
-                    suffix = f"_{suffix}"
+        for kwargs in log_cfg.get("analysis", []):
+            func = kwargs.pop("func", "")
+            suffix = kwargs.pop("suffix", "")
+            if suffix:
+                suffix = f"_{suffix}"
+            if self.rank == 0:
                 print("[WandbLogger] adding analysis function:", func+suffix)
 
-                self._analysis_dict[func + suffix] = partial(
-                    getattr(importlib.import_module("sirentv.analysis"), func), **kwargs
-                )
+            self._analysis_dict[func + suffix] = partial(
+                getattr(importlib.import_module("sirentv.analysis"), func), **kwargs
+            )
 
     def record(self, keys: list, vals: list):
         """
@@ -116,11 +120,16 @@ class WandbLogger(Logger):
             for i, key in enumerate(keys):
                 self._dict[key] = vals[i]
 
+    def commit(self, iteration):
+        """Commit all pending logs to wandb"""
+        if iteration % self._log_every_nsteps == 0 and self.wandb is not None:
+            self.wandb.log({}, step=iteration, commit=True)
+
     def step(self, iteration, label=None, pred=None):
         """
         Function to take an iteration step during training/inference. If this step is
         subject for logging, this function logs the parameters registered through the record function.
-        Only rank 0 actually records.
+        Per-rank analysis logging.
 
         Parameters
         ----------
@@ -134,22 +143,24 @@ class WandbLogger(Logger):
         pred : torch.Tensor
             The predicted values from the model run for training/inference.
         """
-
-        if self.rank != 0:
+        if iteration == 0 or iteration % self._log_every_nsteps != 0:
             return
 
-        if not iteration % self._log_every_nsteps == 0:
-            return
-
-        if None not in (label, pred):
+        if None not in (label, pred) and len(self._analysis_dict)>0:
+            local_metrics = {}
             for key, f in self._analysis_dict.items():
-                self.record(["analysis/"+key], [f(label, pred)])
-        self.write()
+                metric_value = f(label, pred)
+                local_metrics[f"analysis/{key}"] = metric_value
+                #self.record(["analysis/"+key], [f(label, pred)])
+
+            self.log_per_rank_metrics(iteration, local_metrics)
+
+        if self.rank == 0:
+            self.write()
 
     def plot(self, iteration, inferred: dict):
         """
         Log a plot of x vs y at the given iteration.
-        Only rank 0 actually records.
 
         Parameters
         ----------
@@ -160,75 +171,173 @@ class WandbLogger(Logger):
             Type of plot: "line" or "scatter" (default).
         """
 
-        if self.rank != 0 or inferred is None or self.wandb is None:
+        if inferred is None:
             return
 
-        x = inferred['x_value'].detach().cpu().numpy()
-        visibility = inferred['visibility'].detach().cpu().numpy()
-        pdf = inferred['pdf'].detach().cpu().numpy()
-        cdf = inferred['cdf'].detach().cpu().numpy()
+        local_data = {
+            'x_value': inferred['x_value'].detach().cpu(),
+            'visibility': inferred['visibility'].detach().cpu(),
+            'pdf': inferred['pdf'].detach().cpu(),
+            'cdf': inferred['cdf'].detach().cpu(),
+        }
+        if 'position' in inferred and inferred['position'] is not None:
+            local_data['position'] = inferred['position'].detach().cpu()
+        if 't0' in inferred and inferred['t0'] is not None:
+            local_data['t0'] = inferred['t0'].detach().cpu()
+
+        if self.is_distributed:
+
+            gathered_data = [None for _ in range(self.world_size)]
+            if self.rank == 0:
+                dist.gather_object(local_data, gathered_data, dst=0)
+            else:
+                dist.gather_object(local_data, None, dst=0)
+                return
+            all_data = gathered_data
+        else:
+            # Non-distributed: just use local data
+            if self.rank != 0:
+                return
+            all_data = [local_data]
+
+        if iteration % self._log_every_nsteps != 0 or self.wandb is None:
+            return
+
+        n_ranks = len(all_data)
+        n_cols = min(2, n_ranks)  # Max 2 columns
+        n_rows = (n_ranks + n_cols - 1) // n_cols
 
         import matplotlib.pyplot as plt
+        from matplotlib.gridspec import GridSpec
 
         # --- Visibility plot ---
-        fig_vis, ax_vis = plt.subplots()
-        ax_vis.scatter(visibility[:, 0], visibility[:, 1], label="Target vs Pred")
-        max_val = max(visibility[:, 0].max(), visibility[:, 1].max())*1.1
-        ax_vis.set_xlim(0, max_val)
-        ax_vis.set_ylim(0, max_val)
-        ax_vis.plot([0, 1], [0, 1], 'r--', alpha=0.8, label="y=x")
-        ax_vis.set_xlabel("Target Visibility")
-        ax_vis.set_ylabel("Predicted Visibility")
-        ax_vis.set_title("PMT Visibility")
-        ax_vis.legend()
+        fig_vis, axes_vis = plt.subplots(n_rows, n_cols, figsize=(6 * n_cols, 5 * n_rows), squeeze=False)
+        fig_vis.suptitle("PMT Visibility - All Ranks", fontsize=14, fontweight='bold')
+
+        for rank_id, data in enumerate(all_data):
+            row = rank_id // n_cols
+            col = rank_id % n_cols
+            ax = axes_vis[row, col]
+
+            visibility = data['visibility'].numpy()
+            ax.scatter(visibility[:, 0], visibility[:, 1], label="Target vs Pred", alpha=0.6)
+            max_val = max(visibility[:, 0].max(), visibility[:, 1].max()) * 1.1
+            ax.set_xlim(0, max_val)
+            ax.set_ylim(0, max_val)
+            ax.plot([0, max_val], [0, max_val], 'r--', alpha=0.8, label="y=x")
+            ax.set_xlabel("Target Visibility")
+            ax.set_ylabel("Predicted Visibility")
+
+            subtitle = f"Rank {rank_id}"
+            if data['position'] is not None:
+                pos = data['position'].numpy()
+                if pos.ndim > 1:
+                    pos = pos[0]  # Take first position if batch
+                subtitle += f"\nPos: ({pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f})"
+            ax.set_title(subtitle)
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+
+        for rank_id in range(n_ranks, n_rows * n_cols):
+            row = rank_id // n_cols
+            col = rank_id % n_cols
+            axes_vis[row, col].axis('off')
+
+        plt.tight_layout()
 
         # --- PDF plot ---
-        fig_pdf, ax_pdf = plt.subplots()
-        ax_pdf.plot(x, pdf[:, 0], label="Target", color="navy")
-        ax_pdf.plot(x, pdf[:, 1], label="Predicted", color="darkorange")
-        ax_pdf.set_xlabel("Time (ns)")
-        ax_pdf.set_ylabel("Value")
-        ax_pdf.set_title("Waveform PDF")
-        ax_pdf.legend()
+        fig_pdf, axes_pdf = plt.subplots(n_rows, n_cols, figsize=(6 * n_cols, 5 * n_rows), squeeze=False)
+
+        for rank_id, data in enumerate(all_data):
+            row = rank_id // n_cols
+            col = rank_id % n_cols
+            ax = axes_pdf[row, col]
+
+            x = data['x_value'].numpy()
+            pdf = data['pdf'].numpy()
+
+            ax.plot(x, pdf[:, 0], label="Target", color="navy", linewidth=2)
+            ax.plot(x, pdf[:, 1], label="Predicted", color="darkorange", linewidth=2)
+            ax.set_xlabel("Time (ns)")
+            ax.set_ylabel("Value")
+
+            subtitle = f"Rank {rank_id}"
+            if data['position'] is not None:
+                pos = data['position'].numpy()
+                if pos.ndim > 1:
+                    pos = pos[0]
+                subtitle += f"\nPos: ({pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f})"
+            ax.set_title(subtitle)
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+
+        for rank_id in range(n_ranks, n_rows * n_cols):
+            row = rank_id // n_cols
+            col = rank_id % n_cols
+            axes_pdf[row, col].axis('off')
+
+        plt.tight_layout()
 
         # --- CDF plot ---
         # cdf plot with residual subplot below
-        import numpy as np
-        from matplotlib.gridspec import GridSpec
 
-        fig_cdf = plt.figure(constrained_layout=True, figsize=(6, 6))
-        gs = GridSpec(5, 1, figure=fig_cdf)
-        ax_cdf = fig_cdf.add_subplot(gs[:4, 0])
-        ax_res = fig_cdf.add_subplot(gs[4, 0], sharex=ax_cdf)
+        fig_cdf = plt.figure(figsize=(6 * n_cols, 6 * n_rows))
 
-        ax_cdf.plot(x, cdf[:, 0], label="Target", color="navy")
-        ax_cdf.plot(x, cdf[:, 1], label="Predicted", color="darkorange")
-        if 't0' in inferred.keys() and inferred['t0'] is not None:
-            t0s = inferred['t0'].detach().cpu().numpy()
-            ax_cdf.axvline(t0s[0], linestyle='--', label="Target T0", color="navy", alpha=0.6)
-            ax_cdf.axvline(t0s[1], linestyle='--', label="Predicted T0", color="darkorange", alpha=0.6)
-        ax_cdf.set_xlabel("Time (ns)")
-        ax_cdf.set_ylabel("Value")
-        ax_cdf.set_title("Waveform CDF")
-        ax_cdf.legend()
+        for rank_id, data in enumerate(all_data):
+            row = rank_id // n_cols
+            col = rank_id % n_cols
 
-        # residual plot
-        residual = cdf[:, 1] - cdf[:, 0]
-        ax_res.plot(x, np.zeros_like(x), color="grey", linewidth=1, alpha=0.7)
-        ax_res.plot(x, residual, color="red", linewidth=1)
-        ax_res.set_ylabel("Residual")
-        ax_res.set_xlabel("Time (ns)")
-        ax_res.set_ylim(-np.max(np.abs(residual))*1.1, np.max(np.abs(residual))*1.1)
-        ax_res.set_title("CDF Residual (Pred - Target)")
-        ax_res.spines['top'].set_visible(False)
-        ax_res.spines['right'].set_visible(False)
+            # Position in the overall grid
+            gs = GridSpec(n_rows * 5, n_cols, figure=fig_cdf,
+                          hspace=0.4, wspace=0.3)
+
+            ax_cdf = fig_cdf.add_subplot(gs[row * 5:row * 5 + 4, col])
+            ax_res = fig_cdf.add_subplot(gs[row * 5 + 4, col], sharex=ax_cdf)
+
+            x = data['x_value'].numpy()
+            cdf = data['cdf'].numpy()
+
+            ax_cdf.plot(x, cdf[:, 0], label="Target", color="navy", linewidth=2)
+            ax_cdf.plot(x, cdf[:, 1], label="Predicted", color="darkorange", linewidth=2)
+
+            # Add T0 lines if available
+            if data['t0'] is not None:
+                t0s = data['t0'].numpy()
+                ax_cdf.axvline(t0s[0], linestyle='--', label="Target T0", color="navy", alpha=0.6)
+                ax_cdf.axvline(t0s[1], linestyle='--', label="Predicted T0", color="darkorange", alpha=0.6)
+
+            ax_cdf.set_ylabel("Value")
+
+            subtitle = f"Rank {rank_id}"
+            if data['position'] is not None:
+                pos = data['position'].numpy()
+                if pos.ndim > 1:
+                    pos = pos[0]
+                subtitle += f" - Pos: ({pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f})"
+            ax_cdf.set_title(subtitle, fontsize=10)
+            ax_cdf.legend(fontsize=8)
+            ax_cdf.grid(True, alpha=0.3)
+            ax_cdf.tick_params(labelbottom=False)
+
+            # Residual plot
+            residual = cdf[:, 1] - cdf[:, 0]
+            ax_res.plot(x, np.zeros_like(x), color="grey", linewidth=1, alpha=0.7)
+            ax_res.plot(x, residual, color="red", linewidth=1.5)
+            ax_res.set_ylabel("Residual", fontsize=8)
+            ax_res.set_xlabel("Time (ns)")
+            max_res = np.max(np.abs(residual))
+            if max_res > 0:
+                ax_res.set_ylim(-max_res * 1.1, max_res * 1.1)
+            ax_res.grid(True, alpha=0.3)
+            ax_res.spines['top'].set_visible(False)
+            ax_res.spines['right'].set_visible(False)
 
         # log both figures in a single step
         self.wandb.log({
             "PMT Visibility": wandb.Image(fig_vis),
             "PDF": wandb.Image(fig_pdf),
             "CDF": wandb.Image(fig_cdf),
-        }, step=iteration)
+        }, step=iteration, commit=False)
 
         plt.close(fig_vis)
         plt.close(fig_pdf)
@@ -247,7 +356,7 @@ class WandbLogger(Logger):
         Log the key-value pairs provided through the record function to wandb.
         """
         if self.wandb is not None:
-            self.wandb.log(self._dict)
+            self.wandb.log(self._dict, commit=False)
             self._dict = {}  # Clear dict after logging
 
     def save(self, path):
@@ -309,8 +418,10 @@ class WandbLogger(Logger):
             Loss tensor (must be on GPU for all_reduce)
 
         """
+        if iteration == 0 or iteration % self._log_every_nsteps != 0:
+            return
+
         if self.is_distributed:
-            import torch.distributed as dist
             loss_avg = loss_tensor.detach().clone()
             dist.all_reduce(loss_avg, op=dist.ReduceOp.AVG)
         else:
@@ -319,7 +430,7 @@ class WandbLogger(Logger):
             self.wandb.log({
                 "loss/avg_across_gpus": loss_avg.item(),
                 "loss/rank_0": loss_tensor.item(),
-            }, step=iteration)
+            }, step=iteration, commit=False)
 
     def log_per_rank_metrics(self, iteration, metrics_dict):
         """
@@ -337,8 +448,6 @@ class WandbLogger(Logger):
             if self.wandb is not None:
                 self.wandb.log(metrics_dict, step=iteration)
             return
-        import torch
-        import torch.distributed as dist
         log_dict = {}
         for metric_name, metric_value in metrics_dict.items():
             if not isinstance(metric_value, torch.Tensor):
@@ -347,13 +456,14 @@ class WandbLogger(Logger):
             gathered = [torch.zeros_like(metric_value) for _ in range(self.world_size)]
             dist.all_gather(gathered, metric_value)
 
-            if self.wandb is not None:
+            if self.rank == 0:
                 for rank_id, val in enumerate(gathered):
                     log_dict[f"{metric_name}/rank_{rank_id}"] = val.item()
                 avg_val = torch.stack(gathered).mean()
                 log_dict[f"{metric_name}/avg"] = avg_val.item()
-        if self.wandb is not None:
-            self.wandb.log(log_dict, step=iteration)
+
+        if iteration % self._log_every_nsteps == 0  and self.wandb is not None:
+            self.wandb.log(log_dict, step=iteration, commit=False)
 
 class CSVLogger(Logger):
     """
@@ -383,7 +493,7 @@ class CSVLogger(Logger):
         self.is_distributed = is_distributed
 
         log_cfg = cfg.get("logger", dict())
-        self._log_every_nsteps = log_cfg.get("log_every_nsteps", 1)
+        self._log_every_nsteps = log_cfg.get("log_every_nsteps", 10)
         if self.rank == 0:
             self._logdir = self.make_logdir(log_cfg.get("dir_name", "logs"))
             self._logfile = os.path.join(self._logdir, cfg.get("file_name", "log.csv"))
