@@ -1,0 +1,100 @@
+photonlib:
+    #filepath: /sdf/data/neutrino/pubdata/lut/optical/waveform_map/batch02/consolidated/plib.h5
+    filepath: /sdf/data/neutrino/pubdata/lut/optical/consolidated/full_wvfm_plib_b03_uncompressed.h5
+    lazy: True
+    time_tick_size: 0.1 #ns
+physics:
+    R_index: 1.3784
+device: 
+    type: cuda
+model:
+  ckpt_file:
+  mode: cdf
+  network:
+    type: BranchedSiren # or ConditionalSiren or BranchedSiren
+    in_features: 6
+    hidden_features: [512, 256, 1024]
+    hidden_layers: [3, 3, 3]
+    out_features: [1, 1001]
+    outermost_linear: True
+    steepness_factor: 10.0
+    hard: True
+  # Optional: annealing for temperature (Gumbel)
+  anneal:
+    enabled: True
+    tau_start: 0.5
+    tau_end: 0.05
+  output_scale:
+      fix: True
+transform_vis:
+    vmax: 1.0
+    eps: 1.e-8
+    sin_out: False
+data:
+    #n_photon: 200000
+    n_photon: 15000000
+    n_pmt: 81
+    use_gradient_supervision: True  # Enable gradient precomputation
+    gradient_cache_file: /sdf/home/j/junjie/sdf-data/SIREN/gradients/branched_gradient_cache_20260208.pt  # Cache to avoid recomputation
+    weight:
+      t:
+        enable: false
+        factor: 1000000.0
+        threshold: 1.0e-08
+      v:
+        enable: true
+        factor: 5000.0
+        threshold: 1.0e-08
+    loader:
+      batch_size: 3072
+      drop_last: true
+      num_workers: 2
+      pin_memory: true
+      shuffle: true
+logger:
+    type: wandb
+    dir_name: /sdf/home/j/junjie/sdf-data/SIREN/wandb/logs_xyz_81_vis_weighting
+    run_dir: /sdf/home/j/junjie/sdf-data/SIREN
+    file_name: log.csv
+    log_every_nsteps: 10
+    project: branched-siren-81
+    name: siren_81-vis
+    analysis:
+      - func: bias
+        suffix: time
+        key: t_linear
+        threshold: 1.0e-06
+      - func: bias
+        suffix: vis
+        key: v_linear
+        threshold: 1.0e-06
+      - func: abs_bias
+        suffix: t0
+        key: t0
+        threshold: 1.0e-02
+        signed: True
+train:
+    loss:
+      - type: SmoothL1Loss
+        key: t
+        weight: 1.0
+      - type: SmoothL1Loss
+        key: v
+        weight: 1.0
+      - type: VisibilityGradient_SmoothL1Loss
+        key: v
+        weight: 0.01
+        threshold: 1.0e-9
+    regularization: null
+    reduction: sum
+    max_epochs: 1000
+    optimizer_class: AdamW
+    optimizer_param:
+      lr: 2.0e-05
+    resume: false
+    save_every_epochs: 100
+    scheduler_class: ReduceLROnPlateau
+    scheduler_param:
+      patience: 10
+      factor: 0.5
+      verbose: true
