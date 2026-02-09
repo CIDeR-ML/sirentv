@@ -22,6 +22,7 @@ class BranchedSiren(nn.Module):
                  hidden_omega_0: float = 30.0,
                  steepness_factor: float = 10.0,
                  use_CDF: bool = True,
+                 hard: bool = False,
                  xform_vis: dict ={},
     ):
         super().__init__()
@@ -73,7 +74,8 @@ class BranchedSiren(nn.Module):
         self.out_features = out_features
 
         self._steepness_factor = float(steepness_factor)
-        self._use_CDF= use_CDF
+        self._hard = bool(hard)
+        self._use_CDF = use_CDF
 
     def check_outputs(self):
         assert (
@@ -85,14 +87,17 @@ class BranchedSiren(nn.Module):
             == self.waveform_decoder.net[0].linear.in_features
         )
 
-    def forward(self, x):
+    def forward(self, x, tau):
         x = self.encoder(x)
         out_t0cdf = self.waveform_decoder(x)
         out_t0, out_cdf = out_t0cdf[:, :, 1], out_t0cdf[:, :, 1:]
         out_v = self.vis_decoder(x)
         n_ticks = out_cdf.shape[-1]
-        t0 = torch.sigmoid(out_t0)*n_ticks
-        out_cdf = t0_mask(n_ticks, t0.unsqueeze(-1), out_cdf, self._steepness_factor, self._use_CDF)
+        #t0 = torch.sigmoid(out_t0)*n_ticks
+        # Don't do sigmoid twice
+        t0 = torch.clamp(out_t0 * n_ticks, min=0, max=n_ticks-1)
+        out_cdf = t0_mask(n_ticks, t0.unsqueeze(-1), out_cdf, use_CDF=self._use_CDF, steepness=self._steepness_factor,\
+                          temperature=tau, hard=self._hard)
 
         output = dict(
             v=out_v.squeeze(-1),
