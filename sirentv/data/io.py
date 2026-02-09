@@ -6,6 +6,9 @@ from photonlib import PhotonLib
 from photonlib.meta import VoxelMeta
 import h5py
 import numpy as np
+import os
+
+from sirentv.utils.misc import compute_gradients_from_positions
 
 class PLibDataset(Dataset):
     """
@@ -31,40 +34,138 @@ class PLibDataset(Dataset):
             print("[PLibDataset] transformation params", xform_params)
 
         # Data config
-        data_cfg = cfg["data"]
-        self._n_photons = data_cfg.get("n_photon", 200000)
-        self._n_pmt = data_cfg.get("n_pmt", 81)
+        self.data_cfg = cfg["data"]
+        self._n_photons = self.data_cfg.get("n_photon", 200000)
+        self._n_pmt = self.data_cfg.get("n_pmt", 81)
 
         total_voxels = len(self._plib)
-        max_len = data_cfg.get("max_len", -1)
+        max_len = self.data_cfg.get("max_len", -1)
         if max_len is None or max_len < 0:
             max_len = total_voxels
         effective_voxels = min(total_voxels, max_len)
 
-        '''
-        # Manually distribute across ranks
-        if world_size > 1:
-            voxels_per_rank = effective_voxels // world_size
-            remainder = effective_voxels % world_size
-
-            if rank < remainder:
-                voxels_per_rank += 1
-                start_idx = rank * voxels_per_rank
-            else:
-                start_idx = rank * voxels_per_rank + remainder
-
-            end_idx = start_idx + voxels_per_rank
-        else:
-            start_idx = 0
-            end_idx = effective_voxels
-        
-        self.indices = torch.arange(start_idx, end_idx, dtype=torch.long)
-        print(f"[PLibDataset] Voxels on rank {self.rank}: {len(self.indices)}, starting from {self.indices.min()} to {self.indices.max()}")
-        '''
         self.indices = torch.arange(0, effective_voxels, dtype=torch.long)
 
         if rank == 0:
             print(f"[PLibDataset] Total voxels: {effective_voxels}")
+
+        self.use_gradient = self.data_cfg.get("use_gradient_supervision", False)
+
+        if self.use_gradient:
+            self._precompute_gradients(rank, world_size)
+
+    def _precompute_gradients(self, rank, world_size):
+        """
+        Precompute gradient magnitudes for all voxels and PMTs
+        Only rank 0 computes, then broadcasts to all ranks
+        """
+
+        grad_cache_file = self.data_cfg.get("gradient_cache_file", None)
+
+        if grad_cache_file and os.path.exists(grad_cache_file):
+            if rank == 0:
+                print(f"[PLibDataset] Loading precomputed gradients from {grad_cache_file}")
+            cache = torch.load(grad_cache_file)
+            self.grad_mags_linear = cache['grad_mags_linear']
+            self.grad_mags_transformed = cache['grad_mags_transformed']
+            if rank == 0:
+                print(f"[PLibDataset] Loaded gradient magnitudes: {self.grad_mags_transformed.shape}")
+            return
+
+        if rank == 0:
+            #print("[PLibDataset] Precomputing gradient magnitudes...")
+            #print("[PLibDataset] This will take a while but only happens once...")
+
+            # Get all positions and visibilities
+            n_voxels = len(self.indices)
+            positions = np.zeros((n_voxels, 3), dtype=np.float32)
+            visibility_linear = np.zeros((n_voxels, self._n_pmt), dtype=np.float32)
+
+            # Load data
+            meta = self._plib.meta
+            for i, idx in enumerate(tqdm(self.indices, desc="Loading data")):
+                vox_ids = torch.tensor([idx])
+                pos_raw = meta.voxel_to_coord(vox_ids)
+                positions[i] = pos_raw.cpu().numpy()
+
+                try:
+                    vis = self._plib[vox_ids] / self._n_photons
+                except Exception:
+                    vis = (self._plib.vis[vox_ids] * self._plib.eff)
+
+                vis_summed = vis.sum(dim=-1) #(n_pmt, )
+                visibility_linear[i] = vis_summed.cpu().numpy()
+
+            # Compute gradients for each PMT
+            grad_mags_linear = np.zeros((n_voxels, self._n_pmt), dtype=np.float32)
+
+            for pmt_idx in tqdm(range(self._n_pmt), desc="Computing gradients (linear)"):
+                _, _, _, grad_mag_linear, _, _, _ = compute_gradients_from_positions(
+                    positions,
+                    visibility_linear,
+                    pmt_idx
+                )
+                grad_mags_linear[:, pmt_idx] = grad_mag_linear
+
+            self.grad_mags_linear = torch.tensor(grad_mags_linear, dtype=torch.float32)
+
+            # Also compute gradients in TRANSFORMED space
+            visibility_transformed = np.zeros((n_voxels, self._n_pmt), dtype=np.float32)
+
+            for i in range(n_voxels):
+                vis_torch = torch.tensor(visibility_linear[i], dtype=torch.float32)
+                vis_xform = self.xform_vis(vis_torch)
+                visibility_transformed[i] = vis_xform.cpu().numpy()
+
+            grad_mags_transformed = np.zeros((n_voxels, self._n_pmt), dtype=np.float32)
+
+            for pmt_idx in tqdm(range(self._n_pmt), desc="Computing gradients (transformed)"):
+                _, _, _, grad_mag, _, _, _ = compute_gradients_from_positions(
+                    positions,
+                    visibility_transformed,
+                    pmt_idx
+                )
+                grad_mags_transformed[:, pmt_idx] = grad_mag
+
+            self.grad_mags_transformed = torch.tensor(grad_mags_transformed, dtype=torch.float32)
+
+            # Save to cache if specified
+            if grad_cache_file:
+                print(f"[PLibDataset] Saving gradients to {grad_cache_file}")
+                os.makedirs(os.path.dirname(grad_cache_file), exist_ok=True)
+                torch.save({
+                    'grad_mags_linear': self.grad_mags_linear,
+                    'grad_mags_transformed': self.grad_mags_transformed
+                }, grad_cache_file)
+
+            print(f"[PLibDataset] Gradient precomputation complete")
+            print(f"  Linear: {self.grad_mags_linear.shape}")
+            print(f"  Transformed: {self.grad_mags_transformed.shape}")
+
+        else:
+            # Non-rank-0 processes wait
+            self.grad_mags_linear = None
+            self.grad_mags_transformed = None
+
+        # Broadcast from rank 0 to all other ranks
+        if world_size > 1:
+            import torch.distributed as dist
+            if rank == 0:
+                shape = torch.tensor(self.grad_mags_linear.shape, dtype=torch.long)
+            else:
+                shape = torch.zeros(2, dtype=torch.long)
+
+            dist.broadcast(shape, src=0)
+
+            if rank != 0:
+                self.grad_mags_linear = torch.zeros(tuple(shape.tolist()), dtype=torch.float32)
+                self.grad_mags_transformed = torch.zeros(tuple(shape.tolist()), dtype=torch.float32)
+
+            dist.broadcast(self.grad_mags_linear, src=0)
+            dist.broadcast(self.grad_mags_transformed, src=0)
+
+            if rank == 0:
+                print("[PLibDataset] Gradients broadcasted to all ranks")
 
     def __len__(self):
         return len(self.indices)
@@ -89,7 +190,7 @@ class PLibDataset(Dataset):
         w = vis * factor
         w[w < threshold] = 1.0
         return w
-    
+
     def __getitem__(self, idx):
         """
         Get a single voxel's data.
@@ -116,12 +217,19 @@ class PLibDataset(Dataset):
         vis = vis.view(self._n_pmt, -1)
         target = self.xform_vis(vis)
 
-        return {
+        result = {
             'position': pos_raw.squeeze(0),
             'target_linear': vis,
             'target': target
         }
 
+        if self.use_gradient:
+            # Get the actual voxel index in the full dataset
+            actual_idx = self.indices[idx].item()
+            result['grad_mags_linear'] = self.grad_mags_linear[actual_idx]  # (n_pmt,)
+            result['grad_mags_transformed'] = self.grad_mags_transformed[actual_idx]  # (n_pmt,)
+
+        return result
 
 def create_dataloader(cfg, rank=0, world_size=1):
     """Create DataLoader with map-style dataset."""
