@@ -61,6 +61,7 @@ class WandbLogger(Logger):
 
         if self.rank == 0:
             self._logdir = self.make_logdir(log_cfg.get("dir_name", "logs"))
+            self._wandb_rundir = log_cfg.get("run_dir", "./")
             self._logfile = os.path.join(self._logdir, cfg.get("file_name", "log.csv"))
         else:
             self._logdir = None
@@ -82,7 +83,7 @@ class WandbLogger(Logger):
             )
             if self.entity:
                 proj_cfg["entity"] = self.entity
-            wandb.init(**proj_cfg, settings=wandb.Settings(start_method="fork"))
+            wandb.init(**proj_cfg, dir=self._wandb_rundir, settings=wandb.Settings(start_method="fork"))
             self.wandb = wandb
             print(f"[WandbLogger] Initialized wandb project: {self.project}")
         else:
