@@ -84,6 +84,8 @@ def evaluate(cfg: dict, output_file: str = "eval_results.pt"):
     all_pred_vis = []
     all_true_vis = []
     all_positions = []
+    all_vis_errors = []
+    all_pdf_errors = []
 
     for batch_idx, data in enumerate(tqdm(dl, desc=f"Rank {rank} eval", disable=(rank != 0))):
         x = data["position"].contiguous().to(device)
@@ -118,13 +120,21 @@ def evaluate(cfg: dict, output_file: str = "eval_results.pt"):
         # weight by number of masked elements, not total elements
         vis_masked_count = (target_v_linear > threshold).sum()
         time_masked_count = (target_t_for_bias > threshold).sum()
-        
+
         batch_vis_bias = compute_bias(target, pred, key="v_linear", threshold=threshold)
         batch_time_bias = compute_bias(target, pred, key="t_linear", threshold=threshold)
         overall_vis_bias_sum += batch_vis_bias * vis_masked_count
         overall_vis_bias_count += vis_masked_count
         overall_time_bias_sum += batch_time_bias * time_masked_count
         overall_time_bias_count += time_masked_count
+
+        # compute per-position errors for correlation check
+        vis_error = (pred_v_linear - target_v_linear).detach()  # (B, n_pmts)
+        # mean PDF/CDF error across ticks per PMT
+        pdf_error = (pred_t_for_bias - target_t_for_bias).mean(dim=-1).detach()  # (B, n_pmts)
+        all_vis_errors.append(vis_error)
+        all_pdf_errors.append(pdf_error)
+
 
         # per-PMT visibility bias: 2 * |p - t| / (p + t) for each PMT
         vis_mask = target_v_linear > threshold  # (B, n_pmts)
@@ -140,6 +150,10 @@ def evaluate(cfg: dict, output_file: str = "eval_results.pt"):
             t,
             torch.zeros_like(t)
         )
+
+        local_vis_errors = torch.cat(all_vis_errors, dim=0)
+        local_pdf_errors = torch.cat(all_pdf_errors, dim=0)
+
         target_vis_sum += (target_vis_masked * vis_mask).sum(dim=0)
         target_vis_rms_sq_sum += torch.std((target_vis_masked * vis_mask), dim=0)
         vis_bias_sum += (vis_bias_vals * vis_mask).sum(dim=0)
@@ -224,23 +238,35 @@ def evaluate(cfg: dict, output_file: str = "eval_results.pt"):
             gathered_pred_vis = [torch.zeros(sz, n_pmts, device=device) for sz in all_sizes]
             gathered_true_vis = [torch.zeros(sz, n_pmts, device=device) for sz in all_sizes]
             gathered_positions = [torch.zeros(sz, 3, device=device) for sz in all_sizes]
+
+            gathered_vis_errors = [torch.zeros(sz, n_pmts, device=device) for sz in all_sizes]
+            gathered_pdf_errors = [torch.zeros(sz, n_pmts, device=device) for sz in all_sizes]
         else:
             gathered_pred_vis = None
             gathered_true_vis = None
             gathered_positions = None
 
+            gathered_vis_errors = None
+            gathered_pdf_errors = None
+
         dist.gather(local_pred_vis, gathered_pred_vis if rank == 0 else None, dst=0)
         dist.gather(local_true_vis, gathered_true_vis if rank == 0 else None, dst=0)
         dist.gather(local_positions, gathered_positions if rank == 0 else None, dst=0)
+        dist.gather(local_vis_errors, gathered_vis_errors if rank == 0 else None, dst=0)
+        dist.gather(local_pdf_errors, gathered_pdf_errors if rank == 0 else None, dst=0)
 
         if rank == 0:
             all_pred_vis_tensor = torch.cat(gathered_pred_vis, dim=0).cpu()
             all_true_vis_tensor = torch.cat(gathered_true_vis, dim=0).cpu()
             all_positions_tensor = torch.cat(gathered_positions, dim=0).cpu()
+            all_vis_errors_tensor = torch.cat(gathered_vis_errors, dim=0).cpu()
+            all_pdf_errors_tensor = torch.cat(gathered_pdf_errors, dim=0).cpu()
     else:
         all_pred_vis_tensor = local_pred_vis.cpu()
         all_true_vis_tensor = local_true_vis.cpu()
         all_positions_tensor = local_positions.cpu()
+        all_vis_errors_tensor = local_vis_errors.cpu()
+        all_pdf_errors_tensor = local_pdf_errors.cpu()
 
     if rank == 0:
         # overall bias (matches training logger)
@@ -268,6 +294,18 @@ def evaluate(cfg: dict, output_file: str = "eval_results.pt"):
         print(f"[eval] Overall time bias (analysis.bias): {overall_time_bias.item():.6e}")
         print(f"[eval] Per-PMT visibility bias mean: {vis_bias_mean.mean().item():.6e}")
         print(f"[eval] Per-tick time bias mean: {time_bias_mean.mean().item():.6e}")
+        # Compute visibility-PDF error correlation
+        # Flatten across positions and PMTs: (N_positions * N_pmts,)
+        vis_err_flat = all_vis_errors_tensor.flatten()
+        pdf_err_flat = all_pdf_errors_tensor.flatten()
+
+        # Z-score normalization
+        vis_err_z = (vis_err_flat - vis_err_flat.mean()) / vis_err_flat.std()
+        pdf_err_z = (pdf_err_flat - pdf_err_flat.mean()) / pdf_err_flat.std()
+
+        # Compute correlation coefficient
+        correlation = torch.corrcoef(torch.stack([vis_err_z, pdf_err_z]))[0, 1]
+        print(f"[eval] Visibility-PDF error correlation: {correlation.item():.6f}")
 
         results = {
             # overall bias (matches training)
@@ -300,6 +338,13 @@ def evaluate(cfg: dict, output_file: str = "eval_results.pt"):
                 "true": all_true_vis_tensor,
                 "positions": all_positions_tensor,
             },
+            "error_correlation": {
+                "vis_errors": all_vis_errors_tensor,
+                "pdf_errors": all_pdf_errors_tensor,
+                "vis_errors_z": vis_err_z,
+                "cdf_err_z": pdf_err_z,
+                "correlation": correlation.cpu(),
+            },
             "meta": {
                 "n_pmts": n_pmts,
                 "n_ticks": n_ticks,
@@ -322,11 +367,21 @@ def main():
     parser.add_argument("--output", type=str, default="eval_results.pt", help="output .pt file path")
     args = parser.parse_args()
 
-    dist.init_process_group(backend='nccl')
+    # Check if running in distributed mode (torchrun sets these env vars)
+    is_distributed_env = all(k in os.environ for k in ['RANK', 'WORLD_SIZE', 'LOCAL_RANK'])
 
-    local_rank = int(os.environ.get('LOCAL_RANK', 0))
-    if torch.cuda.is_available():
-        torch.cuda.set_device(local_rank)
+    if is_distributed_env:
+        # Running with torchrun - initialize distributed
+        dist.init_process_group(backend='nccl')
+        local_rank = int(os.environ.get('LOCAL_RANK', 0))
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+        print(f"[main] Initialized distributed training: rank {dist.get_rank()}/{dist.get_world_size()}")
+    else:
+        # Running standalone (python train.py) - single GPU
+        print("[main] Running in non-distributed mode (single GPU)")
+        if torch.cuda.is_available():
+            torch.cuda.set_device(0)
 
     with open(args.config, "r") as f:
         cfg = yaml.safe_load(f)
