@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from sirentv.loss.builder import LOSSES
-
+from sirentv.utils.misc import predict_gradient_magnitudes
 
 @LOSSES.register_module()
 class WeightedSmoothL1Loss(nn.Module):
@@ -47,3 +47,46 @@ class SmoothL1Loss(WeightedSmoothL1Loss):
         weight: dict[str, torch.Tensor] | None = None,
     ):
         return super().forward(pred, target, weight=None, **self.kwargs)
+
+@LOSSES.register_module()
+class VisibilityGradient_SmoothL1Loss(nn.Module):
+    """Gradient magnitude loss using any base loss function"""
+
+    def __init__(self, key: str = 'v', weight=1.0, reduce_method="mean", threshold=1.0E-9, **kwargs):
+        super().__init__()
+        self.key = key
+        self.weight = weight
+        self.reduce_method = reduce_method
+        self.threshold = threshold
+
+        # Running statistics for normalization
+        self.register_buffer('grad_mean', torch.tensor(1.0))
+        self.register_buffer('update_count', torch.tensor(0))
+        self.momentum = 0.99  # EMA momentum
+
+    def forward(self, pred, target, weight=None, positions=None):
+
+        if positions is None:
+            raise ValueError("positions required")
+
+        pred_vis = pred[self.key]
+        target_grad_mag = torch.clamp(target['grad_mags_transformed'], min=self.threshold)
+
+        # Compute predicted gradient magnitudes
+        pred_grad_mag = predict_gradient_magnitudes(pred_vis, positions)
+        pred_grad_mag = torch.clamp(pred_grad_mag, min=self.threshold)
+
+        if len(pred_grad_mag) == 0:
+            return torch.tensor(0.0, device=pred_vis.device, requires_grad=True)
+
+        # Relative loss: (pred - target) / target
+        # This makes it scale-invariant
+        relative_diff = (pred_grad_mag - target_grad_mag) / (target_grad_mag + 1e-10)
+
+        loss = F.smooth_l1_loss(
+            relative_diff,
+            torch.zeros_like(relative_diff),  # Target is 0 (perfect match)
+            reduction=self.reduce_method
+        )
+
+        return self.weight * loss
