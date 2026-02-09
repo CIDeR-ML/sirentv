@@ -77,10 +77,19 @@ def compute_loss(
         target: dict[str, torch.Tensor],
         losses: list[nn.Module],
         weights: dict[str, torch.Tensor],
+        positions: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
     losses_out = {}
     for loss in losses:
-        curr_loss = loss(pred, target, weights)
+        # Check if this loss requires positions (gradient losses)
+        loss_signature = loss.forward.__code__.co_varnames
+
+        if 'positions' in loss_signature:
+            # This is a gradient loss
+            curr_loss = loss(pred, target, weights,
+                             positions=positions)
+        else:
+            curr_loss = loss(pred, target, weights)
         cls_name = loss.__class__.__name__.lower()
         losses_out[f"{cls_name}_{loss.key}"] = curr_loss
     return losses_out
@@ -185,6 +194,7 @@ def train(cfg: dict):
     loss_fns = build_losses(cfg)
     regularizer = build_regularizer(cfg)
     logger = build_logger(cfg, net, rank=rank, world_size=world_size, is_distributed=is_distributed)
+    anneal_enabled = cfg.get("model", {}).get("anneal", {}).get("enabled", False)
 
     # Store configuration (only on rank 0)
     if rank == 0:
@@ -248,6 +258,10 @@ def train(cfg: dict):
                     "v_linear": target_v_linear,
                 }
 
+                if 'grad_mags_transformed' in data:
+                    x = x.requires_grad_(True)
+                    target["grad_mags_transformed"] = data['grad_mags_transformed'].contiguous().to(DEVICE, non_blocking=True)  # (B, n_pmt)
+
                 # generate weights for just v! (and for t if mode==pdf; enable via config)
                 weights = {
                     k: get_weight_by_vis(
@@ -288,6 +302,7 @@ def train(cfg: dict):
                     target,
                     loss_fns,
                     weights,
+                    positions=x,
                 )
 
                 keys, losses = zip(*losses.items())
@@ -306,6 +321,7 @@ def train(cfg: dict):
                     loss += regularizer(net)
 
                 opt.zero_grad()
+                # Clear gradient computation cache
                 if amp:
                     scaler.scale(loss).backward()
                     scaler.unscale_(opt)
@@ -314,6 +330,10 @@ def train(cfg: dict):
                 else:
                     loss.backward()
                     opt.step()
+
+                if 'grad_mag_linear' in data or 'grad_mag_transformed' in data:
+                    torch.cuda.empty_cache()
+
                 torch.cuda.synchronize()
                 model_time_iter = time.time() - forward_start
 
@@ -373,7 +393,12 @@ def train(cfg: dict):
         if sch is not None:
             sch.step(loss)
 
+
         epoch_ctr += 1
+
+        if anneal_enabled and rank == 0:
+            net_module = net.module if is_distributed else net
+            net_module.anneal_temperature(epoch_ctr, epoch_max)
 
         if rank == 0 and (save_every_epochs * epoch_ctr) > 0 and epoch_ctr % save_every_epochs == 0:
             filename = os.path.join(
@@ -415,11 +440,21 @@ def main():
     #print(f"  CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', 'NOT SET')}")
     #print(f"  Available CUDA devices: {torch.cuda.device_count()}")
 
-    dist.init_process_group(backend='nccl')
+    # Check if running in distributed mode (torchrun sets these env vars)
+    is_distributed_env = all(k in os.environ for k in ['RANK', 'WORLD_SIZE', 'LOCAL_RANK'])
 
-    local_rank = int(os.environ.get('LOCAL_RANK', 0))
-    if torch.cuda.is_available():
-        torch.cuda.set_device(local_rank)
+    if is_distributed_env:
+        # Running with torchrun - initialize distributed
+        dist.init_process_group(backend='nccl')
+        local_rank = int(os.environ.get('LOCAL_RANK', 0))
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+        print(f"[main] Initialized distributed training: rank {dist.get_rank()}/{dist.get_world_size()}")
+    else:
+        # Running standalone (python train.py) - single GPU
+        print("[main] Running in non-distributed mode (single GPU)")
+        if torch.cuda.is_available():
+            torch.cuda.set_device(0)
 
     default_config_path = '/sdf/home/y/youngsam/sw/dune/siren-t/config/siren_4848-bivis.yaml'
     parser = argparse.ArgumentParser()

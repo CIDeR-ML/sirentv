@@ -58,11 +58,22 @@ class SirenTV(nn.Module):
 
         # Extensions for visibility model
         self._init_output_scale(self.config_model)
-        self._do_hardsigmoid = self.config_model.get("hardsigmoid", False)
         self.tick_size = self.config_model.get("tick_size", 0.1) # ns
 
         self.n_pmts: int = self.config_data.get("n_pmt", 81)
 
+        anneal_cfg = self.config_model.get("anneal", {})
+        self.anneal_enabled = anneal_cfg.get("enabled", False)
+        self.current_tau = 1.0
+        if self.anneal_enabled:
+            self.tau_start = anneal_cfg.get("tau_start", 1.0)
+            self.tau_end = anneal_cfg.get("tau_end", 0.01)
+            self.current_tau = self.tau_start
+
+    def anneal_temperature(self, epoch, max_epochs):
+        """Call this at end of each epoch if annealing is enabled"""
+        if self.anneal_enabled:
+            self.current_tau = self.tau_start * (self.tau_end / self.tau_start) ** (epoch / max_epochs)
 
     def to(self, device):
         self._meta.to(device)
@@ -112,7 +123,7 @@ class SirenTV(nn.Module):
             norm_pmt_tile = self.norm_pmt_coords.to(self.device).unsqueeze(0).expand_as(norm_pos)
             input_to_net = torch.cat([norm_pos, norm_pmt_tile], dim=-1)
 
-        out = self.model(input_to_net)#.to(device)
+        out = self.model(input_to_net, self.current_tau)#.to(device)
 
         v = torch.zeros(
             pos.shape[0], out['v'].shape[-1], dtype=torch.float32, device=self.device
