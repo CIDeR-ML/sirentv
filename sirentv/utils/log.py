@@ -150,9 +150,14 @@ class WandbLogger(Logger):
         if None not in (label, pred) and len(self._analysis_dict)>0:
             local_metrics = {}
             for key, f in self._analysis_dict.items():
-                metric_value = f(label, pred)
-                local_metrics[f"analysis/{key}"] = metric_value
-                #self.record(["analysis/"+key], [f(label, pred)])
+                try:
+                    metric_value = f(label, pred)
+                    if isinstance(metric_value, torch.Tensor):
+                        metric_value = metric_value.detach()
+                    local_metrics[f"analysis/{key}"] = metric_value
+                except Exception as e:
+                    if self.rank == 0:
+                        print(f"[WandbLogger] Warning: Failed to compute {key}: {e}")
 
             self.log_per_rank_metrics(iteration, local_metrics)
 
@@ -445,17 +450,26 @@ class WandbLogger(Logger):
         metrics_dict : dict
             Dict of {metric_name: tensor_value} for this rank
         """
+
+        if iteration % self._log_every_nsteps != 0:
+            return
+
         if not self.is_distributed:
             if self.wandb is not None:
                 self.wandb.log(metrics_dict, step=iteration)
             return
         log_dict = {}
         for metric_name, metric_value in metrics_dict.items():
-            if not isinstance(metric_value, torch.Tensor):
-                metric_value = torch.tensor(metric_value).cuda()
+            if isinstance(metric_value, torch.Tensor):
+                metric_tensor = metric_value.detach().clone()
+            else:
+                metric_tensor = torch.tensor(float(metric_value))
 
-            gathered = [torch.zeros_like(metric_value) for _ in range(self.world_size)]
-            dist.all_gather(gathered, metric_value)
+            if torch.cuda.is_available():
+                metric_tensor = metric_tensor.cuda()
+
+            gathered = [torch.zeros_like(metric_tensor) for _ in range(self.world_size)]
+            dist.all_gather(gathered, metric_tensor)
 
             if self.rank == 0:
                 for rank_id, val in enumerate(gathered):
@@ -510,13 +524,18 @@ class CSVLogger(Logger):
         self._analysis_dict = {}
 
         if self.rank == 0:
-            for key, kwargs in log_cfg.get("analysis", dict()).items():
+            analysis_cfg = log_cfg.get("analysis", [])
+            if isinstance(analysis_cfg, dict):
+                analysis_cfg = [{"func": k, **v} for k, v in analysis_cfg.items()]
+            for item in analysis_cfg:
+                item = dict(item)
+                key = item.pop("func")
                 print("[CSVLogger] adding analysis function:", key)
-                suffix = kwargs.pop("suffix", "")
+                suffix = item.pop("suffix", "")
                 if suffix:
                     suffix = f"_{suffix}"
                 self._analysis_dict[key + suffix] = partial(
-                    getattr(importlib.import_module("sirentv.analysis"), key), **kwargs
+                    getattr(importlib.import_module("sirentv.analysis"), key), **item
                 )
 
     @property
