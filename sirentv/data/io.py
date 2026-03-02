@@ -214,13 +214,15 @@ class PLibDataset(Dataset):
         except Exception:
             vis = (self._plib.vis[vox_ids] * self._plib.eff)
 
+        modified_mask = self._plib.vis_mask[vox_ids]
         vis = vis.view(self._n_pmt, -1)
         target = self.xform_vis(vis)
 
         result = {
             'position': pos_raw.squeeze(0),
             'target_linear': vis,
-            'target': target
+            'target': target,
+            'vis_mask': not modified_mask
         }
 
         if self.use_gradient:
