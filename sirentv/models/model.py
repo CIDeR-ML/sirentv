@@ -97,12 +97,14 @@ class SirenTV(nn.Module):
     def update_meta(self, ranges: torch.Tensor):
         self._meta.update(ranges)
 
-    def forward(self, x):
+    def forward(self, x, return_gradients=False):
         """
         Parameters
         ----------
         x : torch.Tensor
             Input in unnormalized coordinates.
+        return_gradients: bool
+            Whether to compute the visibility gradient in the forward
         return_pdf : bool
             If True, return the PDF of the waveform. If False, return the CDF.
 
@@ -113,7 +115,6 @@ class SirenTV(nn.Module):
             The keys are "t" and "v".
         """
         #device = x.device
-        x = x.to(self.device)
         pos = x.unsqueeze(0) if x.dim() == 1 else x
         mask = self.meta.contain(pos).to(self.device)
         norm_pos = self.meta.norm_coord(pos[mask]).to(self.device)
@@ -123,26 +124,32 @@ class SirenTV(nn.Module):
             norm_pmt_tile = self.norm_pmt_coords.to(self.device).unsqueeze(0).expand_as(norm_pos)
             input_to_net = torch.cat([norm_pos, norm_pmt_tile], dim=-1)
 
-        out = self.model(input_to_net, self.current_tau)#.to(device)
+        out = self.model(input_to_net, self.current_tau, return_gradients)#.to(device)
 
         v = torch.zeros(
             pos.shape[0], out['v'].shape[-1], dtype=torch.float32, device=self.device
         )
-        v[mask] = out['v'].to(self.device)
+        v[mask] = out['v'].to(device=self.device, dtype=torch.float32)
 
         t = torch.zeros(
             pos.shape[0], *out['t'].shape[1:], dtype=torch.float32, device=self.device
         )
-        t[mask] = out['t'].to(self.device)
+        t[mask] = out['t'].to(device=self.device, dtype=torch.float32)
 
+        result = {"t": t, "v": v, "correct_mask": mask}
         if 't0' in out:
             t0 = torch.zeros(
                 pos.shape[0], *out['t0'].shape[1:], dtype=torch.float32, device=self.device
             )
-            t0[mask] = out['t0'].to(self.device)
-            return {"t": t, "v": v, "t0": t0, "correct_mask": mask}
+            t0[mask] = out['t0'].to(device=self.device, dtype=torch.float32)
+            result["t0"] = t0
 
-        return {"t": t, "v": v, "correct_mask": mask}
+        if return_gradients:
+            grads = torch.ones(pos.shape[0], *out['grad_mags_transformed'].shape[1:], dtype=torch.float32, device=self.device)
+            grads[mask] = out['grad_mags_transformed'].to(device=self.device, dtype=torch.float32)
+            result["grad_mags_transformed"] = grads
+
+        return result
 
     def visibility(self, x, return_type: Literal["pdf", "cdf"] = "pdf"):
         out = self.forward(x)
