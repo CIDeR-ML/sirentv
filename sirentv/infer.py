@@ -40,14 +40,23 @@ def infer_single_pos_single_pmt(net: nn.Module, input_x: tensor, target: dict, t
     net.freeze_all()
     use_CDF = net._use_cdf
 
+    # get a valid position based on true mask
+    if 'v_mask' in target.keys():
+        true_mask = target['v_mask'].squeeze()
+        valid_indices = torch.where(true_mask)[0]
+        if len(valid_indices) > 0:
+            batch_id = valid_indices[0].item()  # ← Take FIRST valid index as scalar
+
     pred: dict[str, torch.Tensor] = net(input_x)
     pred_v_linear = net._inv_xform_vis(pred["v"][batch_id, :])
     target_v_linear = target["v_linear"][batch_id, :].to(pred_v_linear.device)
+
     t0s = None
     if "t0" in target.keys():
         pred_t0 = pred['t0'][batch_id, pmt_id] * tick_size
         target_t0 = target['t0'][batch_id, pmt_id].to(pred_t0.device)
         t0s = torch.stack([target_t0, pred_t0], dim=-1)
+
     if use_CDF:
         pred_t_cdf = pred["t"][batch_id, pmt_id, :]
         target_t_cdf = target['t_linear'][batch_id, pmt_id, :].to(pred_t_cdf.device)
@@ -69,7 +78,7 @@ def infer_single_pos_single_pmt(net: nn.Module, input_x: tensor, target: dict, t
         "pdf": torch.stack([target_t_pdf, pred_t_pdf], dim=-1),
         "cdf": torch.stack([target_t_cdf, pred_t_cdf], dim=-1),
         "t0": t0s,
-        "position": input_x
+        "position": input_x[batch_id] if input_x.dim() > 1 else input_x
     }
 
     net.unfreeze_all()
