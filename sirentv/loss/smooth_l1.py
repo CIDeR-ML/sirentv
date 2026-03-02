@@ -4,11 +4,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from sirentv.loss.builder import LOSSES
-from sirentv.utils.misc import predict_gradient_magnitudes
 
 @LOSSES.register_module()
 class WeightedSmoothL1Loss(nn.Module):
-    def __init__(self, key: str, weight=1.0, reduce_method="mean", **kwargs):
+    def __init__(self, key: str, mask_key: str = None, weight=1.0, reduce_method="mean", **kwargs):
         super().__init__()
         assert reduce_method in ["mean", "sum", "none"], (
             f"Invalid reduction method: {reduce_method}"
@@ -17,6 +16,7 @@ class WeightedSmoothL1Loss(nn.Module):
             getattr(torch, reduce_method) if reduce_method != "none" else lambda x: x
         )
         self.key = key
+        self.mask_key = mask_key
         self.weight = weight
         self.kwargs = kwargs
 
@@ -30,16 +30,27 @@ class WeightedSmoothL1Loss(nn.Module):
             weight = {self.key: torch.ones_like(pred[self.key])}
 
         device = pred[self.key].device
-        weight[self.key] = weight[self.key].to(device)
-        target[self.key] = target[self.key].to(device)
-        loss = weight[self.key] * F.smooth_l1_loss(pred[self.key], target[self.key], **self.kwargs)
+        weight_masked = weight[self.key].to(device)
+        target_masked = target[self.key].to(device)
+        pred_masked = pred[self.key]
+        if self.mask_key is not None:
+            #exclude 0 visibility regions from loss
+            mask = target[self.mask_key]
+            while len(mask.shape) < len(target_masked.shape):
+                mask = mask.unsqueeze(-1)
+            true_mask = mask.expand_as(target_masked)
+            pred_masked = pred_masked[true_mask]
+            target_masked = target_masked[true_mask]
+            weight_masked = weight_masked[true_mask]
+
+        loss = weight_masked * F.smooth_l1_loss(pred_masked, target_masked, **self.kwargs)
         return self.weight * self.reduce(loss)
 
 
 @LOSSES.register_module()
 class SmoothL1Loss(WeightedSmoothL1Loss):
-    def __init__(self, key: str, weight=1.0, reduce_method="mean", **kwargs):
-        super().__init__(key, weight, reduce_method)
+    def __init__(self, key: str, mask_key: str=None, weight=1.0, reduce_method="mean", **kwargs):
+        super().__init__(key, mask_key, weight, reduce_method)
     def forward(
         self,
         pred: dict[str, torch.Tensor],
@@ -49,44 +60,26 @@ class SmoothL1Loss(WeightedSmoothL1Loss):
         return super().forward(pred, target, weight=None, **self.kwargs)
 
 @LOSSES.register_module()
-class VisibilityGradient_SmoothL1Loss(nn.Module):
+class VisibilityGradient_SmoothL1Loss(WeightedSmoothL1Loss):
     """Gradient magnitude loss using any base loss function"""
 
-    def __init__(self, key: str = 'v', weight=1.0, reduce_method="mean", threshold=1.0E-9, **kwargs):
-        super().__init__()
-        self.key = key
-        self.weight = weight
-        self.reduce_method = reduce_method
+    def __init__(self, key: str = 'grad_mags_transformed', mask_key: str = None, weight=1.0, reduce_method="mean", threshold=1.0E-9, **kwargs):
+        super().__init__(key, mask_key, weight, reduce_method)
         self.threshold = threshold
+        self.key = key
 
-        # Running statistics for normalization
-        self.register_buffer('grad_mean', torch.tensor(1.0))
-        self.register_buffer('update_count', torch.tensor(0))
-        self.momentum = 0.99  # EMA momentum
+    def forward(self, pred, target, weight=None):
 
-    def forward(self, pred, target, weight=None, positions=None):
-
-        if positions is None:
-            raise ValueError("positions required")
-
-        pred_vis = pred[self.key]
-        target_grad_mag = torch.clamp(target['grad_mags_transformed'], min=self.threshold)
-
-        # Compute predicted gradient magnitudes
-        pred_grad_mag = predict_gradient_magnitudes(pred_vis, positions)
-        pred_grad_mag = torch.clamp(pred_grad_mag, min=self.threshold)
+        target_grad_mag = torch.clamp(target[self.key], min=self.threshold)
+        pred_grad_mag = torch.clamp(pred[self.key], min=self.threshold)
 
         if len(pred_grad_mag) == 0:
-            return torch.tensor(0.0, device=pred_vis.device, requires_grad=True)
+            return torch.tensor(0.0, device=pred['v'].device, requires_grad=True)
 
         # Relative loss: (pred - target) / target
-        # This makes it scale-invariant
-        relative_diff = (pred_grad_mag - target_grad_mag) / (target_grad_mag + 1e-10)
+        relative_diff = 2*(pred_grad_mag - target_grad_mag) / (pred_grad_mag + target_grad_mag + 1e-10)
 
-        loss = F.smooth_l1_loss(
-            relative_diff,
-            torch.zeros_like(relative_diff),  # Target is 0 (perfect match)
-            reduction=self.reduce_method
-        )
+        pred[self.key] = relative_diff
+        target[self.key] = torch.zeros_like(relative_diff)
 
-        return self.weight * loss
+        return super().forward(pred, target, weight=None, **self.kwargs)
