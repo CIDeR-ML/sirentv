@@ -67,8 +67,9 @@ def build_logger(cfg, net, rank=0, world_size=1, is_distributed=False) -> Logger
         logger = CSVLogger(cfg, rank=rank, world_size=world_size, is_distributed=is_distributed)
     else:
         logger = WandbLogger(cfg, rank=rank, world_size=world_size, is_distributed=is_distributed)
-    if hasattr(logger, "watch_grad"):
-        logger.watch_grad(net)
+    if hasattr(logger, "watch_grad") and rank == 0:
+        model_to_watch = net.module if hasattr(net, 'module') else net
+        logger.watch_grad(model_to_watch)
     return logger
 
 
@@ -78,9 +79,22 @@ def compute_loss(
         losses: list[nn.Module],
         weights: dict[str, torch.Tensor],
     ) -> dict[str, torch.Tensor]:
+    """
+    Compute losses with support for both autograd and analytical gradients.
+
+    Args:
+        pred: Dictionary of predictions
+        target: Dictionary of targets
+        losses: List of loss modules
+        weights: Dictionary of weights for each loss
+    Returns:
+        Dictionary of computed losses
+    """
     losses_out = {}
     for loss in losses:
+
         curr_loss = loss(pred, target, weights)
+
         cls_name = loss.__class__.__name__.lower()
         losses_out[f"{cls_name}_{loss.key}"] = curr_loss
     return losses_out
@@ -136,6 +150,7 @@ def train(cfg: dict):
     # Create necessary pieces: the model, optimizer, loss, logger.
     # Load the states if this is resuming.
     net = SirenTV(cfg).to(DEVICE)
+    net = torch.compile(net)
     if is_distributed:
         net = create_ddp_model(
             net,
@@ -145,30 +160,6 @@ def train(cfg: dict):
 
     #dl = PLibDataLoader(cfg, device=DEVICE, rank=rank, world_size=world_size)
     dl = create_dataloader(cfg, rank=rank, world_size=world_size)
-    '''
-    if dist.is_initialized():
-        if hasattr(dl, 'sampler') and dl.sampler is not None:
-            # Get the indices the sampler will use
-            sampler_indices = list(iter(dl.sampler))[:10]
-        else:
-            # No sampler - getting sequential indices
-            sampler_indices = list(range(10))
-
-        all_indices = [None] * world_size
-        dist.all_gather_object(all_indices, sampler_indices)
-
-        if rank == 0:
-            print("First 10 SAMPLER indices per rank:")
-            for r, idx in enumerate(all_indices):
-                print(f"  Rank {r}: {idx}")
-
-            # Check for overlaps
-            all_flat = [i for sublist in all_indices for i in sublist]
-            if len(all_flat) != len(set(all_flat)):
-                print("WARNING: Duplicate indices across ranks!")
-            else:
-                print("No duplicates - distributed sampling working correctly!")
-    '''
 
     opt, sch, epoch = optimizer_factory(list(p for p in net.parameters() if p.requires_grad), cfg)
     if epoch > 0:
@@ -185,6 +176,7 @@ def train(cfg: dict):
     loss_fns = build_losses(cfg)
     regularizer = build_regularizer(cfg)
     logger = build_logger(cfg, net, rank=rank, world_size=world_size, is_distributed=is_distributed)
+    anneal_enabled = cfg.get("model", {}).get("anneal", {}).get("enabled", False)
 
     # Store configuration (only on rank 0)
     if rank == 0:
@@ -226,6 +218,7 @@ def train(cfg: dict):
         # through batches
         if torch.cuda.is_available():
             torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
         data_loading_start = time.time()
         for batch_idx, data in enumerate(tqdm(dl, desc="Epoch %-3d; Loss %-3s" % (epoch_ctr, ",".join(["%.2e" % l for l in losses])), disable=(rank != 0))):
             iteration_ctr += 1
@@ -236,6 +229,7 @@ def train(cfg: dict):
                 target_t_pdf_linear = data["target_linear"].contiguous().to(DEVICE, non_blocking=True)
                 target_v_linear = target_t_pdf_linear.sum(-1)
                 target_v = dl.xform_vis(target_v_linear)
+                fixed_v_mask = data["vis_mask"].contiguous().to(DEVICE, non_blocking=True) if "vis_mask" in data else None
 
                 if mode == "cdf":
                     target_t_cdf = pdf_to_cdf(target_t_pdf_linear) # <-- in linear domain!
@@ -246,7 +240,12 @@ def train(cfg: dict):
                     "t_linear": target_t_pdf_linear if mode == "pdf" else target_t_cdf,
                     "v": target_v,
                     "v_linear": target_v_linear,
+                    "v_mask": fixed_v_mask,
                 }
+
+                if 'grad_mags_transformed' in data:
+                    #x = x.requires_grad_(True)
+                    target["grad_mags_transformed"] = data['grad_mags_transformed'].contiguous().to(DEVICE, non_blocking=True)  # (B, n_pmt)
 
                 # generate weights for just v! (and for t if mode==pdf; enable via config)
                 weights = {
@@ -261,17 +260,25 @@ def train(cfg: dict):
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
                 data_loading_time = time.time() - data_loading_start
+                if torch.cuda.is_available():
+                    peak_mem_data = torch.cuda.max_memory_allocated() / (1024**3)
+                    torch.cuda.reset_peak_memory_stats()
 
                 # Running the model, compute the loss, back-prop gradients to optimize.
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
                 forward_start = time.time()
-                pred: dict[str, torch.Tensor] = net.module(x) if is_distributed else net(x)
+                pred: dict[str, torch.Tensor] = net.module(x, return_gradients=('grad_mags_transformed' in data)) if is_distributed else net(x, return_gradients=('grad_mags_transformed' in data))
                 # OUTPUTS:
                 # v: visibilities, (B, N_pmt)
                 # t: CDF/PDF, (B, N_pmt, N_time)
                 # t0 (possibly, in the units of ticks)
-                mem_after_forward = torch.cuda.memory_allocated()/(1024**3) if torch.cuda.is_available() else 0 # in GB
+                # grad_mag_v (Optional): gradient of visibility w.r.t positions
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                    peak_mem_forward = torch.cuda.max_memory_allocated() / (1024**3)
+                    torch.cuda.reset_peak_memory_stats()
+                forward_time = time.time() - forward_start
 
                 if hasattr(net.module if is_distributed else net, 'load_pos'):
                     load_pos = (net.module if is_distributed else net).load_pos
@@ -306,6 +313,10 @@ def train(cfg: dict):
                     loss += regularizer(net)
 
                 opt.zero_grad()
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                backward_start = time.time()
+                # Clear gradient computation cache
                 if amp:
                     scaler.scale(loss).backward()
                     scaler.unscale_(opt)
@@ -314,16 +325,35 @@ def train(cfg: dict):
                 else:
                     loss.backward()
                     opt.step()
-                torch.cuda.synchronize()
-                model_time_iter = time.time() - forward_start
+
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                    peak_mem_backward = torch.cuda.max_memory_allocated() / (1024**3)
+                    torch.cuda.reset_peak_memory_stats()
+                else:
+                    peak_mem_data = peak_mem_forward = peak_mem_backward = 0.0
+                backward_time = time.time() - backward_start
+
+                if rank == 0 and iteration_ctr % 10 == 0:
+                    print(
+                        f"[iter {iteration_ctr:>6d}] "
+                        f"data: {data_loading_time:.3f}s {peak_mem_data:.2f}GB | "
+                        f"forward: {forward_time:.3f}s {peak_mem_forward:.2f}GB | "
+                        f"backward: {backward_time:.3f}s {peak_mem_backward:.2f}GB"
+                    )
+
+                if 'grad_mag_linear' in data or 'grad_mag_transformed' in data:
+                    torch.cuda.empty_cache()
+
+                model_time_iter = forward_time + backward_time
 
             if rank == 0:
                 # get current learning rate
                 current_lr = opt.param_groups[0]['lr']
                 # Log training parameters
                 logger.record(
-                    ["iter", "epoch", "lr", "data_loading_time", "model_iter_time", "model_forward_mem_usage"] + [f'loss_{k}' for k in keys] + ["loss"],
-                    [iteration_ctr, epoch_ctr, current_lr, data_loading_time, model_time_iter, mem_after_forward] + losses.detach().cpu().tolist() + [loss.item()],
+                    ["iter", "epoch", "lr", "data_loading_time", "model_iter_time", "model_forward_mem_usage", "model_backward_mem_usage"] + [f'loss_{k}' for k in keys] + ["loss"],
+                    [iteration_ctr, epoch_ctr, current_lr, data_loading_time, model_time_iter, peak_mem_forward, peak_mem_backward] + losses.detach().cpu().tolist() + [loss.item()],
                 )
 
             if isinstance(logger, WandbLogger):
@@ -333,7 +363,7 @@ def train(cfg: dict):
                 #if iteration_ctr % 10 == 0 and isinstance(logger, WandbLogger):
                 per_rank_metrics = {
                     "gpu_memory_gb": float(torch.cuda.memory_allocated(local_rank)/(1024**3)) if torch.cuda.is_available() else 0,
-                    "loss": loss.detach(),
+                    "loss": loss.detach().item(),
                     "data_loading_time": data_loading_time,
                     "model_forward_time": model_time_iter,
                 }
@@ -373,7 +403,12 @@ def train(cfg: dict):
         if sch is not None:
             sch.step(loss)
 
+
         epoch_ctr += 1
+
+        if anneal_enabled and rank == 0:
+            net_module = net.module if is_distributed else net
+            net_module.anneal_temperature(epoch_ctr, epoch_max)
 
         if rank == 0 and (save_every_epochs * epoch_ctr) > 0 and epoch_ctr % save_every_epochs == 0:
             filename = os.path.join(
@@ -415,19 +450,34 @@ def main():
     #print(f"  CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', 'NOT SET')}")
     #print(f"  Available CUDA devices: {torch.cuda.device_count()}")
 
-    dist.init_process_group(backend='nccl')
+    # Check if running in distributed mode (torchrun sets these env vars)
+    is_distributed_env = all(k in os.environ for k in ['RANK', 'WORLD_SIZE', 'LOCAL_RANK'])
 
-    local_rank = int(os.environ.get('LOCAL_RANK', 0))
-    if torch.cuda.is_available():
-        torch.cuda.set_device(local_rank)
+    if is_distributed_env:
+        # Running with torchrun - initialize distributed
+        dist.init_process_group(backend='nccl')
+        local_rank = int(os.environ.get('LOCAL_RANK', 0))
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+        print(f"[main] Initialized distributed training: rank {dist.get_rank()}/{dist.get_world_size()}")
+    else:
+        # Running standalone (python train.py) - single GPU
+        print("[main] Running in non-distributed mode (single GPU)")
+        if torch.cuda.is_available():
+            torch.cuda.set_device(0)
 
     default_config_path = '/sdf/home/y/youngsam/sw/dune/siren-t/config/siren_4848-bivis.yaml'
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, default=default_config_path)
+    parser.add_argument('--wandb', action='store_true', default=False,
+                        help='Enable Weights & Biases logging (default: off, prints to stdout)')
     args = parser.parse_args()
     
     cfg = yaml.safe_load(open(args.config))
-    
+
+    if not args.wandb:
+        cfg.setdefault('logger', {})['type'] = 'csv'
+
     train(cfg)
     dist.destroy_process_group()
 
