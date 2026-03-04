@@ -222,7 +222,7 @@ class PLibDataset(Dataset):
             'position': pos_raw.squeeze(0),
             'target_linear': vis,
             'target': target,
-            'vis_mask': not modified_mask
+            'vis_mask': ~modified_mask
         }
 
         if self.use_gradient:
