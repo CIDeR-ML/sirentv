@@ -226,7 +226,7 @@ def train(cfg: dict):
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
                 forward_start = time.time()
-                pred: dict[str, torch.Tensor] = net.module(x) if is_distributed else net(x)
+                pred: dict[str, torch.Tensor] = net(x)
                 # OUTPUTS:
                 # v: visibilities, (B, N_pmt)
                 # t: CDF/PDF, (B, N_pmt, N_time)
