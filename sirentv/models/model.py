@@ -10,6 +10,7 @@ from slar.transform import partial_xform_vis
 
 from sirentv.models.builder import build_model
 from sirentv.utils.transform import cdf_to_pdf, pdf_to_cdf
+from sirentv.data.compressed import CompressedPLib
 
 
 class SirenTV(nn.Module):
@@ -45,13 +46,25 @@ class SirenTV(nn.Module):
         # Create meta
         if meta is not None:
             self._meta = meta
+        elif "compressed_plib" in cfg:
+            cplib_cfg = cfg["compressed_plib"]
+            cplib = CompressedPLib.load(
+                cplib_cfg["filepath"],
+                lazy=False,
+                n_components=cplib_cfg.get("n_components"),
+            )
+            self._meta = cplib.meta
+            if self._load_pos:
+                pmt_pos = torch.tensor(cplib.pmt_pos, dtype=torch.float32)
+                self.pmt_coords = pmt_pos
+                self.norm_pmt_coords = cplib.meta.norm_coord(pmt_pos)
+            del cplib
         elif "photonlib" in cfg:
             self._meta = AABox.load(cfg["photonlib"]["filepath"])
-
-        if self._load_pos:
-            with h5py.File(cfg["photonlib"]["filepath"], 'r') as file:
-                self.pmt_coords = torch.tensor(file['pmt_pos'][:], dtype=torch.float32)
-                self.norm_pmt_coords = torch.tensor(file['pmt_norm_pos'][:], dtype=torch.float32)
+            if self._load_pos:
+                with h5py.File(cfg["photonlib"]["filepath"], 'r') as file:
+                    self.pmt_coords = torch.tensor(file['pmt_pos'][:], dtype=torch.float32)
+                    self.norm_pmt_coords = torch.tensor(file['pmt_norm_pos'][:], dtype=torch.float32)
 
         # Transform functions
         self._xform_vis, self._inv_xform_vis = partial_xform_vis(self.config_xform)
@@ -118,6 +131,8 @@ class SirenTV(nn.Module):
         pos = x.unsqueeze(0) if x.dim() == 1 else x
         mask = self.meta.contain(pos).to(self.device)
         norm_pos = self.meta.norm_coord(pos[mask]).to(self.device)
+        if norm_pos.dim() == 1:
+            norm_pos = norm_pos.unsqueeze(0)
         norm_pos = norm_pos.unsqueeze(1).expand(-1, self.n_pmts, -1)
         input_to_net = norm_pos
         if self._load_pos:

@@ -268,7 +268,7 @@ def train(cfg: dict):
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
                 forward_start = time.time()
-                pred: dict[str, torch.Tensor] = net.module(x, return_gradients=('grad_mags_transformed' in data)) if is_distributed else net(x, return_gradients=('grad_mags_transformed' in data))
+                pred: dict[str, torch.Tensor] = net(x, return_gradients=('grad_mags_transformed' in data))
                 # OUTPUTS:
                 # v: visibilities, (B, N_pmt)
                 # t: CDF/PDF, (B, N_pmt, N_time)
@@ -478,7 +478,15 @@ def main():
     if not args.wandb:
         cfg.setdefault('logger', {})['type'] = 'csv'
 
-    train(cfg)
+    # TODO: completely refactor training loop.
+    # the the dataset type & training loop are
+    # too intertwined to be able to add new things like
+    # PCA training.
+    if "compressed_plib" in cfg:
+        from sirentv.train_pca import train_pca
+        train_pca(cfg)
+    else:
+        train(cfg)
     dist.destroy_process_group()
 
 

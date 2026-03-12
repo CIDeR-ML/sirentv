@@ -17,7 +17,6 @@ from tqdm import tqdm
 from sirentv.analysis import get_pred_target, log_imshow, log_line, log_pred_target
 
 from sirentv.models import SirenTV
-from sirentv.loss.builder import build_loss as build_loss_fn, build_regularizer as build_regularizer_fn
 from sirentv.utils.comm import create_ddp_model
 from sirentv.utils.log import CSVLogger, WandbLogger, Logger
 from sirentv.utils.transform import pdf_to_cdf, cdf_to_pdf
@@ -37,7 +36,8 @@ def infer_single_pos_single_pmt(net: nn.Module, input_x: tensor, target: dict, t
     -------
 
     """
-    net.freeze_all()
+    was_training = net.training
+    net.eval()
     use_CDF = net._use_cdf
 
     # get a valid position based on true mask
@@ -47,7 +47,8 @@ def infer_single_pos_single_pmt(net: nn.Module, input_x: tensor, target: dict, t
         if len(valid_indices) > 0:
             batch_id = valid_indices[0].item()  # ← Take FIRST valid index as scalar
 
-    pred: dict[str, torch.Tensor] = net(input_x)
+    with torch.no_grad():
+        pred: dict[str, torch.Tensor] = net(input_x)
     pred_v_linear = net._inv_xform_vis(pred["v"][batch_id, :])
     target_v_linear = target["v_linear"][batch_id, :].to(pred_v_linear.device)
 
@@ -81,5 +82,6 @@ def infer_single_pos_single_pmt(net: nn.Module, input_x: tensor, target: dict, t
         "position": input_x[batch_id] if input_x.dim() > 1 else input_x
     }
 
-    net.unfreeze_all()
+    if was_training:
+        net.train()
     return output
