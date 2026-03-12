@@ -136,9 +136,13 @@ def bias(
 
     target = target.to(pred.device)
 
-    mask = target > threshold
-    p = pred[mask]
-    t = target[mask]
+    if threshold is not None:
+        mask = target > threshold
+        p = pred[mask]
+        t = target[mask]
+    else:
+        p = pred
+        t = target
 
     if not signed:
         bias = (2 * torch.abs(p - t) / (p + t)).mean()
@@ -173,14 +177,19 @@ def abs_bias(
     target = target[key]
     pred = pred[key]
 
-    target = target.to(pred.device)
-
-    mask = target > threshold
-    p = pred[mask]
-    t = target[mask]
-
     if target.shape != pred.shape:
         raise ValueError(
             f"target and pred must have the same shape {(*target.shape,)} != {(*pred.shape,)}"
         )
+
+    target = target.to(pred.device)
+
+    if threshold is not None:
+        mask = target > threshold
+        p = pred[mask]
+        t = target[mask]
+    else:
+        p = pred
+        t = target
+
     return torch.abs(t - p).mean() if not signed else (t - p).mean()
