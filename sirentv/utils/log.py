@@ -226,11 +226,25 @@ class WandbLogger(Logger):
             ax = axes_vis[row, col]
 
             visibility = data['visibility'].numpy()
-            ax.scatter(visibility[:, 0], visibility[:, 1], label="Target vs Pred", alpha=0.6)
-            max_val = max(visibility[:, 0].max(), visibility[:, 1].max()) * 1.1
-            ax.set_xlim(0, max_val)
-            ax.set_ylim(0, max_val)
-            ax.plot([0, max_val], [0, max_val], 'r--', alpha=0.8, label="y=x")
+            v_target = visibility[:, 0]
+            v_pred = visibility[:, 1]
+            pos_mask = (v_target > 0) & (v_pred > 0)
+            ax.scatter(v_target[pos_mask], v_pred[pos_mask], s=10, alpha=0.6, zorder=3)
+
+            vmin = min(v_target[pos_mask].min(), v_pred[pos_mask].min()) * 0.5
+            vmax = max(v_target[pos_mask].max(), v_pred[pos_mask].max()) * 2.0
+            t_line = np.array([vmin, vmax])
+            ax.plot(t_line, t_line, 'k-', alpha=0.8, lw=1, label="y=x")
+            for bias_pct, color, ls in [(5, "green", "--"), (10, "orange", ":")]:
+                b = bias_pct / 100.0
+                upper = t_line * (2 + b) / (2 - b)
+                lower = t_line * (2 - b) / (2 + b)
+                ax.fill_between(t_line, lower, upper, alpha=0.10, color=color,
+                                label=f"\u00b1{bias_pct}% bias")
+            ax.set_xscale("log")
+            ax.set_yscale("log")
+            ax.set_xlim(vmin, vmax)
+            ax.set_ylim(vmin, vmax)
             ax.set_xlabel("Target Visibility")
             ax.set_ylabel("Predicted Visibility")
 
@@ -262,10 +276,21 @@ class WandbLogger(Logger):
             x = data['x_value'].numpy()
             pdf = data['pdf'].numpy()
 
-            ax.plot(x, pdf[:, 0], label="Target", color="navy", linewidth=2)
-            ax.plot(x, pdf[:, 1], label="Predicted", color="darkorange", linewidth=2)
+            # skip t=0 bin for log scale and floor tiny values
+            mask = x > 0
+            x_pos = x[mask]
+            pdf_pos = pdf[mask]
+            floor = 1e-30
+            pdf_target = np.clip(pdf_pos[:, 0], floor, None)
+            pdf_pred = np.clip(pdf_pos[:, 1], floor, None)
+
+            ax.plot(x_pos, pdf_target, label="Target", color="navy", linewidth=2)
+            ax.plot(x_pos, pdf_pred, label="Predicted", color="darkorange", linewidth=2)
+            ax.set_xscale("log")
+            ax.set_yscale("log")
+            ax.set_ylim(bottom=1e-5)
             ax.set_xlabel("Time (ns)")
-            ax.set_ylabel("Value")
+            ax.set_ylabel("PDF")
 
             subtitle = f"Rank {rank_id}"
             if data['position'] is not None:
@@ -275,7 +300,7 @@ class WandbLogger(Logger):
                 subtitle += f"\nPos: ({pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f})"
             ax.set_title(subtitle)
             ax.legend()
-            ax.grid(True, alpha=0.3)
+            ax.grid(True, alpha=0.3, which="both")
 
         for rank_id in range(n_ranks, n_rows * n_cols):
             row = rank_id // n_cols
