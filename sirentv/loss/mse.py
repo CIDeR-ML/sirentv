@@ -24,7 +24,8 @@ class WeightedL2Loss(nn.Module):
         if weight is None:
             weight = {self.key: torch.ones_like(pred[self.key])}
         device = pred[self.key].device
-        weight_masked = weight[self.key].to(device)
+        w = weight.get(self.key, 1.0) if isinstance(weight, dict) else weight
+        weight_masked = w.to(device) if isinstance(w, torch.Tensor) else w
         target_masked = target[self.key].to(device)
         pred_masked = pred[self.key]
         if self.mask_key is not None:
@@ -32,7 +33,8 @@ class WeightedL2Loss(nn.Module):
             while len(mask.shape) < len(target_masked.shape):
                 mask = mask.unsqueeze(-1)
             true_mask = mask.expand_as(target_masked)
-            weight_masked = weight_masked[true_mask]
+            if isinstance(weight_masked, torch.Tensor):
+                weight_masked = weight_masked[true_mask]
             target_masked = target_masked[true_mask]
             pred_masked = pred_masked[true_mask]
 
