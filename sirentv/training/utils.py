@@ -1,3 +1,10 @@
+import torch
+import torch.nn as nn
+
+from sirentv.loss.builder import build_loss as _build_loss_fn
+from sirentv.loss.builder import build_regularizer as _build_regularizer_fn
+
+
 def unwrap_net(net):
     """Unwrap DDP and torch.compile wrappers to get the underlying model."""
     if hasattr(net, 'module'):
@@ -9,7 +16,6 @@ def unwrap_net(net):
 
 def backward_step(loss, opt, amp, scaler, grad_clip_max_norm, net):
     """AMP-aware backward pass, gradient clipping, and optimizer step."""
-    import torch
     if amp:
         scaler.scale(loss).backward()
         scaler.unscale_(opt)
@@ -25,7 +31,6 @@ def backward_step(loss, opt, amp, scaler, grad_clip_max_norm, net):
 
 
 def get_weight_by_vis(vis, factor=None, threshold=1e-8):
-    import torch
     if factor is None:
         factor = 1 / torch.max(vis.clamp(min=1e-8))
     w = vis * factor
@@ -34,35 +39,29 @@ def get_weight_by_vis(vis, factor=None, threshold=1e-8):
 
 
 def build_losses(cfg):
-    from sirentv.loss.builder import build_loss as build_loss_fn
     loss_cfg = cfg.get("train", dict()).get("loss", [])
     losses = []
     for c in loss_cfg:
-        losses.append(build_loss_fn(c))
+        losses.append(_build_loss_fn(c))
     return losses
 
 
-def build_regularizer(cfg):
-    from sirentv.loss.builder import build_regularizer as build_regularizer_fn
-    import torch.nn as nn
+def build_regularizer(cfg) -> nn.Module | None:
     regularizer_cfg = cfg.get("train", dict()).get("regularization", None)
     if regularizer_cfg is None:
         return None
-    return build_regularizer_fn(regularizer_cfg)
+    return _build_regularizer_fn(regularizer_cfg)
 
 
 def build_logger(cfg, net, rank=0):
-    from sirentv.utils.log import CSVLogger, WandbLogger, Logger
+    from sirentv.utils.log import CSVLogger, WandbLogger
     logger_type = cfg.get("logger", dict()).get("type", "csv")
     if logger_type == "csv":
-        logger = CSVLogger(cfg, rank=rank)
-    else:
-        logger = WandbLogger(cfg, rank=rank)
-    return logger
+        return CSVLogger(cfg, rank=rank)
+    return WandbLogger(cfg, rank=rank)
 
 
 def compute_loss(pred, target, losses, weights):
-    import torch
     losses_out = {}
     for loss in losses:
         curr_loss = loss(pred, target, weights)

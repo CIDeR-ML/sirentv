@@ -1,19 +1,12 @@
 from __future__ import annotations
 
-import numpy as np
 import torch
-import torch.nn as nn
 
 from sirentv.utils.registry import Registry
 from sirentv.utils.transform import pdf_to_cdf, cdf_to_pdf
 from sirentv.training.utils import unwrap_net
 
 INFER_FNS = Registry("infer_fns")
-
-
-def _register_all_infer_fns():
-    """Ensure all infer classes are registered (they're defined in this file)."""
-    pass  # Classes below are decorated at import time
 
 
 def build_infer_fn(cfg, net, dl, device):
@@ -220,11 +213,11 @@ class PCAInfer:
             target_c = self._cplib.denormalize_coeffs(target_c)
 
         pred_t0_ns = torch.exp(pred_log_t0[batch_id:batch_id + 1, :])
-        target_t0_ns = target["t0"]
-        # t0 in target is log(t0_raw), so exponentiate
-        if target_t0_ns.min() < 0:  # log-space
-            target_t0_ns = torch.exp(target_t0_ns)
-        target_t0_ns = target_t0_ns[batch_id:batch_id + 1, :].to(pred_coeffs.device)
+        # Use raw t0 from meta if available, otherwise exponentiate log-space target
+        if self._plot_meta is not None and "t0_raw" in self._plot_meta:
+            target_t0_ns = self._plot_meta["t0_raw"][batch_id:batch_id + 1, :].to(pred_coeffs.device)
+        else:
+            target_t0_ns = torch.exp(target["t0"][batch_id:batch_id + 1, :]).to(pred_coeffs.device)
 
         pred_cdf = self._cplib.reconstruct_cdf(pred_c, pred_t0_ns)
         target_cdf = self._cplib.reconstruct_cdf(target_c, target_t0_ns)

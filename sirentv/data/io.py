@@ -175,27 +175,6 @@ class PLibDataset(Dataset):
     def __len__(self):
         return len(self.indices)
 
-    def get_weight_by_vis(self, vis):
-        """
-        Weight by inverse visibility, `weight  = 1/vis * factor`.
-        Weights below `threshold` are set to 1.
-
-        Arguments
-        ---------
-        vis: torch.Tensor
-            Visibility values.
-
-        Returns
-        -------
-        w: torch.Tensor
-            Weight values with `w.shape == vis.shape`.
-        """
-        factor = self._weight_cfg.get("factor", 1.0)
-        threshold = self._weight_cfg.get("threshold", 1e-8)
-        w = vis * factor
-        w[w < threshold] = 1.0
-        return w
-
     def __getitem__(self, idx):
         """
         Get a single voxel's data in standardized format.
@@ -220,7 +199,6 @@ class PLibDataset(Dataset):
         else:
             modified_mask = torch.zeros(1, dtype=torch.bool)
         vis = vis.view(self._n_pmt, -1)  # (n_pmt, n_time)
-        vis_transformed = self.xform_vis(vis)
 
         # Compute visibility by summing over time
         v_linear = vis.sum(-1)  # (n_pmt,)
@@ -231,7 +209,7 @@ class PLibDataset(Dataset):
             t = pdf_to_cdf(vis)  # CDF in linear domain
             t_linear = t
         else:
-            t = vis_transformed  # PDF in transformed domain
+            t = self.xform_vis(vis)  # PDF in transformed domain
             t_linear = vis  # PDF in linear domain
 
         target = {"t": t, "v": v}
@@ -499,27 +477,6 @@ class PLibDataLoader:
     @property
     def device(self):
         return self._plib.device
-
-    def get_weight_by_vis(self, vis):
-        """
-        Weight by inverse visibility, `weight  = 1/vis * factor`.
-        Weights below `threshold` are set to 1.
-
-        Arguments
-        ---------
-        vis: torch.Tensor
-            Visibility values.
-
-        Returns
-        -------
-        w: torch.Tensor
-            Weight values with `w.shape == vis.shape`.
-        """
-        factor = self._weight_cfg.get("factor", 1.0)
-        threshold = self._weight_cfg.get("threshold", 1e-8)
-        w = vis * factor
-        w[w < threshold] = 1.0
-        return w
 
     def __len__(self):
         """

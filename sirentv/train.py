@@ -103,6 +103,17 @@ def train(cfg: dict):
     grad_norm_per_layer = grad_norm_cfg.get("log_per_layer", False)
     grad_norm_frequency = grad_norm_cfg.get("log_frequency", 1)
 
+    # Unwrap model once (stable for lifetime of training)
+    net_module = unwrap_net(net)
+
+    # Physics constants for t0 computation (if applicable)
+    tick_size = cfg.get("photonlib", {}).get("time_tick_size", 0.1)
+    lAr_r_index = cfg.get("physics", {}).get("R_index", 1.233)
+    speed_of_light = 299.792458 / lAr_r_index
+    _has_load_pos = hasattr(net_module, "load_pos") and net_module.load_pos
+    if _has_load_pos:
+        _pmt_pos = net_module.pmt_coords.to(DEVICE)
+
     if rank == 0:
         print(f"[train] max iterations {iteration_max}, max epochs {epoch_max}")
         print(f"[train] distributed: {is_distributed}, world_size: {world_size}")
@@ -153,14 +164,9 @@ def train(cfg: dict):
                 forward_time = time.time() - forward_start
 
                 # --- t0 from PMT positions (only if dataset didn't provide t0) ---
-                net_module = unwrap_net(net)
-                if hasattr(net_module, "load_pos") and net_module.load_pos and "t0" in pred and "t0" not in target:
-                    tick_size = cfg.get("photonlib", {}).get("time_tick_size", 0.1)
-                    lAr_r_index = cfg.get("physics", {}).get("R_index", 1.233)
-                    speed_of_light = 299.792458 / lAr_r_index
-                    pmt_pos = net_module.pmt_coords.to(x.device)
+                if _has_load_pos and "t0" in pred and "t0" not in target:
                     pred["t0"] = pred["t0"] * tick_size
-                    distances = torch.cdist(x, pmt_pos)
+                    distances = torch.cdist(x, _pmt_pos)
                     target["t0"] = distances / speed_of_light
 
                 # --- Loss computation ---
@@ -207,7 +213,7 @@ def train(cfg: dict):
                     f"mem: {peak_mem:.2f}GB"
                 )
 
-            if "grad_mags_transformed" in data or "grad_mag_transformed" in data:
+            if "grad_mags_transformed" in target:
                 torch.cuda.empty_cache()
 
             # --- Logging ---
@@ -228,7 +234,7 @@ def train(cfg: dict):
                     logger.record(["gpu_memory_gb"], [gpu_mem])
 
                     if log_grad_norm and iteration_ctr % grad_norm_frequency == 0:
-                        logger.log_grad_norms(iteration_ctr, unwrap_net(net), grad_norm_type, grad_norm_per_layer)
+                        logger.log_grad_norms(iteration_ctr, net_module, grad_norm_type, grad_norm_per_layer)
 
                 if rank == 0 and iteration_ctr % 10 == 0:
                     with torch.no_grad():
@@ -249,8 +255,7 @@ def train(cfg: dict):
                     logger.logdir,
                     "iteration-%06d-epoch-%04d.ckpt" % (iteration_ctr, epoch_ctr),
                 )
-                model_to_save = net.module if is_distributed else net
-                model_to_save.save_state(filename, opt, sch, iteration_ctr, scaler if amp else None)
+                net_module.save_state(filename, opt, sch, iteration_ctr, scaler if amp else None)
 
             if iteration_max <= iteration_ctr:
                 stop_training = True
@@ -270,7 +275,6 @@ def train(cfg: dict):
         epoch_ctr += 1
 
         # Temperature annealing (model-attribute-driven)
-        net_module = unwrap_net(net)
         if hasattr(net_module, "anneal_enabled") and net_module.anneal_enabled:
             net_module.anneal_temperature(epoch_ctr, epoch_max)
 
@@ -279,8 +283,7 @@ def train(cfg: dict):
                 logger.logdir,
                 "iteration-%06d-epoch-%04d.ckpt" % (iteration_ctr, epoch_ctr),
             )
-            model_to_save = net.module if is_distributed else net
-            model_to_save.save_state(
+            net_module.save_state(
                 filename, opt, sch, iteration_ctr / len(dl), scaler if amp else None
             )
 
@@ -320,7 +323,8 @@ def main():
     )
     args = parser.parse_args()
 
-    cfg = yaml.safe_load(open(args.config))
+    with open(args.config) as f:
+        cfg = yaml.safe_load(f)
 
     if not args.wandb:
         cfg.setdefault("logger", {})["type"] = "csv"
