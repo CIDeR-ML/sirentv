@@ -61,15 +61,12 @@ def build_regularizer(cfg) -> nn.Module | None:
         return None
     return build_regularizer_fn(regularizer_cfg)
 
-def build_logger(cfg, net, rank=0, world_size=1, is_distributed=False) -> Logger:
+def build_logger(cfg, net, rank=0) -> Logger:
     logger_type = cfg.get("logger", dict()).get("type", "csv")
     if logger_type == "csv":
-        logger = CSVLogger(cfg, rank=rank, world_size=world_size, is_distributed=is_distributed)
+        logger = CSVLogger(cfg, rank=rank)
     else:
-        logger = WandbLogger(cfg, rank=rank, world_size=world_size, is_distributed=is_distributed)
-    if hasattr(logger, "watch_grad") and rank == 0:
-        model_to_watch = net.module if hasattr(net, 'module') else net
-        logger.watch_grad(model_to_watch)
+        logger = WandbLogger(cfg, rank=rank)
     return logger
 
 
@@ -175,7 +172,7 @@ def train(cfg: dict):
 
     loss_fns = build_losses(cfg)
     regularizer = build_regularizer(cfg)
-    logger = build_logger(cfg, net, rank=rank, world_size=world_size, is_distributed=is_distributed)
+    logger = build_logger(cfg, net, rank=rank)
     anneal_enabled = cfg.get("model", {}).get("anneal", {}).get("enabled", False)
 
     # Store configuration (only on rank 0)
@@ -201,6 +198,13 @@ def train(cfg: dict):
         print(f"[train] distributed training: {is_distributed}, world_size: {world_size}")
 
     weight_cfg = cfg.get("data", {}).get("weight", {})
+
+    # Gradient norm logging config
+    grad_norm_cfg = cfg.get("logger", {}).get("grad_norm", {})
+    log_grad_norm = grad_norm_cfg.get("enabled", False)
+    grad_norm_type = grad_norm_cfg.get("norm_type", 2.0)
+    grad_norm_per_layer = grad_norm_cfg.get("log_per_layer", False)
+    grad_norm_frequency = grad_norm_cfg.get("log_frequency", 1)
 
     # Start the training loop
     stop_training = False
@@ -368,14 +372,16 @@ def train(cfg: dict):
                 )
 
             if isinstance(logger, WandbLogger):
-                # Per-rank metrics logged from all ranks
-                per_rank_metrics = {
-                    "gpu_memory_gb": float(torch.cuda.memory_allocated(local_rank)/(1024**3)) if torch.cuda.is_available() else 0,
-                    "loss": loss.detach().item(),
-                    "data_loading_time": data_loading_time,
-                    "model_forward_time": model_time_iter,
-                }
-                logger.log_per_rank_metrics(iteration_ctr, per_rank_metrics)
+                if rank == 0:
+                    gpu_mem = float(torch.cuda.memory_allocated(local_rank)/(1024**3)) if torch.cuda.is_available() else 0
+                    logger.record(
+                        ["gpu_memory_gb"],
+                        [gpu_mem],
+                    )
+
+                    if log_grad_norm and iteration_ctr % grad_norm_frequency == 0:
+                        model_to_log = net.module if is_distributed else net
+                        logger.log_grad_norms(iteration_ctr, model_to_log, grad_norm_type, grad_norm_per_layer)
 
                 if rank == 0 and iteration_ctr % 10 == 0:
                     with torch.no_grad():

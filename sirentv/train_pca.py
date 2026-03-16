@@ -154,7 +154,7 @@ def train_pca(cfg: dict):
     # Losses, logger
     loss_fns = build_losses(cfg)
     regularizer = build_regularizer(cfg)
-    logger = build_logger(cfg, net, rank=rank, world_size=world_size, is_distributed=is_distributed)
+    logger = build_logger(cfg, net, rank=rank)
 
     if rank == 0:
         with open(os.path.join(logger.logdir, "train_cfg.yaml"), "w") as f:
@@ -174,6 +174,13 @@ def train_pca(cfg: dict):
         scaler = torch.amp.GradScaler("cuda")
 
     weight_cfg = cfg.get("data", {}).get("weight", {})
+
+    # Gradient norm logging config
+    grad_norm_cfg = cfg.get("logger", {}).get("grad_norm", {})
+    log_grad_norm = grad_norm_cfg.get("enabled", False)
+    grad_norm_type = grad_norm_cfg.get("norm_type", 2.0)
+    grad_norm_per_layer = grad_norm_cfg.get("log_per_layer", False)
+    grad_norm_frequency = grad_norm_cfg.get("log_frequency", 1)
 
     if rank == 0:
         print(f"[train_pca] max iterations {iteration_max}, max epochs {epoch_max}")
@@ -303,14 +310,16 @@ def train_pca(cfg: dict):
                 )
 
             if isinstance(logger, WandbLogger):
-                # Per-rank metrics logged from all ranks
-                per_rank_metrics = {
-                    "gpu_memory_gb": float(torch.cuda.memory_allocated(local_rank) / (1024**3))
-                    if torch.cuda.is_available()
-                    else 0,
-                    "loss": loss.detach().item(),
-                }
-                logger.log_per_rank_metrics(iteration_ctr, per_rank_metrics)
+                if rank == 0:
+                    gpu_mem = float(torch.cuda.memory_allocated(local_rank) / (1024**3)) if torch.cuda.is_available() else 0
+                    logger.record(
+                        ["gpu_memory_gb"],
+                        [gpu_mem],
+                    )
+
+                    if log_grad_norm and iteration_ctr % grad_norm_frequency == 0:
+                        model_to_log = net.module if is_distributed else net
+                        logger.log_grad_norms(iteration_ctr, model_to_log, grad_norm_type, grad_norm_per_layer)
 
                 if rank == 0 and iteration_ctr % 10 == 0:
                     # CDF/PDF reconstruction for fixed voxel
