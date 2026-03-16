@@ -105,9 +105,9 @@ def train_pca(cfg: dict):
 
     # Model
     net = SirenTV(cfg).to(DEVICE)
-    net = torch.compile(net)
     if is_distributed:
         net = create_ddp_model(net, device_ids=[local_rank])
+    net = torch.compile(net)
 
     # Data
     dl = create_compressed_dataloader(cfg, rank=rank, world_size=world_size)
@@ -169,6 +169,7 @@ def train_pca(cfg: dict):
     reduction = train_cfg.get("reduction", "mean")
 
     amp = train_cfg.get("amp", False)
+    grad_clip_max_norm = train_cfg.get("clip_grad", None)
     if amp:
         scaler = torch.amp.GradScaler("cuda")
 
@@ -182,6 +183,8 @@ def train_pca(cfg: dict):
     losses = [float("inf")] * len(loss_fns)
 
     while iteration_ctr < iteration_max and epoch_ctr < epoch_max:
+        epoch_loss_sum = 0.0
+        epoch_batch_count = 0
         if is_distributed and hasattr(dl, "sampler") and hasattr(dl.sampler, "set_epoch"):
             dl.sampler.set_epoch(epoch_ctr)
 
@@ -194,29 +197,25 @@ def train_pca(cfg: dict):
         for batch_idx, data in enumerate(pbar):
             iteration_ctr += 1
 
+            x = data["position"].to(DEVICE, non_blocking=True)
+            target = {
+                "v": data["target"]["v"].to(DEVICE, non_blocking=True),
+                "t0": data["target"]["t0"].to(DEVICE, non_blocking=True),
+                "coeffs": data["target"]["coeffs"].to(DEVICE, non_blocking=True),
+            }
+
+            data_loading_time = time.time() - data_loading_start
+
+            # Forward pass and loss under autocast
+            opt.zero_grad()
+            forward_start = time.time()
+
             with (torch.autocast(device_type=DEVICE.type, dtype=torch.bfloat16) if amp else nullcontext()):
-                x = data["position"].to(DEVICE, non_blocking=True)
-                target = {
-                    "v": data["target"]["v"].to(DEVICE, non_blocking=True),
-                    "t0": data["target"]["t0"].to(DEVICE, non_blocking=True),
-                    "coeffs": data["target"]["coeffs"].to(DEVICE, non_blocking=True),
-                }
-
-                # if torch.cuda.is_available():
-                #     torch.cuda.synchronize()
-                data_loading_time = time.time() - data_loading_start
-
-                # Forward pass
-                # if torch.cuda.is_available():
-                #     torch.cuda.synchronize()
-                forward_start = time.time()
                 pred = net(x)
 
                 # Remap model output: model's "t" key -> "coeffs"
                 pred["coeffs"] = pred.pop("t")
 
-                # if torch.cuda.is_available():
-                #     torch.cuda.synchronize()
                 forward_time = time.time() - forward_start
 
                 # Weights
@@ -256,27 +255,30 @@ def train_pca(cfg: dict):
                 if regularizer is not None:
                     loss += regularizer(net)
 
-                opt.zero_grad()
-                # if torch.cuda.is_available():
-                #     torch.cuda.synchronize()
-                backward_start = time.time()
+            epoch_loss_sum += loss.detach().item()
+            epoch_batch_count += 1
 
-                if amp:
-                    scaler.scale(loss).backward()
-                    scaler.unscale_(opt)
-                    scaler.step(opt)
-                    scaler.update()
-                else:
-                    loss.backward()
-                    opt.step()
+            # Backward pass outside autocast
+            backward_start = time.time()
+            if amp:
+                scaler.scale(loss).backward()
+                scaler.unscale_(opt)
+                if grad_clip_max_norm is not None:
+                    torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=grad_clip_max_norm)
+                scaler.step(opt)
+                scaler.update()
+            else:
+                loss.backward()
+                if grad_clip_max_norm is not None:
+                    torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=grad_clip_max_norm)
+                opt.step()
 
-                if torch.cuda.is_available():
-                    # torch.cuda.synchronize()
-                    peak_mem_forward = torch.cuda.max_memory_allocated() / (1024**3)
-                    torch.cuda.reset_peak_memory_stats()
-                else:
-                    peak_mem_forward = 0.0
-                backward_time = time.time() - backward_start
+            if torch.cuda.is_available():
+                peak_mem_forward = torch.cuda.max_memory_allocated() / (1024**3)
+                torch.cuda.reset_peak_memory_stats()
+            else:
+                peak_mem_forward = 0.0
+            backward_time = time.time() - backward_start
 
             losses = losses_vals.detach().cpu().tolist()
             pbar.set_postfix_str(", ".join(f"{k}={v:.2e}" for k, v in zip(keys, losses)))
@@ -301,6 +303,7 @@ def train_pca(cfg: dict):
                 )
 
             if isinstance(logger, WandbLogger):
+                # Per-rank metrics logged from all ranks
                 per_rank_metrics = {
                     "gpu_memory_gb": float(torch.cuda.memory_allocated(local_rank) / (1024**3))
                     if torch.cuda.is_available()
@@ -309,17 +312,18 @@ def train_pca(cfg: dict):
                 }
                 logger.log_per_rank_metrics(iteration_ctr, per_rank_metrics)
 
-                # CDF/PDF reconstruction for fixed voxel
-                inferred = _infer_pca_plot(net, plot_x, plot_target, cplib, denorm=normalize_coeffs)
-                logger.plot(iteration_ctr, inferred)
+                if rank == 0 and iteration_ctr % 10 == 0:
+                    # CDF/PDF reconstruction for fixed voxel
+                    inferred = _infer_pca_plot(net, plot_x, plot_target, cplib, denorm=normalize_coeffs)
+                    logger.plot(iteration_ctr, inferred)
 
-                with torch.no_grad():
-                    net_module = net.module if is_distributed else net
-                    if hasattr(net_module, '_orig_mod'):
-                        net_module = net_module._orig_mod
-                    pred['v_linear'] = net_module._inv_xform_vis(pred['v'])
-                    target['v_linear'] = net_module._inv_xform_vis(target['v'])
-                    logger.step(iteration_ctr, target, pred)
+                    with torch.no_grad():
+                        net_module = net.module if is_distributed else net
+                        if hasattr(net_module, '_orig_mod'):
+                            net_module = net_module._orig_mod
+                        pred['v_linear'] = net_module._inv_xform_vis(pred['v'])
+                        target['v_linear'] = net_module._inv_xform_vis(target['v'])
+                        logger.step(iteration_ctr, target, pred)
 
                 logger.commit(iteration_ctr)
 
@@ -344,7 +348,8 @@ def train_pca(cfg: dict):
             break
 
         if sch is not None:
-            sch.step(loss)
+            epoch_avg_loss = epoch_loss_sum / max(epoch_batch_count, 1)
+            sch.step(epoch_avg_loss)
 
         epoch_ctr += 1
 

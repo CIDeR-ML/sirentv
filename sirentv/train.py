@@ -150,12 +150,12 @@ def train(cfg: dict):
     # Create necessary pieces: the model, optimizer, loss, logger.
     # Load the states if this is resuming.
     net = SirenTV(cfg).to(DEVICE)
-    net = torch.compile(net)
     if is_distributed:
         net = create_ddp_model(
             net,
             device_ids=[local_rank],
         )
+    net = torch.compile(net)
     mode: Literal["pdf", "cdf"] = (net.module if is_distributed else net).mode
 
     #dl = PLibDataLoader(cfg, device=DEVICE, rank=rank, world_size=world_size)
@@ -193,6 +193,7 @@ def train(cfg: dict):
 
     # amp flag
     amp = train_cfg.get("amp", False)
+    grad_clip_max_norm = train_cfg.get("clip_grad", None)
     if amp:
         scaler = torch.amp.GradScaler('cuda')
     if rank == 0:
@@ -212,6 +213,8 @@ def train(cfg: dict):
 
     # through epochs
     while iteration_ctr < iteration_max and epoch_ctr < epoch_max:
+        epoch_loss_sum = 0.0
+        epoch_batch_count = 0
         if is_distributed and hasattr(dl, 'sampler') and hasattr(dl.sampler, 'set_epoch'):
             dl.sampler.set_epoch(epoch_ctr)
 
@@ -223,51 +226,53 @@ def train(cfg: dict):
         for batch_idx, data in enumerate(tqdm(dl, desc="Epoch %-3d; Loss %-3s" % (epoch_ctr, ",".join(["%.2e" % l for l in losses])), disable=(rank != 0))):
             iteration_ctr += 1
 
+            x = data["position"].contiguous().to(DEVICE, non_blocking=True)
+            target_t_pdf = data["target"].contiguous().to(DEVICE, non_blocking=True)
+            target_t_pdf_linear = data["target_linear"].contiguous().to(DEVICE, non_blocking=True)
+            target_v_linear = target_t_pdf_linear.sum(-1)
+            target_v = dl.xform_vis(target_v_linear)
+            fixed_v_mask = data["vis_mask"].contiguous().to(DEVICE, non_blocking=True) if "vis_mask" in data else None
+
+            if mode == "cdf":
+                target_t_cdf = pdf_to_cdf(target_t_pdf_linear) # <-- in linear domain!
+
+            target = {
+                "t": target_t_cdf if mode == "cdf" else target_t_pdf,
+                # output for cdf is in linear domain already!
+                "t_linear": target_t_pdf_linear if mode == "pdf" else target_t_cdf,
+                "v": target_v,
+                "v_linear": target_v_linear,
+                "v_mask": fixed_v_mask,
+            }
+
+            if 'grad_mags_transformed' in data:
+                target["grad_mags_transformed"] = data['grad_mags_transformed'].contiguous().to(DEVICE, non_blocking=True)  # (B, n_pmt)
+
+            # generate weights for just v! (and for t if mode==pdf; enable via config)
+            weights = {
+                k: get_weight_by_vis(
+                    target[k],
+                    factor=weight_cfg[k].get("factor", None),
+                    threshold=weight_cfg[k].get("threshold", 1e-8),
+                )
+                if (k in weight_cfg and weight_cfg[k]['enable']) else 1.0
+                for k in target.keys()
+            }
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            data_loading_time = time.time() - data_loading_start
+            if torch.cuda.is_available():
+                peak_mem_data = torch.cuda.max_memory_allocated() / (1024**3)
+                torch.cuda.reset_peak_memory_stats()
+
+            # Running the model, compute the loss, back-prop gradients to optimize.
+            opt.zero_grad()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            forward_start = time.time()
+
+            # Forward pass and loss computation under autocast
             with (torch.autocast(device_type=DEVICE.type, dtype=torch.bfloat16) if amp else nullcontext()):
-                x = data["position"].contiguous().to(DEVICE, non_blocking=True)
-                target_t_pdf = data["target"].contiguous().to(DEVICE, non_blocking=True)
-                target_t_pdf_linear = data["target_linear"].contiguous().to(DEVICE, non_blocking=True)
-                target_v_linear = target_t_pdf_linear.sum(-1)
-                target_v = dl.xform_vis(target_v_linear)
-                fixed_v_mask = data["vis_mask"].contiguous().to(DEVICE, non_blocking=True) if "vis_mask" in data else None
-
-                if mode == "cdf":
-                    target_t_cdf = pdf_to_cdf(target_t_pdf_linear) # <-- in linear domain!
-
-                target = {
-                    "t": target_t_cdf if mode == "cdf" else target_t_pdf,
-                    # output for cdf is in linear domain already!
-                    "t_linear": target_t_pdf_linear if mode == "pdf" else target_t_cdf,
-                    "v": target_v,
-                    "v_linear": target_v_linear,
-                    "v_mask": fixed_v_mask,
-                }
-
-                if 'grad_mags_transformed' in data:
-                    #x = x.requires_grad_(True)
-                    target["grad_mags_transformed"] = data['grad_mags_transformed'].contiguous().to(DEVICE, non_blocking=True)  # (B, n_pmt)
-
-                # generate weights for just v! (and for t if mode==pdf; enable via config)
-                weights = {
-                    k: get_weight_by_vis(
-                        target[k],
-                        factor=weight_cfg[k].get("factor", None),
-                        threshold=weight_cfg[k].get("threshold", 1e-8),
-                    )
-                    if (k in weight_cfg and weight_cfg[k]['enable']) else 1.0
-                    for k in target.keys()
-                }
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                data_loading_time = time.time() - data_loading_start
-                if torch.cuda.is_available():
-                    peak_mem_data = torch.cuda.max_memory_allocated() / (1024**3)
-                    torch.cuda.reset_peak_memory_stats()
-
-                # Running the model, compute the loss, back-prop gradients to optimize.
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                forward_start = time.time()
                 pred: dict[str, torch.Tensor] = net(x, return_gradients=('grad_mags_transformed' in data))
                 # OUTPUTS:
                 # v: visibilities, (B, N_pmt)
@@ -288,7 +293,7 @@ def train(cfg: dict):
                         pred['t0'] *= tick_size
                         distances = torch.cdist(x, pmt_pos)
                         tof = distances / speed_of_light # in ns
-                        target["t0"] = tof.cpu()
+                        target["t0"] = tof
 
                 losses = compute_loss(
                     pred,
@@ -312,40 +317,46 @@ def train(cfg: dict):
                 if regularizer is not None:
                     loss += regularizer(net)
 
-                opt.zero_grad()
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                backward_start = time.time()
-                # Clear gradient computation cache
-                if amp:
-                    scaler.scale(loss).backward()
-                    scaler.unscale_(opt)
-                    scaler.step(opt)
-                    scaler.update()
-                else:
-                    loss.backward()
-                    opt.step()
+            epoch_loss_sum += loss.detach().item()
+            epoch_batch_count += 1
 
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                    peak_mem_backward = torch.cuda.max_memory_allocated() / (1024**3)
-                    torch.cuda.reset_peak_memory_stats()
-                else:
-                    peak_mem_data = peak_mem_forward = peak_mem_backward = 0.0
-                backward_time = time.time() - backward_start
+            # Backward pass outside autocast
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            backward_start = time.time()
+            if amp:
+                scaler.scale(loss).backward()
+                scaler.unscale_(opt)
+                if grad_clip_max_norm is not None:
+                    torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=grad_clip_max_norm)
+                scaler.step(opt)
+                scaler.update()
+            else:
+                loss.backward()
+                if grad_clip_max_norm is not None:
+                    torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=grad_clip_max_norm)
+                opt.step()
 
-                if rank == 0 and iteration_ctr % 10 == 0:
-                    print(
-                        f"[iter {iteration_ctr:>6d}] "
-                        f"data: {data_loading_time:.3f}s {peak_mem_data:.2f}GB | "
-                        f"forward: {forward_time:.3f}s {peak_mem_forward:.2f}GB | "
-                        f"backward: {backward_time:.3f}s {peak_mem_backward:.2f}GB"
-                    )
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                peak_mem_backward = torch.cuda.max_memory_allocated() / (1024**3)
+                torch.cuda.reset_peak_memory_stats()
+            else:
+                peak_mem_data = peak_mem_forward = peak_mem_backward = 0.0
+            backward_time = time.time() - backward_start
 
-                if 'grad_mag_linear' in data or 'grad_mag_transformed' in data:
-                    torch.cuda.empty_cache()
+            if rank == 0 and iteration_ctr % 10 == 0:
+                print(
+                    f"[iter {iteration_ctr:>6d}] "
+                    f"data: {data_loading_time:.3f}s {peak_mem_data:.2f}GB | "
+                    f"forward: {forward_time:.3f}s {peak_mem_forward:.2f}GB | "
+                    f"backward: {backward_time:.3f}s {peak_mem_backward:.2f}GB"
+                )
 
-                model_time_iter = forward_time + backward_time
+            if 'grad_mag_linear' in data or 'grad_mag_transformed' in data:
+                torch.cuda.empty_cache()
+
+            model_time_iter = forward_time + backward_time
 
             if rank == 0:
                 # get current learning rate
@@ -357,10 +368,7 @@ def train(cfg: dict):
                 )
 
             if isinstance(logger, WandbLogger):
-                #logger.log_aggregated_loss(iteration_ctr, loss)
-                # Step the logger
-
-                #if iteration_ctr % 10 == 0 and isinstance(logger, WandbLogger):
+                # Per-rank metrics logged from all ranks
                 per_rank_metrics = {
                     "gpu_memory_gb": float(torch.cuda.memory_allocated(local_rank)/(1024**3)) if torch.cuda.is_available() else 0,
                     "loss": loss.detach().item(),
@@ -369,14 +377,15 @@ def train(cfg: dict):
                 }
                 logger.log_per_rank_metrics(iteration_ctr, per_rank_metrics)
 
-                #if rank == 0 and iteration_ctr % 10 == 0:
-                inferred_output = infer_single_pos_single_pmt(net.module if is_distributed else net, x, target, tick_size)
-                logger.plot(iteration_ctr, inferred_output)
+                if rank == 0 and iteration_ctr % 10 == 0:
+                    with torch.no_grad():
+                        inferred_output = infer_single_pos_single_pmt(net.module if is_distributed else net, x, target, tick_size)
+                    logger.plot(iteration_ctr, inferred_output)
 
-                with torch.no_grad():
-                    pred['v_linear'] = dl.inv_xform_vis(pred['v'])
-                    pred['t_linear'] = pred['t']
-                    logger.step(iteration_ctr, target, pred)
+                    with torch.no_grad():
+                        pred['v_linear'] = dl.inv_xform_vis(pred['v'])
+                        pred['t_linear'] = pred['t']
+                        logger.step(iteration_ctr, target, pred)
 
                 logger.commit(iteration_ctr)
 
@@ -401,7 +410,8 @@ def train(cfg: dict):
             break
 
         if sch is not None:
-            sch.step(loss)
+            epoch_avg_loss = epoch_loss_sum / max(epoch_batch_count, 1)
+            sch.step(epoch_avg_loss)
 
 
         epoch_ctr += 1
@@ -487,7 +497,8 @@ def main():
         train_pca(cfg)
     else:
         train(cfg)
-    dist.destroy_process_group()
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
