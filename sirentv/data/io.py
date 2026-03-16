@@ -9,7 +9,10 @@ import numpy as np
 import os
 
 from sirentv.utils.misc import compute_gradients_from_positions
+from sirentv.data.builder import DATASETS
+from sirentv.utils.transform import pdf_to_cdf
 
+@DATASETS.register_module()
 class PLibDataset(Dataset):
     """
     Map-style dataset for PhotonLib.
@@ -48,6 +51,8 @@ class PLibDataset(Dataset):
 
         if rank == 0:
             print(f"[PLibDataset] Total voxels: {effective_voxels}")
+
+        self._model_mode = cfg.get("model", {}).get("mode", "pdf").lower()
 
         self.use_gradient = self.data_cfg.get("use_gradient_supervision", False)
 
@@ -193,17 +198,13 @@ class PLibDataset(Dataset):
 
     def __getitem__(self, idx):
         """
-        Get a single voxel's data.
-
-        Args:
-            idx: Local index (0 to len(self)-1)
+        Get a single voxel's data in standardized format.
 
         Returns:
-            dict with position, target_linear, target
+            dict with "position", "target" (loss keys), "meta" (plotting data)
         """
         vox_ids = self.indices[idx].unsqueeze(0)
 
-        # Load data
         meta = self._plib.meta
         pos_raw = meta.voxel_to_coord(vox_ids)
         if pos_raw.dim() == 1:
@@ -214,24 +215,41 @@ class PLibDataset(Dataset):
         except Exception:
             vis = (self._plib.vis[vox_ids] * self._plib.eff)
 
-        modified_mask = self._plib.vis_mask[vox_ids]
-        vis = vis.view(self._n_pmt, -1)
-        target = self.xform_vis(vis)
+        if hasattr(self._plib, 'vis_mask') and self._plib.vis_mask is not None:
+            modified_mask = self._plib.vis_mask[vox_ids]
+        else:
+            modified_mask = torch.zeros(1, dtype=torch.bool)
+        vis = vis.view(self._n_pmt, -1)  # (n_pmt, n_time)
+        vis_transformed = self.xform_vis(vis)
 
-        result = {
-            'position': pos_raw.squeeze(0),
-            'target_linear': vis,
-            'target': target,
-            'vis_mask': ~modified_mask
+        # Compute visibility by summing over time
+        v_linear = vis.sum(-1)  # (n_pmt,)
+        v = self.xform_vis(v_linear)  # transformed
+
+        # Timing target: PDF or CDF depending on model mode
+        if self._model_mode == "cdf":
+            t = pdf_to_cdf(vis)  # CDF in linear domain
+            t_linear = t
+        else:
+            t = vis_transformed  # PDF in transformed domain
+            t_linear = vis  # PDF in linear domain
+
+        target = {"t": t, "v": v}
+        meta_dict = {
+            "t_linear": t_linear,
+            "v_linear": v_linear,
+            "v_mask": ~modified_mask,
         }
 
         if self.use_gradient:
-            # Get the actual voxel index in the full dataset
             actual_idx = self.indices[idx].item()
-            result['grad_mags_linear'] = self.grad_mags_linear[actual_idx]  # (n_pmt,)
-            result['grad_mags_transformed'] = self.grad_mags_transformed[actual_idx]  # (n_pmt,)
+            target["grad_mags_transformed"] = self.grad_mags_transformed[actual_idx]
 
-        return result
+        return {
+            "position": pos_raw.squeeze(0),
+            "target": target,
+            "meta": meta_dict,
+        }
 
 def create_dataloader(cfg, rank=0, world_size=1):
     """Create DataLoader with map-style dataset."""

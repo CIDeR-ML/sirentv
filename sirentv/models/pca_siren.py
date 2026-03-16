@@ -41,4 +41,4 @@ class PcaSiren(nn.Module):
         vis = out[..., 0]              # (B, N_pmt)
         log_t0 = out[..., 1]          # (B, N_pmt)
         coeffs = out[..., 2:]         # (B, N_pmt, n_components)
-        return dict(v=vis, t=coeffs, t0=log_t0)
+        return dict(v=vis, coeffs=coeffs, t0=log_t0)

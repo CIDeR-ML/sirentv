@@ -1,0 +1,91 @@
+def unwrap_net(net):
+    """Unwrap DDP and torch.compile wrappers to get the underlying model."""
+    if hasattr(net, 'module'):
+        net = net.module
+    if hasattr(net, '_orig_mod'):
+        net = net._orig_mod
+    return net
+
+
+def backward_step(loss, opt, amp, scaler, grad_clip_max_norm, net):
+    """AMP-aware backward pass, gradient clipping, and optimizer step."""
+    import torch
+    if amp:
+        scaler.scale(loss).backward()
+        scaler.unscale_(opt)
+        if grad_clip_max_norm is not None:
+            torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=grad_clip_max_norm)
+        scaler.step(opt)
+        scaler.update()
+    else:
+        loss.backward()
+        if grad_clip_max_norm is not None:
+            torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=grad_clip_max_norm)
+        opt.step()
+
+
+def get_weight_by_vis(vis, factor=None, threshold=1e-8):
+    import torch
+    if factor is None:
+        factor = 1 / torch.max(vis.clamp(min=1e-8))
+    w = vis * factor
+    w[w < threshold] = 1.0
+    return w
+
+
+def build_losses(cfg):
+    from sirentv.loss.builder import build_loss as build_loss_fn
+    loss_cfg = cfg.get("train", dict()).get("loss", [])
+    losses = []
+    for c in loss_cfg:
+        losses.append(build_loss_fn(c))
+    return losses
+
+
+def build_regularizer(cfg):
+    from sirentv.loss.builder import build_regularizer as build_regularizer_fn
+    import torch.nn as nn
+    regularizer_cfg = cfg.get("train", dict()).get("regularization", None)
+    if regularizer_cfg is None:
+        return None
+    return build_regularizer_fn(regularizer_cfg)
+
+
+def build_logger(cfg, net, rank=0):
+    from sirentv.utils.log import CSVLogger, WandbLogger, Logger
+    logger_type = cfg.get("logger", dict()).get("type", "csv")
+    if logger_type == "csv":
+        logger = CSVLogger(cfg, rank=rank)
+    else:
+        logger = WandbLogger(cfg, rank=rank)
+    return logger
+
+
+def compute_loss(pred, target, losses, weights):
+    import torch
+    losses_out = {}
+    for loss in losses:
+        curr_loss = loss(pred, target, weights)
+        cls_name = loss.__class__.__name__.lower()
+        losses_out[f"{cls_name}_{loss.key}"] = curr_loss
+    return losses_out
+
+
+def build_weight_fn(cfg):
+    """Build a weight function from config. Returns callable: target_dict -> weights_dict."""
+    weight_cfg = cfg.get("data", {}).get("weight", {})
+
+    def weight_fn(target):
+        weights = {}
+        for k in target.keys():
+            if k in weight_cfg and weight_cfg[k].get("enable", False):
+                weights[k] = get_weight_by_vis(
+                    target[k],
+                    factor=weight_cfg[k].get("factor", None),
+                    threshold=weight_cfg[k].get("threshold", 1e-8),
+                )
+            else:
+                weights[k] = 1.0
+        return weights
+
+    return weight_fn

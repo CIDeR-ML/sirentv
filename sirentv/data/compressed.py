@@ -9,6 +9,8 @@ from torch.utils.data import Dataset, DataLoader, DistributedSampler
 from slar.transform import partial_xform_vis
 from photonlib.meta import VoxelMeta
 
+from sirentv.data.builder import DATASETS
+
 
 class CompressedPLib:
     """
@@ -422,6 +424,7 @@ class CompressedPLib:
             vis = vis.unsqueeze(-1)
         return vis * pdf
 
+@DATASETS.register_module()
 class CompressedPLibDataset(Dataset):
     """Map-style dataset for CompressedPLib. Returns position + target (vis, log_vis, t0, coeffs)."""
 
@@ -511,7 +514,9 @@ class CompressedPLibDataset(Dataset):
                     "v": self._v[idx],
                     "t0": self._t0[idx],
                     "coeffs": self._coeffs[idx],
-                    "vis_raw": self._vis_raw[idx],
+                },
+                "meta": {
+                    "v_linear": self._vis_raw[idx],
                     "t0_raw": self._t0_raw[idx],
                 },
             }
@@ -537,7 +542,9 @@ class CompressedPLibDataset(Dataset):
                 "v": v,
                 "t0": t0,
                 "coeffs": coeffs,
-                "vis_raw": vis_raw,
+            },
+            "meta": {
+                "v_linear": vis_raw,
                 "t0_raw": t0_raw,
             },
         }

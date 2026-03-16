@@ -14,7 +14,7 @@ setup(
     ],
     entry_points={
         "console_scripts": [
-            "sirentv-train=sirentv.train:train",
+            "sirentv-train=sirentv.train:main",
         ],
     },
     author="Sam Young",

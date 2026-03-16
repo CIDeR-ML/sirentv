@@ -139,30 +139,20 @@ class SirenTV(nn.Module):
             norm_pmt_tile = self.norm_pmt_coords.to(self.device).unsqueeze(0).expand_as(norm_pos)
             input_to_net = torch.cat([norm_pos, norm_pmt_tile], dim=-1)
 
-        out = self.model(input_to_net, self.current_tau, return_gradients)#.to(device)
+        out = self.model(input_to_net, self.current_tau, return_gradients)
 
-        v = torch.zeros(
-            pos.shape[0], out['v'].shape[-1], dtype=torch.float32, device=self.device
-        )
-        v[mask] = out['v'].to(device=self.device, dtype=torch.float32)
-
-        t = torch.zeros(
-            pos.shape[0], *out['t'].shape[1:], dtype=torch.float32, device=self.device
-        )
-        t[mask] = out['t'].to(device=self.device, dtype=torch.float32)
-
-        result = {"t": t, "v": v, "correct_mask": mask}
-        if 't0' in out:
-            t0 = torch.zeros(
-                pos.shape[0], *out['t0'].shape[1:], dtype=torch.float32, device=self.device
+        result = {"correct_mask": mask}
+        for key, val in out.items():
+            # grad_mags default to 1.0 (unit gradient) for masked positions
+            default_val = 1.0 if key == "grad_mags_transformed" else 0.0
+            buf = torch.full(
+                (pos.shape[0], *val.shape[1:]),
+                default_val,
+                dtype=torch.float32,
+                device=self.device,
             )
-            t0[mask] = out['t0'].to(device=self.device, dtype=torch.float32)
-            result["t0"] = t0
-
-        if return_gradients:
-            grads = torch.ones(pos.shape[0], *out['grad_mags_transformed'].shape[1:], dtype=torch.float32, device=self.device)
-            grads[mask] = out['grad_mags_transformed'].to(device=self.device, dtype=torch.float32)
-            result["grad_mags_transformed"] = grads
+            buf[mask] = val.to(device=self.device, dtype=torch.float32)
+            result[key] = buf
 
         return result
 

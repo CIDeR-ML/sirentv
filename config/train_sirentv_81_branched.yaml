@@ -43,6 +43,8 @@ data:
       num_workers: 8
       pin_memory: true
       shuffle: true
+    dataset:
+      type: PLibDataset
 logger:
     type: wandb
     dir_name: /sdf/home/j/junjie/sdf-data/SIREN/wandb/logs_xyz_81_vis_weighting
@@ -50,6 +52,8 @@ logger:
     log_every_nsteps: 10
     project: branched-siren-81
     name: siren_81-vis
+    infer_fn:
+      type: WaveformInfer
     analysis:
       - func: bias
         suffix: time

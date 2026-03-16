@@ -56,4 +56,4 @@ class DualPcaSiren(nn.Module):
 
         vis = vt0[..., 0]             # (B, N_pmt)
         log_t0 = vt0[..., 1]         # (B, N_pmt)
-        return dict(v=vis, t=coeffs, t0=log_t0)
+        return dict(v=vis, coeffs=coeffs, t0=log_t0)
