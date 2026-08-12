@@ -16,7 +16,7 @@ model:
   network:
     type: PcaSiren
     in_features: 6
-    hidden_features: 1024
+    hidden_features: 512
     hidden_layers: 6
     n_components: 50
     outermost_linear: true
