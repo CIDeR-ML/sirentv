@@ -1,30 +1,29 @@
 from __future__ import annotations
+
 import os
-from contextlib import nullcontext
 import time
+from contextlib import nullcontext
 
 import torch
 import torch.distributed as dist
 import yaml
-from tqdm import tqdm
-
 from slar.optimizers import optimizer_factory
-
-from sirentv.models import SirenTV
-from sirentv.utils.comm import create_ddp_model
-from sirentv.utils.log import WandbLogger
+from tqdm import tqdm
 
 from sirentv.data.builder import create_dataloader
 from sirentv.infer import build_infer_fn
+from sirentv.models import SirenTV
 from sirentv.training.utils import (
+    backward_step,
+    build_logger,
     build_losses,
     build_regularizer,
-    build_logger,
-    compute_loss,
     build_weight_fn,
-    backward_step,
+    compute_loss,
     unwrap_net,
 )
+from sirentv.utils.comm import create_ddp_model
+from sirentv.utils.log import WandbLogger
 
 
 def train(cfg: dict):

@@ -6,11 +6,12 @@ from sirentv.loss.builder import build_regularizer as _build_regularizer_fn
 
 
 def unwrap_net(net):
-    """Unwrap DDP and torch.compile wrappers to get the underlying model."""
-    if hasattr(net, 'module'):
-        net = net.module
+    """Unwrap torch.compile (outer) and DDP (inner) wrappers to get the underlying model."""
+    from torch.nn.parallel import DistributedDataParallel
     if hasattr(net, '_orig_mod'):
         net = net._orig_mod
+    if isinstance(net, DistributedDataParallel):
+        net = net.module
     return net
 
 
