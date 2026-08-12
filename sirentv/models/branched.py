@@ -22,7 +22,7 @@ class BranchedSiren(nn.Module):
                  hidden_omega_0: float = 30.0,
                  steepness_factor: float = 10.0,
                  use_CDF: bool = True,
-                 use_t0: bool = True,
+                 hard: bool = False,
                  xform_vis: dict ={},
     ):
         super().__init__()
@@ -34,12 +34,6 @@ class BranchedSiren(nn.Module):
             [hidden_layers] if isinstance(hidden_layers, int) else hidden_layers
         )
         assert isinstance(out_features, list) and len(out_features)==2, "WaveformSiren needs exactly list of 2 output features"
-
-        self._use_t0 = use_t0
-        
-        # adjust waveform decoder output size based on whether t0 is used
-        # if use_t0=False, only output CDF (1000), not t0+CDF (1001)
-        waveform_out_features = out_features[1] if use_t0 else out_features[1] - 1
 
         print("=" * 20, "visibility encoder", "=" * 20)
         self.encoder = Siren(
@@ -67,7 +61,7 @@ class BranchedSiren(nn.Module):
             in_features=hidden_features[0],
             hidden_features=hidden_features[2],
             hidden_layers=hidden_layers[2] - 1,
-            out_features=waveform_out_features,
+            out_features=out_features[1],
             outermost_linear=outermost_linear,
             first_omega_0=first_omega_0,
             hidden_omega_0=hidden_omega_0,
@@ -80,6 +74,7 @@ class BranchedSiren(nn.Module):
         self.out_features = out_features
 
         self._steepness_factor = float(steepness_factor)
+        self._hard = bool(hard)
         self._use_CDF = use_CDF
 
     def check_outputs(self):
@@ -92,22 +87,23 @@ class BranchedSiren(nn.Module):
             == self.waveform_decoder.net[0].linear.in_features
         )
 
-    def forward(self, x):
-        x = self.encoder(x)
-        out_v = self.vis_decoder(x)
-        
-        if self._use_t0:
-            out_t0cdf = self.waveform_decoder(x)
-            out_t0, out_cdf = out_t0cdf[:, :, 0], out_t0cdf[:, :, 1:]
-            n_ticks = out_cdf.shape[-1]
-            t0 = torch.sigmoid(out_t0) * n_ticks
-            out_cdf = t0_mask(n_ticks, t0.unsqueeze(-1), out_cdf, self._steepness_factor, self._use_CDF)
+    def forward(self, x, tau, return_analytical_gradients=False):
+        if return_analytical_gradients:
+            x_batched = x.requires_grad_(True)
         else:
-            out_cdf = self.waveform_decoder(x) # (B, N_pmt, N_time)
-            out_cdf = out_cdf.softmax(dim=-1) # (B, N_pmt, N_time)
-            if self._use_CDF:
-                out_cdf = out_cdf.cumsum(dim=-1)
-            t0 = None
+            x_batched = x
+
+        x_encoded = self.encoder(x_batched)
+        out_t0cdf = self.waveform_decoder(x_encoded)
+        out_t0, out_cdf = out_t0cdf[:, :, 1], out_t0cdf[:, :, 1:]
+        out_v = self.vis_decoder(x_encoded)
+
+        n_ticks = out_cdf.shape[-1]
+        #t0 = torch.sigmoid(out_t0)*n_ticks
+        # Don't do sigmoid twice
+        t0 = torch.clamp(out_t0 * n_ticks, min=0, max=n_ticks-1)
+        out_cdf = t0_mask(n_ticks, t0.unsqueeze(-1), out_cdf, use_CDF=self._use_CDF, steepness=self._steepness_factor,\
+                          temperature=tau, hard=self._hard)
 
         output = dict(
             v=out_v.squeeze(-1),
@@ -115,7 +111,59 @@ class BranchedSiren(nn.Module):
             t0=t0,
         )
 
+        if return_analytical_gradients:
+            grad_mag = self.compute_analytical_gradients(x_batched, output['v'])
+            output['grad_mags_transformed'] = grad_mag
+
         return output
+
+    def compute_analytical_gradients(self, x_batched_input, vis_output):
+        """
+        Compute gradient magnitudes for visibility w.r.t. photon positions
+        Args:
+            x_batched_input: (B, n_pmts, 6) - [photon_xyz, pmt_xyz] for each PMT
+            vis_output: (B, n_pmts) - predicted visibility for each PMT
+
+        Returns:
+            grad_mag: (B, n_pmts) - gradient magnitudes
+        """
+        B, n_pmts, _ = x_batched_input.shape
+
+        if vis_output.grad_fn is None:
+            raise RuntimeError("vis_output has no grad_fn - not connected to x_batched_input!")
+
+        if not x_batched_input.requires_grad:
+            raise RuntimeError("x_batched_input must have requires_grad=True")
+
+        # Sample only N batches
+        n_samples = min(2048, B)  # Compute gradients for max 256 samples
+        sample_indices = torch.randperm(B)[:n_samples]
+
+        # Full tensor for output (zeros for non-sampled)
+        grad_mags_full = torch.zeros(B, n_pmts, device=vis_output.device)
+        # Process in TINY batches
+        grad_mags = []
+
+        # Compute gradients using autograd
+        grad_mag_micro = []
+        for pmt_idx in range(n_pmts):
+            grad = torch.autograd.grad(
+                outputs=vis_output[sample_indices, pmt_idx].sum(),
+                inputs=x_batched_input,
+                retain_graph=True,
+                create_graph=False,
+            )[0]  # (micro_batch, n_pmts, 3)
+            # Extract gradients only for sampled batches
+            grad_sampled = grad[sample_indices]  # (n_samples, n_pmts, 6)
+            grad_xyz = grad_sampled[:, pmt_idx, :3]  # (n_samples, 3)
+            grad_mag = torch.norm(grad_xyz, dim=1)  # (n_samples,)
+
+            grad_mags.append(grad_mag.detach())
+
+        grad_mags_sampled = torch.stack(grad_mags, dim=1)  # (n_samples, n_pmts)
+        grad_mags_full[sample_indices] = grad_mags_sampled
+
+        return grad_mags_full.detach()
 
     def init_weights(self):
         """

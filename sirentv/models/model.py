@@ -10,6 +10,7 @@ from slar.transform import partial_xform_vis
 
 from sirentv.models.builder import build_model
 from sirentv.utils.transform import cdf_to_pdf, pdf_to_cdf
+from sirentv.data.compressed import CompressedPLib
 
 
 class SirenTV(nn.Module):
@@ -40,29 +41,52 @@ class SirenTV(nn.Module):
             with open(ckpt_file, "rb") as f:
                 model_dict = torch.load(f, map_location="cpu")
                 self.load_model_dict(model_dict)
-            return
+            #return
 
         # Create meta
         if meta is not None:
             self._meta = meta
+        elif "compressed_plib" in cfg:
+            cplib_cfg = cfg["compressed_plib"]
+            cplib = CompressedPLib.load(
+                cplib_cfg["filepath"],
+                lazy=False,
+                n_components=cplib_cfg.get("n_components"),
+            )
+            self._meta = cplib.meta
+            if self._load_pos:
+                pmt_pos = torch.tensor(cplib.pmt_pos, dtype=torch.float32)
+                self.pmt_coords = pmt_pos
+                self.norm_pmt_coords = cplib.meta.norm_coord(pmt_pos)
+            del cplib
         elif "photonlib" in cfg:
             self._meta = AABox.load(cfg["photonlib"]["filepath"])
-
-        if self._load_pos:
-            with h5py.File(cfg["photonlib"]["filepath"], 'r') as file:
-                self.pmt_coords = torch.tensor(file['pmt_pos'][:], dtype=torch.float32)
-                self.norm_pmt_coords = torch.tensor(file['pmt_norm_pos'][:], dtype=torch.float32)
+            if self._load_pos:
+                with h5py.File(cfg["photonlib"]["filepath"], 'r') as file:
+                    self.pmt_coords = torch.tensor(file['pmt_pos'][:], dtype=torch.float32)
+                    self.norm_pmt_coords = torch.tensor(file['pmt_norm_pos'][:], dtype=torch.float32)
 
         # Transform functions
         self._xform_vis, self._inv_xform_vis = partial_xform_vis(self.config_xform)
 
         # Extensions for visibility model
         self._init_output_scale(self.config_model)
-        self._do_hardsigmoid = self.config_model.get("hardsigmoid", False)
         self.tick_size = self.config_model.get("tick_size", 0.1) # ns
 
         self.n_pmts: int = self.config_data.get("n_pmt", 81)
 
+        anneal_cfg = self.config_model.get("anneal", {})
+        self.anneal_enabled = anneal_cfg.get("enabled", False)
+        self.current_tau = 1.0
+        if self.anneal_enabled:
+            self.tau_start = anneal_cfg.get("tau_start", 1.0)
+            self.tau_end = anneal_cfg.get("tau_end", 0.01)
+            self.current_tau = self.tau_start
+
+    def anneal_temperature(self, epoch, max_epochs):
+        """Call this at end of each epoch if annealing is enabled"""
+        if self.anneal_enabled:
+            self.current_tau = self.tau_start * (self.tau_end / self.tau_start) ** (epoch / max_epochs)
 
     def to(self, device):
         self._meta.to(device)
@@ -86,12 +110,14 @@ class SirenTV(nn.Module):
     def update_meta(self, ranges: torch.Tensor):
         self._meta.update(ranges)
 
-    def forward(self, x):
+    def forward(self, x, return_gradients=False):
         """
         Parameters
         ----------
         x : torch.Tensor
             Input in unnormalized coordinates.
+        return_gradients: bool
+            Whether to compute the visibility gradient in the forward
         return_pdf : bool
             If True, return the PDF of the waveform. If False, return the CDF.
 
@@ -102,36 +128,33 @@ class SirenTV(nn.Module):
             The keys are "t" and "v".
         """
         #device = x.device
-        x = x.to(self.device)
         pos = x.unsqueeze(0) if x.dim() == 1 else x
         mask = self.meta.contain(pos).to(self.device)
         norm_pos = self.meta.norm_coord(pos[mask]).to(self.device)
+        if norm_pos.dim() == 1:
+            norm_pos = norm_pos.unsqueeze(0)
         norm_pos = norm_pos.unsqueeze(1).expand(-1, self.n_pmts, -1)
         input_to_net = norm_pos
         if self._load_pos:
             norm_pmt_tile = self.norm_pmt_coords.to(self.device).unsqueeze(0).expand_as(norm_pos)
             input_to_net = torch.cat([norm_pos, norm_pmt_tile], dim=-1)
 
-        out = self.model(input_to_net)#.to(device)
+        out = self.model(input_to_net, self.current_tau, return_gradients)
 
-        v = torch.zeros(
-            pos.shape[0], out['v'].shape[-1], dtype=torch.float32, device=self.device
-        )
-        v[mask] = out['v'].to(self.device)
-
-        t = torch.zeros(
-            pos.shape[0], *out['t'].shape[1:], dtype=torch.float32, device=self.device
-        )
-        t[mask] = out['t'].to(self.device)
-
-        if 't0' in out and out['t0'] is not None:
-            t0 = torch.zeros(
-                pos.shape[0], *out['t0'].shape[1:], dtype=torch.float32, device=self.device
+        result = {"correct_mask": mask}
+        for key, val in out.items():
+            # grad_mags default to 1.0 (unit gradient) for masked positions
+            default_val = 1.0 if key == "grad_mags_transformed" else 0.0
+            buf = torch.full(
+                (pos.shape[0], *val.shape[1:]),
+                default_val,
+                dtype=torch.float32,
+                device=self.device,
             )
-            t0[mask] = out['t0'].to(self.device)
-            return {"t": t, "v": v, "t0": t0, "correct_mask": mask}
+            buf[mask] = val.to(device=self.device, dtype=torch.float32)
+            result[key] = buf
 
-        return {"t": t, "v": v, "correct_mask": mask}
+        return result
 
     def visibility(self, x, return_type: Literal["pdf", "cdf"] = "pdf"):
         out = self.forward(x)

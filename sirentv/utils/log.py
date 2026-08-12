@@ -1,6 +1,9 @@
 import os
 from functools import partial
 import glob
+import numpy as np
+import torch
+
 import importlib
 from abc import ABC, abstractmethod
 
@@ -29,7 +32,7 @@ class WandbLogger(Logger):
     Logger class to log training progress using Weights & Biases (wandb).
     """
 
-    def __init__(self, cfg, rank=0, world_size=1, is_distributed=False):
+    def __init__(self, cfg, rank=0):
         """
         Constructor
 
@@ -40,14 +43,8 @@ class WandbLogger(Logger):
             the wandb project and run name respectively.
         rank : int
             Global rank of this process
-        world_size : int
-            Total number of processes
-        is_distributed : bool
-            Whether running in distributed mode
         """
         self.rank = rank
-        self.world_size = world_size
-        self.is_distributed = is_distributed
 
         log_cfg = cfg.get("logger", dict())
         self.project = log_cfg.get("project", "default-project")
@@ -57,6 +54,7 @@ class WandbLogger(Logger):
 
         if self.rank == 0:
             self._logdir = self.make_logdir(log_cfg.get("dir_name", "logs"))
+            self._wandb_rundir = log_cfg.get("run_dir", "./")
             self._logfile = os.path.join(self._logdir, cfg.get("file_name", "log.csv"))
         else:
             self._logdir = None
@@ -72,13 +70,11 @@ class WandbLogger(Logger):
             proj_cfg = dict(
                 project=self.project,
                 name=self.name,
-                config={**cfg,
-                        "world_size": world_size,
-                        "distributed": is_distributed}
+                config=cfg,
             )
             if self.entity:
                 proj_cfg["entity"] = self.entity
-            wandb.init(**proj_cfg, settings=wandb.Settings(start_method="fork"))
+            wandb.init(**proj_cfg, dir=self._wandb_rundir, settings=wandb.Settings(start_method="fork"))
             self.wandb = wandb
             print(f"[WandbLogger] Initialized wandb project: {self.project}")
         else:
@@ -87,17 +83,17 @@ class WandbLogger(Logger):
         self._dict = {}
         self._analysis_dict = {}
 
-        if self.rank == 0:
-            for kwargs in log_cfg.get("analysis", []):
-                func = kwargs.pop("func", "")
-                suffix = kwargs.pop("suffix", "")
-                if suffix:
-                    suffix = f"_{suffix}"
+        for kwargs in log_cfg.get("analysis", []):
+            func = kwargs.pop("func", "")
+            suffix = kwargs.pop("suffix", "")
+            if suffix:
+                suffix = f"_{suffix}"
+            if self.rank == 0:
                 print("[WandbLogger] adding analysis function:", func+suffix)
 
-                self._analysis_dict[func + suffix] = partial(
-                    getattr(importlib.import_module("sirentv.analysis"), func), **kwargs
-                )
+            self._analysis_dict[func + suffix] = partial(
+                getattr(importlib.import_module("sirentv.analysis"), func), **kwargs
+            )
 
     def record(self, keys: list, vals: list):
         """
@@ -116,11 +112,16 @@ class WandbLogger(Logger):
             for i, key in enumerate(keys):
                 self._dict[key] = vals[i]
 
+    def commit(self, iteration):
+        """Commit all pending logs to wandb"""
+        if iteration % self._log_every_nsteps == 0 and self.wandb is not None:
+            self.wandb.log({}, step=iteration, commit=True)
+
     def step(self, iteration, label=None, pred=None):
         """
         Function to take an iteration step during training/inference. If this step is
         subject for logging, this function logs the parameters registered through the record function.
-        Only rank 0 actually records.
+        Per-rank analysis logging.
 
         Parameters
         ----------
@@ -134,22 +135,31 @@ class WandbLogger(Logger):
         pred : torch.Tensor
             The predicted values from the model run for training/inference.
         """
+        if iteration == 0 or iteration % self._log_every_nsteps != 0:
+            return
 
         if self.rank != 0:
             return
 
-        if not iteration % self._log_every_nsteps == 0:
-            return
-
-        if None not in (label, pred):
+        if None not in (label, pred) and len(self._analysis_dict) > 0:
+            local_metrics = {}
             for key, f in self._analysis_dict.items():
-                self.record(["analysis/"+key], [f(label, pred)])
+                try:
+                    metric_value = f(label, pred)
+                    if isinstance(metric_value, torch.Tensor):
+                        metric_value = metric_value.detach().item() if metric_value.numel() == 1 else metric_value.detach()
+                    local_metrics[f"analysis/{key}"] = metric_value
+                except Exception as e:
+                    print(f"[WandbLogger] Warning: Failed to compute {key}: {e}")
+
+            if self.wandb is not None:
+                self.wandb.log(local_metrics, step=iteration, commit=False)
+
         self.write()
 
     def plot(self, iteration, inferred: dict):
         """
         Log a plot of x vs y at the given iteration.
-        Only rank 0 actually records.
 
         Parameters
         ----------
@@ -160,75 +170,131 @@ class WandbLogger(Logger):
             Type of plot: "line" or "scatter" (default).
         """
 
-        if self.rank != 0 or inferred is None or self.wandb is None:
+        if self.rank != 0 or inferred is None:
             return
 
-        x = inferred['x_value'].detach().cpu().numpy()
-        visibility = inferred['visibility'].detach().cpu().numpy()
-        pdf = inferred['pdf'].detach().cpu().numpy()
-        cdf = inferred['cdf'].detach().cpu().numpy()
+        if iteration % self._log_every_nsteps != 0 or self.wandb is None:
+            return
+
+        data = {
+            'x_value': inferred['x_value'].detach().cpu(),
+            'visibility': inferred['visibility'].detach().cpu(),
+            'pdf': inferred['pdf'].detach().cpu(),
+            'cdf': inferred['cdf'].detach().cpu(),
+        }
+        if 'position' in inferred and inferred['position'] is not None:
+            data['position'] = inferred['position'].detach().cpu()
+        else:
+            data['position'] = None
+        if 't0' in inferred and inferred['t0'] is not None:
+            data['t0'] = inferred['t0'].detach().cpu()
+        else:
+            data['t0'] = None
 
         import matplotlib.pyplot as plt
-
-        # --- Visibility plot ---
-        fig_vis, ax_vis = plt.subplots()
-        ax_vis.scatter(visibility[:, 0], visibility[:, 1], label="Target vs Pred")
-        max_val = max(visibility[:, 0].max(), visibility[:, 1].max())*1.1
-        ax_vis.set_xlim(0, max_val)
-        ax_vis.set_ylim(0, max_val)
-        ax_vis.plot([0, 1], [0, 1], 'r--', alpha=0.8, label="y=x")
-        ax_vis.set_xlabel("Target Visibility")
-        ax_vis.set_ylabel("Predicted Visibility")
-        ax_vis.set_title("PMT Visibility")
-        ax_vis.legend()
-
-        # --- PDF plot ---
-        fig_pdf, ax_pdf = plt.subplots()
-        ax_pdf.plot(x, pdf[:, 0], label="Target", color="navy")
-        ax_pdf.plot(x, pdf[:, 1], label="Predicted", color="darkorange")
-        ax_pdf.set_xlabel("Time (ns)")
-        ax_pdf.set_ylabel("Value")
-        ax_pdf.set_title("Waveform PDF")
-        ax_pdf.legend()
-
-        # --- CDF plot ---
-        # cdf plot with residual subplot below
-        import numpy as np
         from matplotlib.gridspec import GridSpec
 
-        fig_cdf = plt.figure(constrained_layout=True, figsize=(6, 6))
-        gs = GridSpec(5, 1, figure=fig_cdf)
-        ax_cdf = fig_cdf.add_subplot(gs[:4, 0])
+        # Build subtitle from position
+        subtitle = ""
+        if data['position'] is not None:
+            pos = data['position'].numpy()
+            if pos.ndim > 1:
+                pos = pos[0]
+            subtitle = f"Pos: ({pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f})"
+
+        # --- Visibility plot ---
+        fig_vis, ax = plt.subplots(figsize=(6, 5))
+
+        visibility = data['visibility'].numpy()
+        v_target = visibility[:, 0]
+        v_pred = visibility[:, 1]
+        pos_mask = (v_target > 0) & (v_pred > 0)
+        ax.scatter(v_target[pos_mask], v_pred[pos_mask], s=10, alpha=0.6, zorder=3)
+
+        vmin = min(v_target[pos_mask].min(), v_pred[pos_mask].min()) * 0.5
+        vmax = max(v_target[pos_mask].max(), v_pred[pos_mask].max()) * 2.0
+        t_line = np.array([vmin, vmax])
+        ax.plot(t_line, t_line, 'k-', alpha=0.8, lw=1, label="y=x")
+        for bias_pct, color, ls in [(5, "green", "--"), (10, "orange", ":")]:
+            b = bias_pct / 100.0
+            upper = t_line * (2 + b) / (2 - b)
+            lower = t_line * (2 - b) / (2 + b)
+            ax.fill_between(t_line, lower, upper, alpha=0.10, color=color,
+                            label=f"\u00b1{bias_pct}% bias")
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax.set_xlim(vmin, vmax)
+        ax.set_ylim(vmin, vmax)
+        ax.set_xlabel("Target Visibility")
+        ax.set_ylabel("Predicted Visibility")
+        ax.set_title(f"PMT Visibility\n{subtitle}" if subtitle else "PMT Visibility")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+
+        # --- PDF plot ---
+        fig_pdf, ax = plt.subplots(figsize=(6, 5))
+
+        x = data['x_value'].numpy()
+        pdf = data['pdf'].numpy()
+
+        mask = x > 0
+        x_pos = x[mask]
+        pdf_pos = pdf[mask]
+        floor = 1e-30
+        pdf_target = np.clip(pdf_pos[:, 0], floor, None)
+        pdf_pred = np.clip(pdf_pos[:, 1], floor, None)
+
+        ax.plot(x_pos, pdf_target, label="Target", color="navy", linewidth=2)
+        ax.plot(x_pos, pdf_pred, label="Predicted", color="darkorange", linewidth=2)
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax.set_ylim(bottom=1e-5)
+        ax.set_xlabel("Time (ns)")
+        ax.set_ylabel("PDF")
+        ax.set_title(f"PDF\n{subtitle}" if subtitle else "PDF")
+        ax.legend()
+        ax.grid(True, alpha=0.3, which="both")
+        plt.tight_layout()
+
+        # --- CDF plot with residual ---
+        fig_cdf = plt.figure(figsize=(6, 6))
+        gs = GridSpec(5, 1, figure=fig_cdf, hspace=0.4)
+        ax_cdf = fig_cdf.add_subplot(gs[0:4, 0])
         ax_res = fig_cdf.add_subplot(gs[4, 0], sharex=ax_cdf)
 
-        ax_cdf.plot(x, cdf[:, 0], label="Target", color="navy")
-        ax_cdf.plot(x, cdf[:, 1], label="Predicted", color="darkorange")
-        if 't0' in inferred.keys() and inferred['t0'] is not None:
-            t0s = inferred['t0'].detach().cpu().numpy()
+        cdf = data['cdf'].numpy()
+        ax_cdf.plot(x, cdf[:, 0], label="Target", color="navy", linewidth=2)
+        ax_cdf.plot(x, cdf[:, 1], label="Predicted", color="darkorange", linewidth=2)
+
+        if data['t0'] is not None:
+            t0s = data['t0'].numpy()
             ax_cdf.axvline(t0s[0], linestyle='--', label="Target T0", color="navy", alpha=0.6)
             ax_cdf.axvline(t0s[1], linestyle='--', label="Predicted T0", color="darkorange", alpha=0.6)
-        ax_cdf.set_xlabel("Time (ns)")
-        ax_cdf.set_ylabel("Value")
-        ax_cdf.set_title("Waveform CDF")
-        ax_cdf.legend()
 
-        # residual plot
+        ax_cdf.set_ylabel("Value")
+        ax_cdf.set_title(f"CDF - {subtitle}" if subtitle else "CDF", fontsize=10)
+        ax_cdf.legend(fontsize=8)
+        ax_cdf.grid(True, alpha=0.3)
+        ax_cdf.tick_params(labelbottom=False)
+
         residual = cdf[:, 1] - cdf[:, 0]
         ax_res.plot(x, np.zeros_like(x), color="grey", linewidth=1, alpha=0.7)
-        ax_res.plot(x, residual, color="red", linewidth=1)
-        ax_res.set_ylabel("Residual")
+        ax_res.plot(x, residual, color="red", linewidth=1.5)
+        ax_res.set_ylabel("Residual", fontsize=8)
         ax_res.set_xlabel("Time (ns)")
-        ax_res.set_ylim(-np.max(np.abs(residual))*1.1, np.max(np.abs(residual))*1.1)
-        ax_res.set_title("CDF Residual (Pred - Target)")
+        max_res = np.max(np.abs(residual))
+        if max_res > 0:
+            ax_res.set_ylim(-max_res * 1.1, max_res * 1.1)
+        ax_res.grid(True, alpha=0.3)
         ax_res.spines['top'].set_visible(False)
         ax_res.spines['right'].set_visible(False)
 
-        # log both figures in a single step
         self.wandb.log({
             "PMT Visibility": wandb.Image(fig_vis),
             "PDF": wandb.Image(fig_pdf),
             "CDF": wandb.Image(fig_cdf),
-        }, step=iteration)
+        }, step=iteration, commit=False)
 
         plt.close(fig_vis)
         plt.close(fig_pdf)
@@ -247,7 +313,7 @@ class WandbLogger(Logger):
         Log the key-value pairs provided through the record function to wandb.
         """
         if self.wandb is not None:
-            self.wandb.log(self._dict)
+            self.wandb.log(self._dict, commit=False)
             self._dict = {}  # Clear dict after logging
 
     def save(self, path):
@@ -292,75 +358,52 @@ class WandbLogger(Logger):
 
         return logdir
     
-    def watch_grad(self, net):
-        if self.wandb is not None:
-            self.wandb.watch(net, log="all", log_freq=100)
-
-    def log_aggregated_loss(self, iteration, loss_tensor):
-        """
-        Log loss aggregated across all ranks.
-        All ranks must call this, but only rank 0 logs.
+    def log_grad_norms(self, iteration, net, norm_type=2.0, log_per_layer=False):
+        """Log gradient norms to wandb. Call after backward() on rank 0 only.
 
         Parameters
         ----------
         iteration : int
-            Current iteration
-        loss_tensor : torch.Tensor
-            Loss tensor (must be on GPU for all_reduce)
-
+            Current training iteration.
+        net : nn.Module
+            The model (unwrapped, not DDP wrapper).
+        norm_type : float
+            Norm type (default 2.0 for L2).
+        log_per_layer : bool
+            If True, also log per-layer gradient norms.
         """
-        if self.is_distributed:
-            import torch.distributed as dist
-            loss_avg = loss_tensor.detach().clone()
-            dist.all_reduce(loss_avg, op=dist.ReduceOp.AVG)
-        else:
-            loss_avg = loss_tensor.detach()
-        if self.wandb is not None:
-            self.wandb.log({
-                "loss/avg_across_gpus": loss_avg.item(),
-                "loss/rank_0": loss_tensor.item(),
-            }, step=iteration)
-
-    def log_per_rank_metrics(self, iteration, metrics_dict):
-        """
-        Gather and log per-rank metrics.
-        All ranks must call this with their local metrics.
-
-        Parameters
-        ----------
-        iteration : int
-            Current iteration
-        metrics_dict : dict
-            Dict of {metric_name: tensor_value} for this rank
-        """
-        if not self.is_distributed:
-            if self.wandb is not None:
-                self.wandb.log(metrics_dict, step=iteration)
+        if self.wandb is None:
             return
-        import torch
-        import torch.distributed as dist
-        log_dict = {}
-        for metric_name, metric_value in metrics_dict.items():
-            if not isinstance(metric_value, torch.Tensor):
-                metric_value = torch.tensor(metric_value).cuda()
 
-            gathered = [torch.zeros_like(metric_value) for _ in range(self.world_size)]
-            dist.all_gather(gathered, metric_value)
+        grads = [p.grad for p in net.parameters() if p.grad is not None]
+        if len(grads) == 0:
+            return
 
-            if self.wandb is not None:
-                for rank_id, val in enumerate(gathered):
-                    log_dict[f"{metric_name}/rank_{rank_id}"] = val.item()
-                avg_val = torch.stack(gathered).mean()
-                log_dict[f"{metric_name}/avg"] = avg_val.item()
-        if self.wandb is not None:
-            self.wandb.log(log_dict, step=iteration)
+        if norm_type == float('inf'):
+            total_norm = max(g.abs().max() for g in grads)
+        else:
+            total_norm = torch.norm(
+                torch.stack([torch.norm(g, norm_type) for g in grads]),
+                norm_type,
+            )
+
+        log_dict = {"grad_norm/total": total_norm.item()}
+
+        if log_per_layer:
+            for name, param in net.named_parameters():
+                if param.grad is not None:
+                    grad_norm = torch.norm(param.grad, norm_type)
+                    clean_name = name.replace('.', '/')
+                    log_dict[f"grad_norm/layers/{clean_name}"] = grad_norm.item()
+
+        self.wandb.log(log_dict, step=iteration, commit=False)
 
 class CSVLogger(Logger):
     """
     Logger class to store training progress in a CSV file.
     """
 
-    def __init__(self, cfg, rank=0, world_size=1, is_distributed=False):
+    def __init__(self, cfg, rank=0):
         """
         Constructor
 
@@ -372,18 +415,12 @@ class CSVLogger(Logger):
             created from the analysis module and run during the training.
         rank : int
             Global rank of this process
-        world_size : int
-            Total number of processes
-        is_distributed : bool
-            Whether running in distributed mode
         """
 
         self.rank = rank
-        self.world_size = world_size
-        self.is_distributed = is_distributed
 
         log_cfg = cfg.get("logger", dict())
-        self._log_every_nsteps = log_cfg.get("log_every_nsteps", 1)
+        self._log_every_nsteps = log_cfg.get("log_every_nsteps", 10)
         if self.rank == 0:
             self._logdir = self.make_logdir(log_cfg.get("dir_name", "logs"))
             self._logfile = os.path.join(self._logdir, cfg.get("file_name", "log.csv"))
@@ -399,13 +436,18 @@ class CSVLogger(Logger):
         self._analysis_dict = {}
 
         if self.rank == 0:
-            for key, kwargs in log_cfg.get("analysis", dict()).items():
+            analysis_cfg = log_cfg.get("analysis", [])
+            if isinstance(analysis_cfg, dict):
+                analysis_cfg = [{"func": k, **v} for k, v in analysis_cfg.items()]
+            for item in analysis_cfg:
+                item = dict(item)
+                key = item.pop("func")
                 print("[CSVLogger] adding analysis function:", key)
-                suffix = kwargs.pop("suffix", "")
+                suffix = item.pop("suffix", "")
                 if suffix:
                     suffix = f"_{suffix}"
                 self._analysis_dict[key + suffix] = partial(
-                    getattr(importlib.import_module("sirentv.analysis"), key), **kwargs
+                    getattr(importlib.import_module("sirentv.analysis"), key), **item
                 )
 
     @property

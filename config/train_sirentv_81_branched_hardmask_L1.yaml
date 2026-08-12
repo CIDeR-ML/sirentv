@@ -1,19 +1,29 @@
 photonlib:
-    filepath: /sdf/data/neutrino/pubdata/lut/optical/waveform_map/batch02/consolidated/plib.h5
+    #filepath: /sdf/data/neutrino/pubdata/lut/optical/waveform_map/batch02/consolidated/plib.h5
+    filepath: /sdf/data/neutrino/pubdata/lut/optical/consolidated/full_wvfm_plib_b03_uncompressed.h5
     lazy: True
+    time_tick_size: 0.1 #ns
+physics:
+    R_index: 1.3784
 device: 
     type: cuda
 model:
-  ckpt_file: null
+  ckpt_file:
   mode: cdf
   network:
-    type: ParallelSiren # or ConditionalSiren or BranchedSiren
+    type: BranchedSiren # or ConditionalSiren or BranchedSiren
     in_features: 6
-    hidden_features: [128, 512]
-    hidden_layers: [3, 3]
+    hidden_features: [512, 256, 1024]
+    hidden_layers: [3, 3, 3]
     out_features: [1, 1001]
     outermost_linear: True
     steepness_factor: 10.0
+    hard: True
+  # Optional: annealing for temperature (Gumbel)
+  anneal:
+    enabled: True
+    tau_start: 0.5
+    tau_end: 0.05
   output_scale:
       fix: True
 transform_vis:
@@ -21,8 +31,11 @@ transform_vis:
     eps: 1.e-8
     sin_out: False
 data:
-    n_photon: 200000
+    #n_photon: 200000
+    n_photon: 15000000
     n_pmt: 81
+    use_gradient_supervision: True  # Enable gradient precomputation
+    gradient_cache_file: /sdf/home/j/junjie/sdf-data/SIREN/gradients/branched_gradient_cache_20260208.pt  # Cache to avoid recomputation
     weight:
       t:
         enable: false
@@ -33,18 +46,19 @@ data:
         factor: 5000.0
         threshold: 1.0e-08
     loader:
-      batch_size: 1024
+      batch_size: 3072
       drop_last: true
-      num_workers: 4
+      num_workers: 2
       pin_memory: true
       shuffle: true
     dataset:
       type: PLibDataset
 logger:
     type: wandb
-    dir_name: logs_xyz_81_vis_weighting
+    dir_name: /sdf/home/j/junjie/sdf-data/SIREN/wandb/logs_xyz_81_vis_weighting
+    run_dir: /sdf/home/j/junjie/sdf-data/SIREN
     file_name: log.csv
-    log_every_nstep: 8
+    log_every_nsteps: 10
     project: branched-siren-81
     name: siren_81-vis
     infer_fn:
@@ -58,6 +72,11 @@ logger:
         suffix: vis
         key: v_linear
         threshold: 1.0e-06
+      - func: abs_bias
+        suffix: t0
+        key: t0
+        threshold: 1.0e-02
+        signed: True
 train:
     loss:
       - type: SmoothL1Loss
@@ -66,14 +85,18 @@ train:
       - type: SmoothL1Loss
         key: v
         weight: 1.0
+      - type: VisibilityGradient_SmoothL1Loss
+        key: v
+        weight: 0.01
+        threshold: 1.0e-9
     regularization: null
     reduction: sum
-    max_epochs: 500
+    max_epochs: 1000
     optimizer_class: AdamW
     optimizer_param:
-      lr: 1.0e-06
+      lr: 2.0e-05
     resume: false
-    save_every_epochs: 500
+    save_every_epochs: 100
     scheduler_class: ReduceLROnPlateau
     scheduler_param:
       patience: 10
