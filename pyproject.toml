@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sirentv"
+version = "0.1.0"
+description = "Neural photon-visibility and timing surrogates for liquid-argon TPCs"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  {name = "Sam Young", email = "youngsam@stanford.edu"},
+  {name = "Junjie Xia", email = "junjiex@stanford.edu"},
+]
+keywords = ["DUNE", "LArTPC", "neutrino", "photon transport", "SIREN"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+  "h5py",
+  "numpy",
+  "photonlib @ git+https://github.com/CIDeR-ML/photonlib.git@5f734f43218b65951001c7c02cc2f95767056da8",
+  "pyyaml",
+  "slar @ git+https://github.com/CIDeR-ML/siren-lartpc.git@d20eaa0076c9c953169fec6eb119bee8c16591a8",
+  "torch>=2.0",
+  "tqdm",
+]
+
+[project.optional-dependencies]
+wandb = ["hist", "matplotlib", "wandb"]
+test = ["pytest>=8"]
+dev = ["build", "hist", "matplotlib", "pytest>=8", "wandb"]
+
+[project.scripts]
+sirentv-train = "sirentv.train:main"
+sirentv-eval = "sirentv.eval:main"
+
+[project.urls]
+Homepage = "https://github.com/CIDeR-ML/sirentv"
+Repository = "https://github.com/CIDeR-ML/sirentv.git"
+Issues = "https://github.com/CIDeR-ML/sirentv/issues"
+
+[tool.setuptools.packages.find]
+include = ["sirentv*"]
+
+[tool.setuptools.data-files]
+"share/sirentv/config" = ["config/*.yaml"]

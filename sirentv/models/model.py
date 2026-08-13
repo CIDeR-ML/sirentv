@@ -1,6 +1,6 @@
 from typing import Union, Literal
 
-import os
+import copy
 import numpy as np
 import torch
 import h5py
@@ -16,10 +16,13 @@ from sirentv.data.compressed import CompressedPLib
 class SirenTV(nn.Module):
     def __init__(self, cfg: dict, meta=None):
         super().__init__()
-        self.config_model = cfg["model"]
-        self.config_data = cfg["data"]
-        self.config_loader = cfg["data"]["loader"]
+        self.config_model = copy.deepcopy(cfg["model"])
+        self.config_data = copy.deepcopy(cfg["data"])
+        self.config_loader = self.config_data["loader"]
         self._load_pos = self.config_loader.get("load_pos", True)
+        self.n_pmts: int = self.config_data.get("n_pmt", 81)
+        self._checkpoint_epoch = None
+        self._checkpoint_iteration = None
 
         self.config_xform = cfg.get("transform_vis", None)
         if self.config_xform is None:
@@ -36,12 +39,6 @@ class SirenTV(nn.Module):
         self.model = build_model(model_config)
         self.out_features = self.model.out_features
         ckpt_file = self.config_model.get("ckpt_file")
-        if ckpt_file:
-            print("[SirenTV] loading model_dict from checkpoint", ckpt_file)
-            with open(ckpt_file, "rb") as f:
-                model_dict = torch.load(f, map_location="cpu")
-                self.load_model_dict(model_dict)
-            #return
 
         # Create meta
         if meta is not None:
@@ -65,6 +62,10 @@ class SirenTV(nn.Module):
                 with h5py.File(cfg["photonlib"]["filepath"], 'r') as file:
                     self.pmt_coords = torch.tensor(file['pmt_pos'][:], dtype=torch.float32)
                     self.norm_pmt_coords = torch.tensor(file['pmt_norm_pos'][:], dtype=torch.float32)
+        else:
+            raise ValueError(
+                "SirenTV requires meta=..., a photonlib section, or a compressed_plib section"
+            )
 
         # Transform functions
         self._xform_vis, self._inv_xform_vis = partial_xform_vis(self.config_xform)
@@ -73,8 +74,6 @@ class SirenTV(nn.Module):
         self._init_output_scale(self.config_model)
         self.tick_size = self.config_model.get("tick_size", 0.1) # ns
 
-        self.n_pmts: int = self.config_data.get("n_pmt", 81)
-
         anneal_cfg = self.config_model.get("anneal", {})
         self.anneal_enabled = anneal_cfg.get("enabled", False)
         self.current_tau = 1.0
@@ -82,6 +81,12 @@ class SirenTV(nn.Module):
             self.tau_start = anneal_cfg.get("tau_start", 1.0)
             self.tau_end = anneal_cfg.get("tau_end", 0.01)
             self.current_tau = self.tau_start
+
+        if ckpt_file:
+            print("[SirenTV] loading model_dict from checkpoint", ckpt_file)
+            with open(ckpt_file, "rb") as f:
+                model_dict = torch.load(f, map_location="cpu", weights_only=True)
+            self.load_model_dict(model_dict)
 
     def anneal_temperature(self, epoch, max_epochs):
         """Call this at end of each epoch if annealing is enabled"""
@@ -180,49 +185,68 @@ class SirenTV(nn.Module):
             v = v.unsqueeze(-1)
         return v.expand_as(t) * t # (B, N_pmt, N_time)
 
-    def model_dict(self, opt=None, sch=None, epoch=-1, scaler=None):
+    def model_dict(self, opt=None, sch=None, epoch=-1, scaler=None, iteration=-1):
         model_dict = {
             "state_dict": self.state_dict(),
             "xform_cfg": self.config_xform,
             "model_cfg": self.config_model,
+            "data_cfg": self.config_data,
             "aabox_ranges": self._meta.ranges,
         }
+        if self._load_pos:
+            model_dict["pmt_coords"] = self.pmt_coords
+            model_dict["norm_pmt_coords"] = self.norm_pmt_coords
         if opt:
             model_dict["optimizer"] = opt.state_dict()
         if sch:
             model_dict["scheduler"] = sch.state_dict()
         if epoch >= 0:
-            model_dict["epoch"] = epoch
+            model_dict["epoch"] = float(epoch)
+        if iteration >= 0:
+            model_dict["iteration"] = int(iteration)
         if scaler is not None:
             model_dict["amp_scaler"] = scaler.state_dict()
         return model_dict
 
-    def save_state(self, filename, opt=None, sch=None, epoch=-1, scaler=None):
+    def save_state(
+        self, filename, opt=None, sch=None, epoch=-1, scaler=None, iteration=-1
+    ):
         print("[SirenTV] saving model_dict ", filename)
-        torch.save(self.model_dict(opt, sch, epoch, scaler), filename)
+        torch.save(
+            self.model_dict(opt, sch, epoch, scaler, iteration=iteration), filename
+        )
         print("[SirenTV] saving finished")
 
     def load_model_dict(self, model_dict):
         print("[SirenTV] loading model_dict")
 
-        self.config_model = model_dict.get("model_cfg")
+        self.config_model = copy.deepcopy(model_dict.get("model_cfg"))
         self.config_xform = model_dict.get("xform_cfg")
         if self.config_model is None:
             raise KeyError('The model dictionary is lacking the "model_cfg" data')
 
-        self._init_output_scale(self.config_model)
+        if model_dict.get("data_cfg") is not None:
+            self.config_data = copy.deepcopy(model_dict["data_cfg"])
+            self.config_loader = self.config_data["loader"]
+            self._load_pos = self.config_loader.get("load_pos", True)
+            self.n_pmts = self.config_data.get("n_pmt", self.n_pmts)
         self._do_hardsigmoid = self.config_model.get("hardsigmoid", False)
         self._xform_vis, self._inv_xform_vis = partial_xform_vis(self.config_xform)
 
         self._meta = AABox(model_dict["aabox_ranges"])
+        if "pmt_coords" in model_dict:
+            self.pmt_coords = model_dict["pmt_coords"].to(dtype=torch.float32)
+            self.norm_pmt_coords = model_dict["norm_pmt_coords"].to(dtype=torch.float32)
 
-        state_dict = model_dict["state_dict"]
+        state_dict = copy.deepcopy(model_dict["state_dict"])
         if "input_scale" in state_dict:
             state_dict.pop("input_scale")
         if "scale" in model_dict.keys():
             state_dict["output_scale"] = model_dict["scale"]
 
         self.load_state_dict(state_dict)
+        self._checkpoint_epoch = model_dict.get("epoch")
+        self._checkpoint_iteration = model_dict.get("iteration")
 
         print("[SirenTV] loading finished\n")
 
@@ -231,11 +255,8 @@ class SirenTV(nn.Module):
         if isinstance(cfg_or_fname, dict):
             if "model" not in cfg_or_fname:
                 raise KeyError("The configuration dictionary must contain model")
-            if "ckpt_file" in cfg_or_fname["model"]:
-                filepath = cfg_or_fname["model"]["ckpt_file"]
-            else:
-                print("[SirenTV] creating from a configuration dict...")
-                return cls(cfg_or_fname)
+            print("[SirenTV] creating from a configuration dict...")
+            return cls(cfg_or_fname)
         elif isinstance(cfg_or_fname, str):
             filepath = cfg_or_fname
         else:
@@ -245,20 +266,26 @@ class SirenTV(nn.Module):
 
         print("[SirenTV] creating from checkpoint", filepath)
         with open(filepath, "rb") as f:
-            model_dict = torch.load(f, map_location="cpu")
+            model_dict = torch.load(f, map_location="cpu", weights_only=True)
             return cls.create_from_model_dict(model_dict)
 
     @classmethod
     def create_from_model_dict(cls, model_dict):
+        if model_dict.get("data_cfg") is None:
+            raise ValueError(
+                "This checkpoint predates standalone loading and does not contain "
+                "the data/PMT configuration. Pass a full configuration dictionary "
+                "with model.ckpt_file set instead."
+            )
         cfg = {
-            "model": model_dict["model_cfg"],
-            "transform_vis": model_dict["xform_cfg"],
+            "model": copy.deepcopy(model_dict["model_cfg"]),
+            "data": copy.deepcopy(model_dict["data_cfg"]),
+            "transform_vis": copy.deepcopy(model_dict["xform_cfg"]),
         }
 
-        if "ckpt_file" in cfg["model"]:
-            cfg["model"].pop("ckpt_file")
+        cfg["model"].pop("ckpt_file", None)
 
-        net = cls(cfg)
+        net = cls(cfg, meta=AABox(model_dict["aabox_ranges"]))
         net.load_model_dict(model_dict)
         return net
 

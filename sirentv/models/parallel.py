@@ -49,7 +49,7 @@ class ParallelSiren(nn.Module):
             in_features=in_features,
             out_features=out_features[1],
             hidden_features=hidden_features[1] if len(hidden_features)>1 else hidden_features[0],
-            hidden_layers=hidden_layers[1] if len(hidden_layers)>1 else hidden_features[0],
+            hidden_layers=hidden_layers[1] if len(hidden_layers)>1 else hidden_layers[0],
             outermost_linear=True,
             first_omega_0=first_omega_0,
             hidden_omega_0=hidden_omega_0,
@@ -60,15 +60,26 @@ class ParallelSiren(nn.Module):
 
         self.init_weights()
 
-    def forward(self, x):
+    def forward(self, x, tau=1.0, return_analytical_gradients=False):
+        if return_analytical_gradients:
+            raise NotImplementedError(
+                "ParallelSiren does not implement analytical gradient supervision"
+            )
         out_v = self.v_net(x)
         out_t0cdf = self.t0_cdf_net(x)
-        out_t0, out_cdf = out_t0cdf[:, :, 1], out_t0cdf[:, :, 1:]
+        out_t0, out_cdf = out_t0cdf[:, :, 0], out_t0cdf[:, :, 1:]
         #out_v = out_v - 8  # <-- initalize guess with 1e-8 offset
         n_ticks = out_cdf.shape[-1]
         t0 = torch.sigmoid(out_t0)*n_ticks  # t0 between 0 and 1000
 
-        out_cdf = t0_mask(n_ticks, t0.unsqueeze(-1), out_cdf, self._steepness_factor, self._use_CDF)
+        out_cdf = t0_mask(
+            n_ticks,
+            t0.unsqueeze(-1),
+            out_cdf,
+            use_CDF=self._use_CDF,
+            steepness=self._steepness_factor,
+            temperature=tau,
+        )
 
         output = dict(
             v=out_v.squeeze(-1),

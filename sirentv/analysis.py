@@ -2,10 +2,6 @@
 from __future__ import annotations
 
 import torch.nn.functional as F
-from hist import Hist
-import matplotlib.pyplot as plt
-from matplotlib.colors import LogNorm
-import wandb
 import torch
 
 def _products_from_pdf(pdf):
@@ -38,6 +34,11 @@ def get_pred_target(dataloader, net, max_voxels=pow(2, 18)): # 262144 vox max
 
 
 def log_pred_target(pred, target, name="pred_vs_target"):
+    from hist import Hist
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import LogNorm
+    import wandb
+
     # get bounds
     nonzero_pred = pred[pred > 0]
     nonzero_target = target[target > 0]
@@ -77,6 +78,10 @@ def log_pred_target(pred, target, name="pred_vs_target"):
     del h
 
 def log_imshow(tensor, name="imshow"):
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import LogNorm
+    import wandb
+
     fig, ax = plt.subplots()
     img = ax.imshow(tensor, cmap="viridis", aspect="auto", norm=LogNorm(), origin="lower")
     fig.colorbar(img, ax=ax)
@@ -85,6 +90,9 @@ def log_imshow(tensor, name="imshow"):
     plt.close(fig)
 
 def log_line(tensor, name="line"):
+    import matplotlib.pyplot as plt
+    import wandb
+
     fig, ax = plt.subplots()
     ax.plot(tensor)
     ax.set_title(name)
@@ -93,6 +101,9 @@ def log_line(tensor, name="line"):
 
 
 def log_hist(tensor, name="hist"):
+    import matplotlib.pyplot as plt
+    import wandb
+
     fig, ax = plt.subplots()
     ax.hist(tensor)
     ax.set_title(name)

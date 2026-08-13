@@ -11,7 +11,7 @@ model:
   ckpt_file:
   mode: cdf
   network:
-    type: BranchedSiren # or ConditionalSiren or BranchedSiren
+    type: BranchedSiren
     in_features: 6
     hidden_features: [512, 256, 1024]
     hidden_layers: [3, 3, 3]
@@ -86,7 +86,7 @@ train:
         key: v
         weight: 1.0
       - type: VisibilityGradient_SmoothL1Loss
-        key: v
+        key: grad_mags_transformed
         weight: 0.01
         threshold: 1.0e-9
     regularization: null

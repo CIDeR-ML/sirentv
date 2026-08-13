@@ -9,10 +9,9 @@ import torch
 import torch.distributed as dist
 import yaml
 
-from sirentv.data.io import create_dataloader
+from sirentv.data.builder import create_dataloader
 from sirentv.models import SirenTV
 from sirentv.utils.comm import create_ddp_model
-from sirentv.utils.transform import pdf_to_cdf
 from sirentv.analysis import bias as compute_bias
 from tqdm import tqdm
 
@@ -49,11 +48,11 @@ def evaluate(cfg: dict, output_file: str = "eval_results.pt"):
         eval_cfg["data"]["loader"]["drop_last"] = False
         eval_cfg["data"]["loader"]["shuffle"] = False
     dl = create_dataloader(eval_cfg, rank=rank, world_size=world_size)
-    inv_xform_vis = dl.inv_xform_vis
+    inv_xform_vis = net_module._inv_xform_vis
 
     n_pmts = cfg.get("data", {}).get("n_pmt", 81)
     n_ticks = cfg.get("model", {}).get("network", {}).get("out_features", [1, 1001])[1] - 1
-    threshold = 1e-6  # from config
+    threshold = cfg.get("eval", {}).get("threshold", 1e-6)
     tick_size = cfg.get("photonlib", {}).get("time_tick_size", 0.1)  # ns
 
     if rank == 0:
@@ -61,7 +60,7 @@ def evaluate(cfg: dict, output_file: str = "eval_results.pt"):
 
     # accumulators for per-PMT visibility bias (using analysis.bias formula)
     target_vis_sum = torch.zeros(n_pmts, device=device)
-    target_vis_rms_sq_sum = torch.zeros(n_pmts, device=device)
+    target_vis_sq_sum = torch.zeros(n_pmts, device=device)
     vis_bias_sum = torch.zeros(n_pmts, device=device)
     vis_bias_sq_sum = torch.zeros(n_pmts, device=device)
     vis_count = torch.zeros(n_pmts, device=device)
@@ -89,23 +88,25 @@ def evaluate(cfg: dict, output_file: str = "eval_results.pt"):
 
     for batch_idx, data in enumerate(tqdm(dl, desc=f"Rank {rank} eval", disable=(rank != 0))):
         x = data["position"].contiguous().to(device)
-        target_t_pdf_linear = data["target_linear"].contiguous().to(device)
-        target_v_linear = target_t_pdf_linear.sum(-1)  # (B, n_pmts)
+        meta = {
+            key: value.contiguous().to(device)
+            for key, value in data.get("meta", {}).items()
+        }
+        if "t_linear" not in meta or "v_linear" not in meta:
+            raise KeyError(
+                "Evaluation requires standardized dataset metadata keys "
+                "'t_linear' and 'v_linear'"
+            )
+        target_t_for_bias = meta["t_linear"]
+        target_v_linear = meta["v_linear"]
 
         pred_out: dict[str, torch.Tensor] = net_module(x)
 
         # prepare pred and target dicts
         pred_v_linear = inv_xform_vis(pred_out["v"])  # (B, n_pmts)
 
-        # match training: use CDF for time bias in CDF mode, PDF in PDF mode
-        if mode == "cdf":
-            # convert target PDF to CDF (same as training)
-            target_t_cdf = pdf_to_cdf(target_t_pdf_linear)
-            target_t_for_bias = target_t_cdf
-            pred_t_for_bias = pred_out["t"]  # model outputs CDF
-        else:
-            target_t_for_bias = target_t_pdf_linear
-            pred_t_for_bias = pred_out["t"]
+        # PLibDataset stores CDF metadata in CDF mode and PDF metadata in PDF mode.
+        pred_t_for_bias = pred_out["t"]
 
         target = {
             "v_linear": target_v_linear,
@@ -151,11 +152,8 @@ def evaluate(cfg: dict, output_file: str = "eval_results.pt"):
             torch.zeros_like(t)
         )
 
-        local_vis_errors = torch.cat(all_vis_errors, dim=0)
-        local_pdf_errors = torch.cat(all_pdf_errors, dim=0)
-
         target_vis_sum += (target_vis_masked * vis_mask).sum(dim=0)
-        target_vis_rms_sq_sum += torch.std((target_vis_masked * vis_mask), dim=0)
+        target_vis_sq_sum += ((target_vis_masked ** 2) * vis_mask).sum(dim=0)
         vis_bias_sum += (vis_bias_vals * vis_mask).sum(dim=0)
         vis_bias_sq_sum += ((vis_bias_vals ** 2) * vis_mask).sum(dim=0)
         vis_count += vis_mask.sum(dim=0).float()
@@ -209,6 +207,8 @@ def evaluate(cfg: dict, output_file: str = "eval_results.pt"):
     local_pred_vis = torch.cat(all_pred_vis, dim=0)
     local_true_vis = torch.cat(all_true_vis, dim=0)
     local_positions = torch.cat(all_positions, dim=0)
+    local_vis_errors = torch.cat(all_vis_errors, dim=0)
+    local_pdf_errors = torch.cat(all_pdf_errors, dim=0)
 
     if is_distributed:
         # reduce all statistics across ranks
@@ -217,7 +217,7 @@ def evaluate(cfg: dict, output_file: str = "eval_results.pt"):
         dist.all_reduce(vis_count, op=dist.ReduceOp.SUM)
 
         dist.all_reduce(target_vis_sum, op=dist.ReduceOp.SUM)
-        dist.all_reduce(target_vis_rms_sq_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(target_vis_sq_sum, op=dist.ReduceOp.SUM)
 
         dist.all_reduce(time_bias_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(time_bias_sq_sum, op=dist.ReduceOp.SUM)
@@ -281,7 +281,8 @@ def evaluate(cfg: dict, output_file: str = "eval_results.pt"):
 
         # per-PMT target visibility stats
         target_vis_mean = target_vis_sum / vis_count.clamp(min=1)
-        target_vis_std = torch.sqrt(target_vis_rms_sq_sum.clamp(min=0))
+        target_vis_var = (target_vis_sq_sum / vis_count.clamp(min=1)) - target_vis_mean ** 2
+        target_vis_std = torch.sqrt(target_vis_var.clamp(min=0))
 
         # per-tick time bias stats
         time_bias_mean = time_bias_sum / time_count.clamp(min=1)
@@ -362,8 +363,7 @@ def evaluate(cfg: dict, output_file: str = "eval_results.pt"):
 
 def main():
     parser = argparse.ArgumentParser()
-    default_config_path = "/sdf/home/y/youngsam/sw/dune/sirentv/config/cfg.yaml"
-    parser.add_argument("--config", type=str, default=default_config_path)
+    parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--output", type=str, default="eval_results.pt", help="output .pt file path")
     args = parser.parse_args()
 
@@ -388,7 +388,8 @@ def main():
 
     evaluate(cfg, output_file=args.output)
 
-    dist.destroy_process_group()
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

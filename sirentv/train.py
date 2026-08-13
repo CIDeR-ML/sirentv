@@ -20,6 +20,7 @@ from sirentv.training.utils import (
     build_regularizer,
     build_weight_fn,
     compute_loss,
+    step_scheduler,
     unwrap_net,
 )
 from sirentv.utils.comm import create_ddp_model
@@ -51,7 +52,8 @@ def train(cfg: dict):
     net = SirenTV(cfg).to(DEVICE)
     if is_distributed:
         net = create_ddp_model(net, device_ids=[local_rank])
-    net = torch.compile(net)
+    if cfg.get("train", {}).get("compile", False):
+        net = torch.compile(net)
 
     # --- Data (registry-based, config-driven) ---
     dl = create_dataloader(cfg, rank=rank, world_size=world_size)
@@ -60,8 +62,13 @@ def train(cfg: dict):
     opt, sch, epoch = optimizer_factory(
         list(p for p in net.parameters() if p.requires_grad), cfg
     )
-    if epoch > 0:
-        iteration_ctr = int(epoch * len(dl))
+    checkpoint_iteration = getattr(unwrap_net(net), "_checkpoint_iteration", None)
+    if epoch > 0 or checkpoint_iteration is not None:
+        iteration_ctr = (
+            int(checkpoint_iteration)
+            if checkpoint_iteration is not None
+            else int(epoch * len(dl))
+        )
         epoch_ctr = int(epoch)
         if rank == 0:
             print(f"[train] resuming from iteration {iteration_ctr}, epoch {epoch_ctr}")
@@ -153,9 +160,9 @@ def train(cfg: dict):
             forward_start = time.time()
 
             with (torch.autocast(device_type=DEVICE.type, dtype=torch.bfloat16) if amp else nullcontext()):
-                fwd_kwargs = {}
-                if data.get("return_gradients", False):
-                    fwd_kwargs["return_gradients"] = True
+                fwd_kwargs = {
+                    "return_gradients": "grad_mags_transformed" in target
+                }
                 pred = net(x, **fwd_kwargs)
 
                 if torch.cuda.is_available():
@@ -212,7 +219,7 @@ def train(cfg: dict):
                     f"mem: {peak_mem:.2f}GB"
                 )
 
-            if "grad_mags_transformed" in target:
+            if "grad_mags_transformed" in target and torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
             # --- Logging ---
@@ -254,7 +261,15 @@ def train(cfg: dict):
                     logger.logdir,
                     "iteration-%06d-epoch-%04d.ckpt" % (iteration_ctr, epoch_ctr),
                 )
-                net_module.save_state(filename, opt, sch, iteration_ctr, scaler if amp else None)
+                fractional_epoch = epoch_ctr + (batch_idx + 1) / max(len(dl), 1)
+                net_module.save_state(
+                    filename,
+                    opt,
+                    sch,
+                    fractional_epoch,
+                    scaler if amp else None,
+                    iteration=iteration_ctr,
+                )
 
             if iteration_max <= iteration_ctr:
                 stop_training = True
@@ -269,7 +284,7 @@ def train(cfg: dict):
 
         if sch is not None:
             epoch_avg_loss = epoch_loss_sum / max(epoch_batch_count, 1)
-            sch.step(epoch_avg_loss)
+            step_scheduler(sch, epoch_avg_loss)
 
         epoch_ctr += 1
 
@@ -283,7 +298,12 @@ def train(cfg: dict):
                 "iteration-%06d-epoch-%04d.ckpt" % (iteration_ctr, epoch_ctr),
             )
             net_module.save_state(
-                filename, opt, sch, iteration_ctr / len(dl), scaler if amp else None
+                filename,
+                opt,
+                sch,
+                epoch_ctr,
+                scaler if amp else None,
+                iteration=iteration_ctr,
             )
 
     if rank == 0:

@@ -7,7 +7,7 @@ model:
   ckpt_file: null
   mode: cdf
   network:
-    type: ParallelSiren # or ConditionalSiren or BranchedSiren
+    type: ParallelSiren
     in_features: 6
     hidden_features: [128, 512]
     hidden_layers: [3, 3]

@@ -1,5 +1,8 @@
 **/*.pyc
 *.egg-info
+build/
+dist/
+.pytest_cache/
 wandb/
 *.ipynb
 *.sh
@@ -8,3 +11,4 @@ logs*/
 *.out
 *.err
 *.ckpt
+*.h5

@@ -95,7 +95,7 @@ class BranchedSiren(nn.Module):
 
         x_encoded = self.encoder(x_batched)
         out_t0cdf = self.waveform_decoder(x_encoded)
-        out_t0, out_cdf = out_t0cdf[:, :, 1], out_t0cdf[:, :, 1:]
+        out_t0, out_cdf = out_t0cdf[:, :, 0], out_t0cdf[:, :, 1:]
         out_v = self.vis_decoder(x_encoded)
 
         n_ticks = out_cdf.shape[-1]
@@ -137,7 +137,7 @@ class BranchedSiren(nn.Module):
 
         # Sample only N batches
         n_samples = min(2048, B)  # Compute gradients for max 256 samples
-        sample_indices = torch.randperm(B)[:n_samples]
+        sample_indices = torch.randperm(B, device=vis_output.device)[:n_samples]
 
         # Full tensor for output (zeros for non-sampled)
         grad_mags_full = torch.zeros(B, n_pmts, device=vis_output.device)
@@ -151,19 +151,19 @@ class BranchedSiren(nn.Module):
                 outputs=vis_output[sample_indices, pmt_idx].sum(),
                 inputs=x_batched_input,
                 retain_graph=True,
-                create_graph=False,
+                create_graph=True,
             )[0]  # (micro_batch, n_pmts, 3)
             # Extract gradients only for sampled batches
             grad_sampled = grad[sample_indices]  # (n_samples, n_pmts, 6)
             grad_xyz = grad_sampled[:, pmt_idx, :3]  # (n_samples, 3)
             grad_mag = torch.norm(grad_xyz, dim=1)  # (n_samples,)
 
-            grad_mags.append(grad_mag.detach())
+            grad_mags.append(grad_mag)
 
         grad_mags_sampled = torch.stack(grad_mags, dim=1)  # (n_samples, n_pmts)
         grad_mags_full[sample_indices] = grad_mags_sampled
 
-        return grad_mags_full.detach()
+        return grad_mags_full
 
     def init_weights(self):
         """

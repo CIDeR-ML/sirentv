@@ -31,6 +31,14 @@ def backward_step(loss, opt, amp, scaler, grad_clip_max_norm, net):
         opt.step()
 
 
+def step_scheduler(scheduler, metric):
+    """Advance a scheduler using the argument contract expected by PyTorch."""
+    if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+        scheduler.step(metric)
+    else:
+        scheduler.step()
+
+
 def get_weight_by_vis(vis, factor=None, threshold=1e-8):
     if factor is None:
         factor = 1 / torch.max(vis.clamp(min=1e-8))

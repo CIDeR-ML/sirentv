@@ -11,7 +11,7 @@ model:
   ckpt_file: /sdf/home/j/junjie/sdf-data/SIREN/wandb/logs_xyz_81_vis_weighting/version-49/iteration-097500-epoch-0500.ckpt
   mode: cdf
   network:
-    type: BranchedSiren # or ConditionalSiren or BranchedSiren
+    type: BranchedSiren
     in_features: 6
     hidden_features: [512, 256, 1024]
     hidden_layers: [3, 3, 3]
@@ -28,6 +28,8 @@ data:
     #n_photon: 200000
     n_photon: 15000000
     n_pmt: 81
+    dataset:
+      type: PLibDataset
     weight:
       t:
         enable: false
