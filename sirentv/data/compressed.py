@@ -138,8 +138,17 @@ class CompressedPLib:
                 self.coeffs = torch.from_numpy(f["coeffs"][:, :, : self._n_components]).float()
             self._vis = self._t0 = self._coeffs = None
 
-    def compute_coeff_stats(self, chunk_size=5000):
-        """Compute per-component mean and std over all (voxel, PMT) pairs."""
+    def compute_coeff_stats(self, chunk_size=5000, weight_power: int = 1):
+        """Compute per-component mean and std over all (voxel, PMT) pairs.
+
+        weight_power (p): sets coeff_weight_k = K * std_k^p / sum(std_j^p), i.e. the net
+        penalty on the *raw* coefficient error once combined with normalize_coeffs' division
+        by std is std_k^(p-2) (see derivation in compute_coeff_stats' caller / training docs):
+        p=2 reproduces the original unnormalized loss exactly (no net penalty, since PCA
+        components are orthonormal and raw MSE already equals reconstruction error by
+        Parseval's theorem); p=0 gives plain normalized MSE (full 1/std^2 inverse-variance
+        penalty); p=1 (default) is the midpoint, a 1/std penalty on raw error.
+        """
         K = self._n_components
         with h5py.File(self._path, "r") as f:
             ds = f["coeffs"]
@@ -157,6 +166,12 @@ class CompressedPLib:
         std = np.maximum(std, 1e-12)
         self.coeff_mean = torch.from_numpy(mean.astype(np.float32)).to(self._device)
         self.coeff_std = torch.from_numpy(std.astype(np.float32)).to(self._device)
+        # per-component loss weight: K * std_k^p / sum(std_j^p), rescaled so the average weight
+        # is 1 (keeps the overall loss scale comparable to an unweighted baseline, rather than
+        # shrinking by ~K from the sum-to-1 normalization on top of WeightedL2Loss's mean
+        # reduction). See the weight_power docstring above for what p controls.
+        std_pow = self.coeff_std ** weight_power
+        self.coeff_weight = self.coeff_std.numel() * std_pow / std_pow.sum()
         return self.coeff_mean, self.coeff_std
 
     def normalize_coeffs(self, coeffs):
@@ -353,6 +368,20 @@ class CompressedPLib:
         out = torch.from_numpy(f_flat.reshape(*batch_shape, 1000)).to(device=device, dtype=dtype)
         return out
 
+    def to_linear_time(self, coeffs):
+        """coeffs: (..., K) -> raw linear-ns quantile times (..., n_quantile), the PCA-
+        reconstructed quantile function evaluated at self._u_grid, without interpolating
+        onto a fixed CDF grid. Only valid when self._mode is 'quantile' or 'log_quantile'.
+        """
+        if self._mode not in ("log_quantile", "quantile"):
+            raise RuntimeError(f"to_linear_time only valid for quantile/log_quantile mode, got {self._mode!r}")
+        raw = self.reconstruct_aligned_raw(coeffs)
+        if self._mode == "log_quantile":
+            q = torch.pow(10.0, raw) - self._log_quantile_C
+        else:
+            q = raw
+        return q.clamp(min=0.0)
+
     def reconstruct_aligned_raw(self, coeffs):
         """coeffs: (..., K) -> raw PCA output (..., align_window), no post-processing.
 
@@ -448,9 +477,16 @@ class CompressedPLibDataset(Dataset):
 
         self._normalize_coeffs = bool(plib_cfg.get("normalize_coeffs", False))
         if self._normalize_coeffs:
-            print("[CompressedPLibDataset] computing per-component coeff stats for normalization ...")
-            self._plib.compute_coeff_stats()
+            # NOTE: every compressed_plib config in this repo sets this as "weight_power" (see
+            # e.g. train_sirentv_81_dualpca_grad_supervision.yaml) -- this used to read
+            # "coeff_weight_power" instead, a key that was never actually set anywhere, so this
+            # silently defaulted to 1 in every run to date regardless of the configured value.
+            coeff_weight_power = plib_cfg.get("weight_power", 1)
+            print("[CompressedPLibDataset] computing per-component coeff stats for normalization "
+                  f"(weight_power={coeff_weight_power}) ...")
+            self._plib.compute_coeff_stats(weight_power=coeff_weight_power)
             print(f"  coeff_std range: [{self._plib.coeff_std.min():.4g}, {self._plib.coeff_std.max():.4g}]")
+            print(f"  coeff_weight range: [{self._plib.coeff_weight.min():.4g}, {self._plib.coeff_weight.max():.4g}]")
 
         xform_cfg = cfg.get("transform_vis", {})
         self._xform_vis, self._inv_xform_vis = partial_xform_vis(xform_cfg)
@@ -470,9 +506,195 @@ class CompressedPLibDataset(Dataset):
 
         self.indices = indices
 
+        # Target-side spatial-gradient precomputation (Frobenius norm across channels) for
+        # whichever keys train.grad_supervision_keys asks for -- independent of whether the
+        # main dataset path below is lazy, since a finite-difference gradient inherently needs
+        # a full pass over the data regardless (same one-time-cost reasoning as
+        # compute_coeff_stats above).
+        self._grad_keys = [
+            k for k in cfg.get("train", {}).get("grad_supervision_keys", []) if k in ("v", "coeffs")
+        ]
+        # EXACT (native-resolution, no coarse-graining) gradient-target precomputation via a
+        # chunked Hutchinson random-projection read (see compute_grad_frob_target_exact_projected)
+        # -- replaces the earlier subsample_factor + near-wall-refine two-tier approximation
+        # (which had a real, confirmed systematic truncation-error bias at subsample_factor>1
+        # that ensemble-averaging couldn't fix) with an exact computation that never needs to
+        # avoid reading the full volume in the first place, since it never materializes the
+        # full (N, n_pmt, K) array regardless of K.
+        # number of independent Rademacher projections to average over for multi-channel keys
+        # ("coeffs"); "v" (K=1) is always exact regardless (a single projection of a K=1 field
+        # is exact, see compute_grad_frob_target_exact_projected's docstring).
+        self._grad_n_projections = int(cfg.get("train", {}).get("grad_target_n_projections", 10))
+        # voxels per chunked read (see compute_grad_frob_target_exact_projected) -- keeps at
+        # most one chunk's raw K-dimensional slice in memory at once. null = no chunking.
+        self._grad_chunk_size = cfg.get("train", {}).get("grad_target_chunk_size", 200000)
+        # must match train.grad_supervision_aggregate (see SirenTV.forward's grad_aggregate) --
+        # the prediction side aggregates all PMTs into one per-voxel value weighted by its own
+        # (predicted) visibility, so the target side needs the matching (N,) shape, aggregated
+        # by the TRUE visibility (the one thing the target side has that the prediction side
+        # doesn't -- a real, accepted asymmetry, see the comment in model.py's forward()).
+        self._grad_aggregate = bool(cfg.get("train", {}).get("grad_supervision_aggregate", False))
+        # chunk size for the aggregation step's "vis" read (see _precompute_grad_targets) --
+        # null/unset means no chunking (read the full array in one shot).
+        self._grad_agg_chunk_size = cfg.get("train", {}).get("grad_target_agg_chunk_size", 20000)
+        if self._grad_keys:
+            self._precompute_grad_targets()
+
         # Precompute all targets on device (GPU or CPU)
         if self._on_gpu or not lazy:
             self._precompute_targets()
+
+    def _grad_cache_meta(self):
+        """Meta dict identifying exactly which config choices affect the cached per-(voxel,
+        PMT) grad-frob targets -- anything here changing must invalidate a cache computed under
+        the old value. See load_grad_frob_cache/save_grad_frob_cache in sirentv.utils.misc."""
+        from sirentv.utils.misc import GRAD_CACHE_FORMAT_VERSION
+
+        xform_cfg = self.cfg.get("transform_vis", {})
+        plib_cfg = self.cfg.get("compressed_plib", self.cfg.get("photonlib", {}))
+        return {
+            "format_version": GRAD_CACHE_FORMAT_VERSION,
+            "lut_filepath": plib_cfg.get("filepath"),
+            "total_voxels": len(self._plib),
+            "n_photon": self._n_photon,
+            "xform_vmax": xform_cfg.get("vmax", 1.0),
+            "xform_eps": xform_cfg.get("eps", 1e-8),
+            "xform_sin_out": xform_cfg.get("sin_out", False),
+            "normalize_coeffs": self._normalize_coeffs,
+            "coeff_weight_power": plib_cfg.get("weight_power", 1) if self._normalize_coeffs else None,
+            "n_components": self._plib._n_components,
+            "n_projections": self._grad_n_projections,
+            "seed": 0,
+        }
+
+    def _precompute_grad_targets(self):
+        """One-time finite-difference gradient-target precomputation, cached in self._grad_targets
+        (dataset-local order, matching self.indices) for whichever keys are requested. Computed
+        EXACTLY at native grid resolution via a chunked Hutchinson random-projection read (see
+        compute_grad_frob_target_exact_projected) -- reads the full volume in chunks, but never
+        materializes more than one chunk's raw (chunk, n_pmt, K) slice in memory at once,
+        regardless of K.
+
+        The expensive per-(voxel, PMT) part (before any visibility-weighted aggregation) is
+        cached to train.grad_target_cache_file if set, keyed on the exact config choices that
+        affect it (see _grad_cache_meta) -- computed/cached over ALL voxels of the source LUT
+        regardless of this run's own self.indices, so one cache file is reusable across
+        differently-subsampled runs. See sirentv/scripts/precompute_grad_frob_targets.py to
+        populate this once, offline (optionally on GPU via train.grad_target_device), instead of
+        paying this cost at the start of every training/eval run."""
+        from sirentv.utils.misc import (
+            compute_grad_frob_target_exact_projected, load_grad_frob_cache, save_grad_frob_cache,
+        )
+
+        idx = self.indices.numpy()
+        n_pmt = self._plib._n_pmts
+        total_voxels = len(self._plib)
+        cache_file = self.cfg.get("train", {}).get("grad_target_cache_file")
+        meta = self._grad_cache_meta()
+
+        cached = load_grad_frob_cache(cache_file, self._grad_keys, meta)
+        if cached is not None:
+            print(f"[CompressedPLibDataset] loaded EXACT target spatial-gradient for "
+                  f"{self._grad_keys} from cache: {cache_file}")
+            full_targets = cached
+        else:
+            # compute over ALL voxels (not just self.indices) so the cache stays valid for any
+            # future run's own subsampling -- see _grad_cache_meta's docstring
+            full_idx = np.arange(total_voxels)
+            pos_np = self._plib.pos[full_idx]
+
+            # TWO different validity criteria, deliberately not the same mask:
+            # - valid_per_pmt (used for "coeffs"): a (voxel, PMT) pair with zero visibility to THAT
+            #   SPECIFIC PMT has no real waveform, so its coeffs can be NaN or otherwise meaningless
+            #   -- must be skipped as a NEIGHBOR in the finite difference, or it corrupts an
+            #   adjacent real voxel's derivative. This is fundamentally per-(voxel, PMT): a voxel
+            #   can be valid for one PMT and invalid for another (occluded, out of view, etc.).
+            # - valid_agg (used for "v"): visibility=0 to one specific PMT is a real, physically
+            #   meaningful value there (a shadowed/occluded region, not missing data) -- using
+            #   valid_per_pmt for "v" would wrongly treat most of the volume as "invalid" for
+            #   whichever PMT doesn't see it, degrading its gradient almost everywhere. "v" only
+            #   needs the much rarer, genuinely-undefined case: zero visibility to EVERY PMT at
+            #   once (inside a PMT's own solid body).
+            # Both computed once here, chunked for the same reason the aggregation step below
+            # chunks its "vis" read.
+            n = total_voxels
+            chunk_size = self._grad_chunk_size if self._grad_chunk_size is not None else n
+            valid_per_pmt = np.empty((n, n_pmt), dtype=bool)
+            for s in range(0, n, chunk_size):
+                e = min(s + chunk_size, n)
+                vis_chunk = self._plib[full_idx[s:e]]["vis"].numpy()
+                valid_per_pmt[s:e] = vis_chunk > 0
+            valid_agg = valid_per_pmt.any(axis=1)
+
+            def read_v(chunk_idx):
+                d = self._plib[full_idx[chunk_idx]]
+                vis_norm = d["vis"].float() / self._n_photon
+                return self._xform_vis(vis_norm).numpy()[:, :, None]  # (chunk, n_pmt, 1)
+
+            def read_coeffs(chunk_idx):
+                d = self._plib[full_idx[chunk_idx]]
+                coeffs = d["coeffs"].float()
+                if self._normalize_coeffs:
+                    coeffs = self._plib.normalize_coeffs(coeffs)
+                # defense-in-depth: valid_mask (above) is what actually prevents these voxels'
+                # values from corrupting a neighbor's derivative; this just keeps any NaN here from
+                # also leaking into diagnostics/logging that don't go through the masked path.
+                coeffs = torch.nan_to_num(coeffs, nan=0.0)
+                return coeffs.numpy()  # (chunk, n_pmt, K)
+
+            grad_target_device = self.cfg.get("train", {}).get("grad_target_device")
+            # caps the (N, n_pmt, batch) projected-array memory regardless of n_projections --
+            # see compute_grad_frob_target_exact_projected's projection_batch_size docstring for
+            # why this matters (n_projections=100 without batching is a ~52GB array for the
+            # full dualpca LUT and silently OOM-kills the process). Default 10 matches the
+            # n_projections value this was already known to run safely at.
+            grad_target_projection_batch_size = self.cfg.get("train", {}).get("grad_target_projection_batch_size", 10)
+            full_targets = {}
+            if "v" in self._grad_keys:
+                print("[CompressedPLibDataset] computing EXACT target spatial-gradient (v) ...")
+                full_targets["v"] = compute_grad_frob_target_exact_projected(
+                    pos_np, read_v, n_pmt=n_pmt, n_channels=1, n_projections=1,
+                    chunk_size=self._grad_chunk_size, valid=valid_agg, device=grad_target_device,
+                )
+            if "coeffs" in self._grad_keys:
+                print(f"[CompressedPLibDataset] computing EXACT target spatial-gradient (coeffs) "
+                      f"via {self._grad_n_projections} random projections ...")
+                full_targets["coeffs"] = compute_grad_frob_target_exact_projected(
+                    pos_np, read_coeffs, n_pmt=n_pmt, n_channels=self._plib._n_components,
+                    n_projections=self._grad_n_projections, chunk_size=self._grad_chunk_size,
+                    valid=valid_per_pmt, device=grad_target_device,
+                    projection_batch_size=grad_target_projection_batch_size,
+                )
+
+            if cache_file:
+                print(f"[CompressedPLibDataset] caching EXACT target spatial-gradient for "
+                      f"{self._grad_keys} to {cache_file}")
+                save_grad_frob_cache(cache_file, full_targets, meta)
+
+        self._grad_targets = {k: torch.from_numpy(np.asarray(v)[idx]).float() for k, v in full_targets.items()}
+
+        if self._grad_aggregate:
+            print("[CompressedPLibDataset] aggregating gradient targets across PMTs "
+                  "(visibility-weighted) ...")
+            # chunked, like compute_coeff_stats -- a full-array self._plib[idx]["vis"] read
+            # (~500MB-1GB for ~1.6M voxels x 81 pmts) was enough to OOM here even though "vis"
+            # is the smallest field in this file, so the available headroom is evidently much
+            # tighter than that; never materialize more than one chunk's worth at a time.
+            # grad_target_agg_chunk_size: null/unset -> no chunking (one shot, old behavior).
+            n = len(idx)
+            chunk_size = self._grad_agg_chunk_size if self._grad_agg_chunk_size is not None else n
+            aggregated = {key: torch.empty(n, dtype=torch.float32) for key in self._grad_targets}
+            for s in range(0, n, chunk_size):
+                e = min(s + chunk_size, n)
+                vis_chunk = self._plib[idx[s:e]]["vis"].float() / self._n_photon  # (chunk, n_pmt)
+                for key, per_pmt in self._grad_targets.items():
+                    # per_pmt is already the SQUARED per-(voxel, PMT) Frobenius norm (see
+                    # compute_grad_frob_target's docstring) -- aggregating across PMTs is then
+                    # just the visibility-weighted SUM, no re-squaring and no final sqrt, to
+                    # match compute_grad_frob_hutchinson_aggregate's own squared-domain
+                    # convention on the prediction side (see loss/grad_frob.py).
+                    aggregated[key][s:e] = (vis_chunk * per_pmt[s:e]).sum(dim=1)
+            self._grad_targets = aggregated
 
     def _precompute_targets(self):
         """Precompute and store all transformed targets on self._device."""
@@ -508,16 +730,24 @@ class CompressedPLibDataset(Dataset):
     def __getitem__(self, idx):
         if hasattr(self, "_v"):
             # Precomputed path (GPU or eager CPU)
+            target = {
+                "v": self._v[idx],
+                "t0": self._t0[idx],
+                "coeffs": self._coeffs[idx],
+            }
+            if self._normalize_coeffs:
+                # per-component loss weight (see compute_coeff_stats) -- (1, K), same for every
+                # sample, broadcasts against coeffs' (n_pmts, K) shape once collated to (B, 1, K)
+                target["coeffs_weight"] = self._plib.coeff_weight.unsqueeze(0).cpu()
+            for key in self._grad_keys:
+                target[f"{key}_grad_frob"] = self._grad_targets[key][idx]
             return {
                 "position": self._pos[idx],
-                "target": {
-                    "v": self._v[idx],
-                    "t0": self._t0[idx],
-                    "coeffs": self._coeffs[idx],
-                },
+                "target": target,
                 "meta": {
                     "v_linear": self._vis_raw[idx],
                     "t0_raw": self._t0_raw[idx],
+                    "voxel_id": self.indices[idx],
                 },
             }
 
@@ -536,16 +766,23 @@ class CompressedPLibDataset(Dataset):
         v = self._xform_vis(vis_norm)
         t0 = torch.log(t0_raw.clamp(min=1e-3))
 
+        target = {
+            "v": v,
+            "t0": t0,
+            "coeffs": coeffs,
+        }
+        if self._normalize_coeffs:
+            target["coeffs_weight"] = self._plib.coeff_weight.unsqueeze(0).cpu()
+        for key in self._grad_keys:
+            target[f"{key}_grad_frob"] = self._grad_targets[key][idx]
+
         return {
             "position": pos,
-            "target": {
-                "v": v,
-                "t0": t0,
-                "coeffs": coeffs,
-            },
+            "target": target,
             "meta": {
                 "v_linear": vis_raw,
                 "t0_raw": t0_raw,
+                "voxel_id": self.indices[idx],
             },
         }
 
