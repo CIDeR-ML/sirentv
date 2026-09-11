@@ -1,17 +1,22 @@
 compressed_plib:
-    filepath: /sdf/data/neutrino/youngsam/compressed_plib_b04_quantile_log_n50.h5
+    filepath: /sdf/data/neutrino/youngsam/compressed_plib_b05_quantile_log_prod_lite_n50.h5
     lazy: true
     n_components: 50
-    n_photon: 1.5e7
+    n_photon: 3.0e7
     device: cpu
     normalize_coeffs: false
     evr_weight_coeffs: false
+# eval-only: true (uncompressed) quantile function, for measuring the PCA-reconstruction
+# ceiling (compressed target vs. raw) separately from model error. Ignored by training.
+raw_quantile_plib:
+    filepath: /sdf/data/neutrino/pubdata/lut/optical/consolidated/full_wvfm_plib_b05_quantile_prod_lite_fixed.h5
+    mode: quantile
 physics:
     R_index: 1.233
 device:
     type: cuda
 model:
-  ckpt_file: null
+  ckpt_file: /sdf/data/neutrino/junjie/SIREN/cider-ml/logs/logs_pca_81_dual/latest.ckpt
   mode: pca_cdf
   network:
     type: DualPcaSiren
@@ -52,11 +57,16 @@ data:
 logger:
     type: wandb
     entity: junjiex-stanford-university
-    dir_name: logs_pca_81
+    run_dir: /sdf/data/neutrino/junjie/SIREN/cider-ml/logs
+    dir_name: logs_pca_81_dual
     file_name: log.csv
-    log_every_nsteps: 8
+    grad_norm:
+      enabled: true
+      log_per_layer: true
+      log_frequency: 77
+    log_every_nsteps: 77
     project: sirentv-pca-81
-    name: dualpca_siren_81_raw
+    name: dualpca_siren_81
     infer_fn:
       type: PCAInfer
     analysis:
@@ -74,6 +84,7 @@ logger:
         threshold: 1.0e-02
         signed: True
 train:
+    clip_grad: {vt0_net: 1.0, coeff_net: 1.0}
     loss:
       - type: WeightedL2Loss
         key: coeffs
