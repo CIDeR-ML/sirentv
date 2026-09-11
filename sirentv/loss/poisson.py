@@ -19,9 +19,7 @@ class WeightedPoissonNLLLoss(nn.Module):
     train_sirentv_81_dualpca_poisson.yaml). Leave both None to use pred[key]/target[key] as-is.
 
     The reported loss also subtracts the p-INDEPENDENT floor value the NLL takes at the true
-    optimum p=t: n*(t - t*log(t)). This is exactly the (constant-factor-of-2-dropped) Poisson
-    deviance, D = n*[(p - t) - t*log(p/t)], which is convex, always >= 0, and zero exactly at
-    p=t -- subtracting a p-independent term changes neither the gradient nor the optimum, only
+    optimum p=t: n*(t - t*log(t)) -- subtracting a p-independent term changes neither the gradient nor the optimum, only
     the reported/logged magnitude, so the loss actually approaches 0 near convergence instead of
     sitting at a large, target-dependent, uninformative constant that swamps other loss terms
     under `reduction: sum`.
@@ -69,9 +67,6 @@ class WeightedPoissonNLLLoss(nn.Module):
         # poisson nll without constant term: lambda - k * log(lambda)
         nll = pred_lin - target_val * torch.log(pred_lin)
         # p-independent floor at p=target_val -- target_val*log(target_clamped) is 0 (not NaN)
-        # when target_val==0, since the eps clamp only affects the argument of log(), not the
-        # target_val multiplier in front of it (0 * log(eps) = 0, the standard 0*log(0):=0
-        # convention)
         floor = target_val - target_val * torch.log(target_clamped)
         loss = scale * (nll - floor)
         if self.full:
