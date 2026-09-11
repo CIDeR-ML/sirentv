@@ -12,6 +12,7 @@ def _register_all_datasets():
     """Import dataset modules so they register with the DATASETS registry."""
     import sirentv.data.io  # noqa: F401 — registers PLibDataset
     import sirentv.data.compressed  # noqa: F401 — registers CompressedPLibDataset
+    import sirentv.data.quantile  # noqa: F401 — registers QuantilePLibDataset
 
 
 def build_dataset(cfg, rank=0, world_size=1):
