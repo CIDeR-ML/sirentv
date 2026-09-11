@@ -53,8 +53,12 @@ class WandbLogger(Logger):
         self._log_every_nsteps = log_cfg.get("log_every_nsteps", 1)
 
         if self.rank == 0:
-            self._logdir = self.make_logdir(log_cfg.get("dir_name", "logs"))
-            self._wandb_rundir = log_cfg.get("run_dir", "./")
+            run_dir = log_cfg.get("run_dir", "./")
+            dir_name = log_cfg.get("dir_name", "logs")
+            if not os.path.isabs(dir_name):
+                dir_name = os.path.join(run_dir, dir_name)
+            self._logdir = self.make_logdir(dir_name)
+            self._wandb_rundir = run_dir
             self._logfile = os.path.join(self._logdir, cfg.get("file_name", "log.csv"))
         else:
             self._logdir = None
@@ -209,27 +213,39 @@ class WandbLogger(Logger):
         v_target = visibility[:, 0]
         v_pred = visibility[:, 1]
         pos_mask = (v_target > 0) & (v_pred > 0)
-        ax.scatter(v_target[pos_mask], v_pred[pos_mask], s=10, alpha=0.6, zorder=3)
+        if not pos_mask.any():
+            # v_target is fixed ground truth for this diagnostic voxel, so this can only mean
+            # v_pred is non-positive (or NaN, which also fails ">0") for EVERY PMT here -- a
+            # real, worth-knowing-about model issue, but this plot is a monitoring aid, not the
+            # training loop itself: crashing the whole run (and losing everything trained so
+            # far) over a diagnostic plot failing is strictly worse than just skipping this one
+            # plot and letting training continue.
+            print(f"[WandbLogger.plot] iteration {iteration}: skipping visibility plot, "
+                  f"no (target, pred) pair is both positive (v_pred range "
+                  f"[{np.nanmin(v_pred):.3g}, {np.nanmax(v_pred):.3g}] -- check for NaN/collapse)")
+            ax.set_title(f"PMT Visibility (skipped: v_pred non-positive/NaN for every PMT)")
+        else:
+            ax.scatter(v_target[pos_mask], v_pred[pos_mask], s=10, alpha=0.6, zorder=3)
 
-        vmin = min(v_target[pos_mask].min(), v_pred[pos_mask].min()) * 0.5
-        vmax = max(v_target[pos_mask].max(), v_pred[pos_mask].max()) * 2.0
-        t_line = np.array([vmin, vmax])
-        ax.plot(t_line, t_line, 'k-', alpha=0.8, lw=1, label="y=x")
-        for bias_pct, color, ls in [(5, "green", "--"), (10, "orange", ":")]:
-            b = bias_pct / 100.0
-            upper = t_line * (2 + b) / (2 - b)
-            lower = t_line * (2 - b) / (2 + b)
-            ax.fill_between(t_line, lower, upper, alpha=0.10, color=color,
-                            label=f"\u00b1{bias_pct}% bias")
-        ax.set_xscale("log")
-        ax.set_yscale("log")
-        ax.set_xlim(vmin, vmax)
-        ax.set_ylim(vmin, vmax)
-        ax.set_xlabel("Target Visibility")
-        ax.set_ylabel("Predicted Visibility")
-        ax.set_title(f"PMT Visibility\n{subtitle}" if subtitle else "PMT Visibility")
-        ax.legend()
-        ax.grid(True, alpha=0.3)
+            vmin = min(v_target[pos_mask].min(), v_pred[pos_mask].min()) * 0.5
+            vmax = max(v_target[pos_mask].max(), v_pred[pos_mask].max()) * 2.0
+            t_line = np.array([vmin, vmax])
+            ax.plot(t_line, t_line, 'k-', alpha=0.8, lw=1, label="y=x")
+            for bias_pct, color, ls in [(5, "green", "--"), (10, "orange", ":")]:
+                b = bias_pct / 100.0
+                upper = t_line * (2 + b) / (2 - b)
+                lower = t_line * (2 - b) / (2 + b)
+                ax.fill_between(t_line, lower, upper, alpha=0.10, color=color,
+                                label=f"\u00b1{bias_pct}% bias")
+            ax.set_xscale("log")
+            ax.set_yscale("log")
+            ax.set_xlim(vmin, vmax)
+            ax.set_ylim(vmin, vmax)
+            ax.set_xlabel("Target Visibility")
+            ax.set_ylabel("Predicted Visibility")
+            ax.set_title(f"PMT Visibility\n{subtitle}" if subtitle else "PMT Visibility")
+            ax.legend()
+            ax.grid(True, alpha=0.3)
         plt.tight_layout()
 
         # --- PDF plot ---
@@ -422,7 +438,11 @@ class CSVLogger(Logger):
         log_cfg = cfg.get("logger", dict())
         self._log_every_nsteps = log_cfg.get("log_every_nsteps", 10)
         if self.rank == 0:
-            self._logdir = self.make_logdir(log_cfg.get("dir_name", "logs"))
+            run_dir = log_cfg.get("run_dir", "./")
+            dir_name = log_cfg.get("dir_name", "logs")
+            if not os.path.isabs(dir_name):
+                dir_name = os.path.join(run_dir, dir_name)
+            self._logdir = self.make_logdir(dir_name)
             self._logfile = os.path.join(self._logdir, cfg.get("file_name", "log.csv"))
             print("[CSVLogger] output log directory:", self._logdir)
             print(f"[CSVLogger] recording a log every {self._log_every_nsteps} steps")
