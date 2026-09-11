@@ -51,7 +51,26 @@ def train(cfg: dict):
     net = SirenTV(cfg).to(DEVICE)
     if is_distributed:
         net = create_ddp_model(net, device_ids=[local_rank])
-    net = torch.compile(net)
+    # torch.compile's default (inductor/AOTAutograd) backend generates a fixed, non-further-
+    # differentiable backward for whatever it compiles -- that limitation lives on the tensor
+    # produced by the compiled forward call itself, not on the code that later calls
+    # torch.autograd.grad(..., create_graph=True) on it (compute_grad_frob_hutchinson[_aggregate],
+    # used for gradient supervision), so a narrow dynamo.disable() around just that helper
+    # wouldn't fix it -- the disable would need to cover SirenTV's own net(...) call, for the
+    # specific step(s) where grad_keys is active. Every grad-supervision config gives "v" a
+    # warmup of 0, so grad_keys is truthy from iteration 1 onward and stays that way for the
+    # rest of training -- there's no "mostly compiled, occasionally eager" regime available
+    # here, so we just skip compilation entirely for these runs rather than adding a redundant
+    # eager forward pass that would provide no practical benefit given warmup=0.
+    _has_grad_supervision = bool(cfg.get("train", {}).get("grad_supervision_keys", []))
+    if _has_grad_supervision:
+        if rank == 0:
+            print("[train] grad_supervision_keys configured -- skipping torch.compile (its "
+                  "AOTAutograd backend does not support the double backward gradient "
+                  "supervision needs, and grad_keys is active from iteration 1 onward here "
+                  "anyway since v's warmup is 0, so compile would never actually engage)")
+    else:
+        net = torch.compile(net)
 
     # --- Data (registry-based, config-driven) ---
     dl = create_dataloader(cfg, rank=rank, world_size=world_size)
@@ -82,7 +101,10 @@ def train(cfg: dict):
 
     # --- Training hyperparameters ---
     train_cfg = cfg.get("train", {})
-    epoch_max = train_cfg.get("max_epochs", int(1e20))
+    # max_epochs is epochs to run in *this* session, not an absolute/accumulated target --
+    # add the resumed starting epoch so a resumed run doesn't immediately exit (or silently
+    # run fewer epochs than requested) just because epoch_ctr already starts above 0
+    epoch_max = epoch_ctr + train_cfg.get("max_epochs", int(1e20))
     iteration_max = train_cfg.get("max_iterations", int(1e20))
     save_every_iterations = train_cfg.get("save_every_iterations", -1)
     save_every_epochs = train_cfg.get("save_every_epochs", -1)
@@ -104,6 +126,40 @@ def train(cfg: dict):
 
     # Unwrap model once (stable for lifetime of training)
     net_module = unwrap_net(net)
+
+    # Output keys to compute a Hutchinson-estimated spatial-gradient-magnitude for, on top of
+    # the model's normal outputs -- consumed by a matching *_grad_frob loss term (see
+    # WeightedGradFrobLoss). Empty by default. Two forms accepted:
+    #   grad_supervision_keys: ["v", "coeffs"]              # plain list, no warmup (epoch 0+)
+    #   grad_supervision_keys: {v: 0, coeffs: 100}           # per-key warmup (epoch it starts)
+    # A per-key warmup matters because the aggregate estimator (see
+    # compute_grad_frob_hutchinson_aggregate) weights by the model's OWN predicted visibility --
+    # for "v" itself that's self-referential and fine from the start, but for "coeffs"/
+    # "quantiles" it means the aggregation is weighted by a visibility prediction that's
+    # essentially untrained early on, actively misdirecting which PMTs the gradient loss
+    # emphasizes until v has had time to converge. Skipping the key entirely below its warmup
+    # (rather than computing it and discarding the loss) also skips its backward passes.
+    _grad_supervision_keys_cfg = train_cfg.get("grad_supervision_keys", [])
+    if isinstance(_grad_supervision_keys_cfg, dict):
+        grad_supervision_warmup = {k: int(v) for k, v in _grad_supervision_keys_cfg.items()}
+    else:
+        grad_supervision_warmup = {k: 0 for k in _grad_supervision_keys_cfg}
+    # whether the warmup values above count in epochs (compared against epoch_ctr) or raw
+    # optimizer steps (compared against iteration_ctr) -- epochs are a config-independent,
+    # dataset-size-independent unit but iterations give finer-grained control when an epoch is
+    # very long.
+    grad_supervision_warmup_unit = train_cfg.get("grad_supervision_warmup_unit", "epoch")
+    assert grad_supervision_warmup_unit in ("epoch", "iteration"), (
+        f"grad_supervision_warmup_unit must be 'epoch' or 'iteration', got {grad_supervision_warmup_unit!r}"
+    )
+    # per-PMT granularity (default) does O(n_pmts) backward passes per grad_supervision_keys
+    # entry and can OOM regardless of channel count -- set true to fall back to a single
+    # visibility-weighted aggregate over all PMTs (O(1) backward passes), trading away per-PMT
+    # granularity. See compute_grad_frob_hutchinson_aggregate.
+    grad_supervision_aggregate = bool(train_cfg.get("grad_supervision_aggregate", False))
+    # tracks which grad_supervision_keys have already had their warmup-complete message printed,
+    # so each key announces exactly once (the moment it first becomes active) rather than every step.
+    _grad_supervision_announced = set()
 
     # Physics constants for t0 computation (if applicable)
     tick_size = cfg.get("photonlib", {}).get("time_tick_size", 0.1)
@@ -156,6 +212,19 @@ def train(cfg: dict):
                 fwd_kwargs = {}
                 if data.get("return_gradients", False):
                     fwd_kwargs["return_gradients"] = True
+                _warmup_progress = epoch_ctr if grad_supervision_warmup_unit == "epoch" else iteration_ctr
+                active_grad_keys = [k for k, warmup in grad_supervision_warmup.items() if _warmup_progress >= warmup]
+                if rank == 0:
+                    for k in active_grad_keys:
+                        if k not in _grad_supervision_announced:
+                            _grad_supervision_announced.add(k)
+                            print(
+                                f"[train] gradient supervision on '{k}' starts now "
+                                f"(warmup={grad_supervision_warmup[k]} {grad_supervision_warmup_unit}s passed)"
+                            )
+                if active_grad_keys:
+                    fwd_kwargs["grad_keys"] = active_grad_keys
+                    fwd_kwargs["grad_aggregate"] = grad_supervision_aggregate
                 pred = net(x, **fwd_kwargs)
 
                 if torch.cuda.is_available():
@@ -320,6 +389,18 @@ def main():
         default=False,
         help="Enable Weights & Biases logging (default: off, uses CSV)",
     )
+    parser.add_argument(
+        "--debug-timing",
+        action="store_true",
+        default=False,
+        help="Log per-field dataset read timing (currently QuantilePLib only)",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        default=False,
+        help="Override train.resume=True (restores optimizer/scheduler/epoch state from model.ckpt_file)",
+    )
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -327,6 +408,11 @@ def main():
 
     if not args.wandb:
         cfg.setdefault("logger", {})["type"] = "csv"
+
+    cfg["debug_timing"] = args.debug_timing
+
+    if args.resume:
+        cfg.setdefault("train", {})["resume"] = True
 
     train(cfg)
 

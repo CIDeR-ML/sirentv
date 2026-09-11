@@ -246,3 +246,104 @@ class PCAInfer:
 
         net_module.unfreeze_all()
         return output
+
+
+@INFER_FNS.register_module()
+class QuantileInfer:
+    """Quantile-mode inference for WandB plotting."""
+
+    def __init__(self, cfg, net=None, dl=None, device=None, **kwargs):
+        import h5py
+        from sirentv.data.quantile import QuantilePLib
+
+        plib_cfg = cfg.get("quantile_plib", cfg.get("photonlib", {}))
+        filepath = plib_cfg["filepath"]
+        mode = plib_cfg.get("mode", "quantile")
+        combine_every_quantile = plib_cfg.get("combine_every_quantile", 1)
+
+        self._qlib = QuantilePLib.load(
+            filepath, lazy=True, mode=mode, combine_every_quantile=combine_every_quantile,
+        )
+        with h5py.File(filepath, "r") as f:
+            self._u_grid = f["u_grid"][::combine_every_quantile].astype("float32")
+
+        if dl is not None:
+            plot_sample = dl.dataset[0]
+            self._plot_x = plot_sample["position"].unsqueeze(0).to(device)
+            self._plot_target = {k: v.unsqueeze(0).to(device) for k, v in plot_sample["target"].items()}
+            self._plot_meta = {k: v.unsqueeze(0).to(device) for k, v in plot_sample.get("meta", {}).items()}
+        else:
+            self._plot_x = None
+            self._plot_target = None
+            self._plot_meta = None
+
+    def __call__(self, net, x, target, meta=None):
+        if self._plot_x is None:
+            return None
+        try:
+            return self._infer_quantile_plot(net, self._plot_x, self._plot_target)
+        except Exception as e:
+            print(f"[QuantileInfer] Warning: plot inference failed (likely early training): {e}")
+            return None
+
+    def log_step(self, pred, target, net, meta=None):
+        net_module = unwrap_net(net)
+        pred_log = dict(pred)
+        target_log = dict(target)
+        pred_log["v_linear"] = net_module._inv_xform_vis(pred["v"])
+        target_log["v_linear"] = net_module._inv_xform_vis(target["v"])
+        return target_log, pred_log
+
+    def cleanup(self, net, dl, logger, rank):
+        self._qlib.close()
+
+    def _infer_quantile_plot(self, net, x, target, batch_id=0, pmt_id=40):
+        """Reconstruct CDF/PDF from quantile predictions for plotting."""
+        net_module = unwrap_net(net)
+        net_module.freeze_all()
+
+        with torch.no_grad():
+            pred = net_module(x)
+        pred_quantiles = pred["quantiles"]
+        pred_log_t0 = pred["t0"]
+        pred_v = pred["v"]
+
+        pred_v_linear = net_module._inv_xform_vis(pred_v[batch_id, :])
+        target_v_linear = net_module._inv_xform_vis(target["v"][batch_id, :].to(pred_v.device))
+
+        pred_q = pred_quantiles[batch_id:batch_id + 1, :, :]
+        target_q = target["quantiles"][batch_id:batch_id + 1, :, :].to(pred_quantiles.device)
+
+        pred_cdf = self._qlib.reconstruct_aligned_cdf(self._u_grid, pred_q)
+        target_cdf = self._qlib.reconstruct_aligned_cdf(self._u_grid, target_q)
+
+        pred_t0_ns = torch.exp(pred_log_t0[batch_id:batch_id + 1, :])
+        if self._plot_meta is not None and "t0_raw" in self._plot_meta:
+            target_t0_ns = self._plot_meta["t0_raw"][batch_id:batch_id + 1, :].to(pred_quantiles.device)
+        else:
+            target_t0_ns = torch.exp(target["t0"][batch_id:batch_id + 1, :]).to(pred_quantiles.device)
+
+        tick_ns = self._qlib._t_max_ns / self._qlib._n_bins
+        pred_cdf_pmt = pred_cdf[0, pmt_id, :]
+        target_cdf_pmt = target_cdf[0, pmt_id, :]
+
+        pred_pdf = cdf_to_pdf(pred_cdf_pmt, tick_ns)
+        target_pdf = cdf_to_pdf(target_cdf_pmt, tick_ns)
+
+        t_window = torch.arange(0, pred_pdf.shape[-1]) * tick_ns
+
+        pred_t0_val = pred_t0_ns[0, pmt_id]
+        target_t0_val = target_t0_ns[0, pmt_id].to(pred_t0_val.device)
+        t0s = torch.stack([target_t0_val, pred_t0_val], dim=-1)
+
+        output = {
+            "x_value": t_window,
+            "visibility": torch.stack([target_v_linear, pred_v_linear], dim=-1),
+            "pdf": torch.stack([target_pdf, pred_pdf], dim=-1),
+            "cdf": torch.stack([target_cdf_pmt, pred_cdf_pmt], dim=-1),
+            "t0": t0s,
+            "position": x[batch_id] if x.dim() > 1 else x,
+        }
+
+        net_module.unfreeze_all()
+        return output
