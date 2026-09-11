@@ -17,8 +17,8 @@ class DualPcaSiren(nn.Module):
         hidden_layers: List[int] | int = [3, 3],
         n_components: int = 50,
         outermost_linear: bool = True,
-        first_omega_0: float = 30.0,
-        hidden_omega_0: float = 30.0,
+        first_omega_0: List[float] | float = 30.0,
+        hidden_omega_0: List[float] | float = 30.0,
         **kwargs,
     ):
         super().__init__()
@@ -26,6 +26,19 @@ class DualPcaSiren(nn.Module):
             hidden_features = [hidden_features, hidden_features]
         if isinstance(hidden_layers, int):
             hidden_layers = [hidden_layers, hidden_layers]
+        # same [vt0_branch, coeff_branch] convention as hidden_features/hidden_layers above --
+        # a bare scalar still applies uniformly to both branches (backward compatible with
+        # every existing config), a 2-element list lets them differ. Added specifically to test
+        # whether coeff_net's steep-near-PMT/flat-far-field fitting difficulty is a SIREN
+        # bandwidth limit (see loss/grad_frob.py's dynamic_weight docstring and the
+        # ex-junjie.ipynb investigation) -- raising omega_0 raises the range of spatial
+        # frequencies the branch can represent, at the cost of needing a cleaner signal
+        # (dynamic_weight, or a longer warmup) to avoid that extra bandwidth manifesting as
+        # ringing in the (otherwise smooth) far field instead.
+        if isinstance(first_omega_0, (int, float)):
+            first_omega_0 = [first_omega_0, first_omega_0]
+        if isinstance(hidden_omega_0, (int, float)):
+            hidden_omega_0 = [hidden_omega_0, hidden_omega_0]
 
         self.n_components = n_components
         self.out_features = [2, n_components]
@@ -36,8 +49,8 @@ class DualPcaSiren(nn.Module):
             hidden_layers[0],
             2,  # vis + log_t0
             outermost_linear,
-            first_omega_0,
-            hidden_omega_0,
+            first_omega_0[0],
+            hidden_omega_0[0],
         )
 
         self.coeff_net = Siren(
@@ -46,8 +59,8 @@ class DualPcaSiren(nn.Module):
             hidden_layers[1] if len(hidden_layers) > 1 else hidden_layers[0],
             n_components,
             outermost_linear,
-            first_omega_0,
-            hidden_omega_0,
+            first_omega_0[1] if len(first_omega_0) > 1 else first_omega_0[0],
+            hidden_omega_0[1] if len(hidden_omega_0) > 1 else hidden_omega_0[0],
         )
 
     def forward(self, x, *args, **kwargs):
