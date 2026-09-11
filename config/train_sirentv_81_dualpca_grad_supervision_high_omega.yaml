@@ -1,0 +1,164 @@
+compressed_plib:
+    filepath: /sdf/data/neutrino/youngsam/compressed_plib_b05_quantile_log_prod_lite_n50.h5
+    lazy: true
+    n_components: 50
+    n_photon: &n_photon 3.0e7
+    device: cpu
+    normalize_coeffs: true
+    weight_power: 3.0 # power of the standard deviation for the coefficient weight. Default is 1.0, which is equivalent to u/sigma penalty loss. 0 is the same as unormalized L2 loss, and 2 is the as plain L2 loss on the normalized coeffs.
+    evr_weight_coeffs: false
+# eval-only: true (uncompressed) quantile function, for measuring the PCA-reconstruction
+# ceiling (compressed target vs. raw) separately from model error. Ignored by training.
+raw_quantile_plib:
+    filepath: /sdf/data/neutrino/pubdata/lut/optical/consolidated/full_wvfm_plib_b05_quantile_prod_lite_fixed.h5
+    mode: quantile
+physics:
+    R_index: 1.233
+device:
+    type: cuda
+model:
+  # deliberately no ckpt_file -- trains from scratch, so this is a clean ablation against the
+  # baseline dualpca run rather than a fine-tune on top of it
+  mode: pca_cdf
+  network:
+    type: DualPcaSiren
+    in_features: 6
+    hidden_features: [256, 512]   # [vt0_branch, coeff_branch]
+    hidden_layers: [6, 6]         # [vt0_branch, coeff_branch]
+    n_components: 50
+    outermost_linear: true
+    # [vt0_branch, coeff_branch] -- DualPcaSiren only just gained per-branch omega_0 support
+    # (previously a single scalar shared by both branches; added specifically for this
+    # ablation). ONLY coeff_net's omega_0 is raised here (2x): this directly tests whether
+    # coeff_net's persistent first/second-layer gradient plateau near clip_grad (see the
+    # per-layer grad-norm investigation that motivated per-branch clipping) is a SIREN
+    # bandwidth limit -- the near-PMT region needs much shorter spatial wavelengths than the
+    # smooth far field, and a single global omega_0 has to compromise between the two (see
+    # loss/grad_frob.py's dynamic_weight docstring for the full reasoning). If this is the real
+    # cause, raising omega_0 should sharpen near-PMT fit but risks introducing ringing/noise in
+    # the (otherwise smooth) far field -- watch for BOTH effects, not just whether the near-PMT
+    # bias improves, to actually test the hypothesis rather than just chase one metric.
+    # vt0_net's omega_0 is left at 30 (unchanged, no diagnosed bandwidth issue there) so this
+    # stays a single-variable ablation against train_sirentv_81_dualpca_grad_supervision_coeffs_only.yaml.
+    first_omega_0: [30.0, 60.0]
+    hidden_omega_0: [30.0, 60.0]
+  output_scale:
+    fix: true
+transform_vis:
+    vmax: 1.0
+    eps: 1.e-8
+    sin_out: false
+data:
+    n_pmt: 81
+    use_gradient_supervision: False  # legacy flag, unrelated to grad_supervision_keys below
+    weight:
+      coeffs:
+        enable: false
+      v:
+        enable: true
+        factor: 5000.0
+        threshold: 1.0e-08
+      t0:
+        enable: false
+    loader:
+      batch_size: 512
+      drop_last: true
+      num_workers: 4
+      pin_memory: true
+      shuffle: true
+      load_pos: true
+    dataset:
+      type: CompressedPLibDataset
+logger:
+    type: wandb
+    entity: junjiex-stanford-university
+    run_dir: /sdf/data/neutrino/junjie/SIREN/cider-ml/logs
+    dir_name: logs_pca_81_dual_grad_supervision_high_omega
+    file_name: log.csv
+    grad_norm:
+      enabled: true
+      log_per_layer: true
+      log_frequency: 77
+    log_every_nsteps: 77
+    project: sirentv-pca-81
+    name: dualpca_siren_81_grad_supervision_high_omega
+    infer_fn:
+      type: PCAInfer
+    analysis:
+      - func: bias
+        suffix: coeffs
+        key: coeffs
+        threshold: 1.0e-06
+      - func: bias
+        suffix: vis
+        key: v_linear
+        threshold: 1.0e-06
+      - func: abs_bias
+        suffix: t0
+        key: t0
+        threshold: 1.0e-02
+        signed: True
+train:
+    clip_grad: {vt0_net: 1.0, coeff_net: 3.0}
+    # ABLATION vs. train_sirentv_81_dualpca_grad_supervision_coeffs_only.yaml (this config's own
+    # baseline): the ONLY change here is coeff_net's omega_0 (see model.network above) --
+    # dynamic_weight is deliberately left OFF so this run isolates omega_0's own effect, not a
+    # combination of the two fixes.
+    grad_supervision_keys: {coeffs: 100}
+    grad_supervision_warmup_unit: epoch  # or "iteration", for finer-grained control
+    grad_supervision_aggregate: true  # per-PMT mode OOM'd; falling back to the visibility-weighted aggregate
+    grad_target_agg_chunk_size: 20000  # null = no chunking (one-shot read); lower this further if still tight on memory
+    # EXACT (native-resolution, no coarse-graining/subsampling) gradient target -- the earlier
+    # subsample_factor + near-wall-refine two-tier approximation had a real, confirmed
+    # systematic truncation-error bias at subsample_factor>1 that ensemble-averaging over many
+    # PMTs/voxels could NOT fix (confirmed via a flat, non-decreasing disagreement-vs-N curve).
+    # Multi-channel keys (coeffs/quantiles) are computed via a chunked Hutchinson random-
+    # projection (same trick as the prediction-side estimator, applied on the target side
+    # instead) so the full (N, n_pmt, K) array is never materialized -- see
+    # compute_grad_frob_target_exact_projected. n_projections=100 averages over 100 independent
+    # random directions (a single projection would be a biased, arbitrary-direction estimate
+    # baked in for the whole run, unlike the prediction side which gets a fresh one every step)
+    # -- picked from the ex-junjie.ipynb M-sweep as a good precision/cost tradeoff.
+    # Deliberately NOT shared with the prediction side: there, M projections would cost M
+    # backward passes/step (each projection needs its own torch.autograd.grad call), unlike
+    # here where M projections cost barely more than 1 (one np.gradient call handles any
+    # channel count) -- see compute_grad_frob_hutchinson's docstring for the full reasoning.
+    grad_target_n_projections: 100
+    grad_target_chunk_size: 20000  # coeffs is K=50: 20000*81*50*4 bytes ~= 324MB/chunk; null = no chunking (one-shot read)
+    # Same sidecar cache as train_sirentv_81_dualpca_grad_supervision.yaml (identical LUT/
+    # n_photon/xform/normalize_coeffs/weight_power/n_components/n_projections, so the meta
+    # matches exactly -- coeff_net's omega_0 does NOT affect the target, only the model, so this
+    # cache is still valid here): only the "coeffs" entry is read from it now
+    # (grad_supervision_keys no longer requests "v"), so this reuses the SAME cache file the
+    # "v"-included run already populated -- no need to regenerate anything.
+    grad_target_cache_file: /sdf/data/neutrino/junjie/SIREN/cider-ml/sirentv/grad_frob_cache/dualpca_n50_grad_frob.h5
+    loss:
+      - type: WeightedL2Loss
+        key: coeffs
+        weight: 1.0
+      - type: WeightedPoissonNLLLoss
+        key: v
+        weight: 1.0e-7
+      - type: SmoothL1Loss
+        key: t0
+        weight: 1.0
+      # unchanged from train_sirentv_81_dualpca_grad_supervision_coeffs_only.yaml -- this run
+      # isolates omega_0's own effect, not a re-tuned weight on top of it. Check logged
+      # magnitudes early anyway: a higher-omega_0 coeff_net may have a different natural
+      # grad_frob scale even before any fit-quality difference.
+      - type: WeightedGradFrobLoss
+        key: coeffs
+        weight: 1.0
+    regularization: null
+    reduction: sum
+    max_epochs: 2000
+    optimizer_class: AdamW
+    optimizer_param:
+      lr: 1.0e-05
+    resume: false
+    save_every_epochs: 100
+    save_every_iterations: -1
+    scheduler_class: CosineAnnealingLR
+    scheduler_param:
+      T_max: 2000
+      eta_min: 1.0e-07
