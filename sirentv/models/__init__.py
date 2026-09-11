@@ -7,3 +7,4 @@ from .conditional import ConditionalSiren
 from .parallel import ParallelSiren
 from .pca_siren import PcaSiren
 from .dual_pca_siren import DualPcaSiren
+from .quant_siren import QuantileSiren

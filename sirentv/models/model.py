@@ -14,7 +14,7 @@ from sirentv.data.compressed import CompressedPLib
 
 
 class SirenTV(nn.Module):
-    def __init__(self, cfg: dict, meta=None):
+    def __init__(self, cfg: dict, meta=None, weights_only: bool = False):
         super().__init__()
         self.config_model = cfg["model"]
         self.config_data = cfg["data"]
@@ -39,7 +39,7 @@ class SirenTV(nn.Module):
         if ckpt_file:
             print("[SirenTV] loading model_dict from checkpoint", ckpt_file)
             with open(ckpt_file, "rb") as f:
-                model_dict = torch.load(f, map_location="cpu")
+                model_dict = torch.load(f, map_location="cpu", weights_only=weights_only)
                 self.load_model_dict(model_dict)
             #return
 
@@ -48,9 +48,14 @@ class SirenTV(nn.Module):
             self._meta = meta
         elif "compressed_plib" in cfg:
             cplib_cfg = cfg["compressed_plib"]
+            # only .meta/.pmt_pos are used below, both read unconditionally at construction --
+            # lazy=True here never touches vis/t0/coeffs, so there's no reason this should ever
+            # eagerly pull the full (tens-of-GB) dataset into memory just to build positional
+            # metadata (this used to hardcode lazy=False and could OOM-kill a modest-memory
+            # process, e.g. a Jupyter kernel, for no benefit)
             cplib = CompressedPLib.load(
                 cplib_cfg["filepath"],
-                lazy=False,
+                lazy=True,
                 n_components=cplib_cfg.get("n_components"),
             )
             self._meta = cplib.meta
@@ -110,14 +115,45 @@ class SirenTV(nn.Module):
     def update_meta(self, ranges: torch.Tensor):
         self._meta.update(ranges)
 
-    def forward(self, x, return_gradients=False):
+    def forward(self, x, return_gradients=False, grad_keys=None, grad_aggregate=False, grad_create_graph=True,
+                grad_pmt_ids=None):
         """
         Parameters
         ----------
         x : torch.Tensor
             Input in unnormalized coordinates.
         return_gradients: bool
-            Whether to compute the visibility gradient in the forward
+            Whether to compute the visibility gradient in the forward (legacy path, used only
+            by BranchedSiren's own internal analytical-gradient computation).
+        grad_keys : list[str], optional
+            For each key in this list, additionally compute a `{key}_grad_frob` output: a
+            genuinely differentiable (create_graph=True by default) SQUARED Frobenius-norm
+            gradient magnitude of out[key] w.r.t. physical (unnormalized) position -- see
+            compute_grad_frob_hutchinson (squared, not the sqrt'd norm, so the estimator stays
+            unbiased at a single projection -- see WeightedGradFrobLoss's docstring for why).
+        grad_aggregate : bool
+            False (default): per-(voxel, PMT) granularity via compute_grad_frob_hutchinson --
+            O(n_pmts) backward passes per call, independent of channel count K, but n_pmts
+            itself (e.g. 81) can still OOM on some hardware. True: fall back to
+            compute_grad_frob_hutchinson_aggregate -- a single visibility-weighted aggregate
+            over all PMTs at once (O(1) backward passes total), trading away per-PMT
+            granularity for a much cheaper estimate. `{key}_grad_frob` becomes (n_valid,)
+            instead of (n_valid, n_pmts) in this mode.
+        grad_create_graph : bool
+            Passed straight through to compute_grad_frob_hutchinson[_aggregate]. True
+            (default) is required during training, where `{key}_grad_frob` feeds into a loss
+            that itself gets backpropagated. Pass False for a read-only use (e.g. a notebook
+            diagnostic that only wants the VALUES) -- PyTorch retains substantially more graph
+            structure per backward pass when this is True, so leaving it True when nothing
+            downstream differentiates through the result again is a real, avoidable memory
+            cost, particularly with grad_aggregate=False's O(n_pmts) backward passes per call.
+        grad_pmt_ids : list[int], optional
+            Only used when grad_aggregate=False. Restricts compute_grad_frob_hutchinson's
+            O(n_pmts) backward-pass loop to just these PMT indices -- e.g. a diagnostic that
+            only ever reads off one fixed PMT has no reason to pay for the other n_pmts-1
+            backward passes. None (default) computes every PMT, as training needs all of them.
+            `{key}_grad_frob` becomes (n_valid, len(grad_pmt_ids)) instead of (n_valid, n_pmts)
+            when set -- indexed in the SAME order as grad_pmt_ids, not by absolute PMT index.
         return_pdf : bool
             If True, return the PDF of the waveform. If False, return the CDF.
 
@@ -130,7 +166,13 @@ class SirenTV(nn.Module):
         #device = x.device
         pos = x.unsqueeze(0) if x.dim() == 1 else x
         mask = self.meta.contain(pos).to(self.device)
-        norm_pos = self.meta.norm_coord(pos[mask]).to(self.device)
+        pos_masked = pos[mask]
+        if grad_keys:
+            # fresh leaf, detached from whatever graph state x had -- position is a fixed model
+            # input, not a trainable parameter, so there's nothing upstream worth preserving;
+            # we only need d(output)/d(pos_masked) itself, not further backprop past it
+            pos_masked = pos_masked.detach().requires_grad_(True)
+        norm_pos = self.meta.norm_coord(pos_masked).to(self.device)
         if norm_pos.dim() == 1:
             norm_pos = norm_pos.unsqueeze(0)
         norm_pos = norm_pos.unsqueeze(1).expand(-1, self.n_pmts, -1)
@@ -140,6 +182,27 @@ class SirenTV(nn.Module):
             input_to_net = torch.cat([norm_pos, norm_pmt_tile], dim=-1)
 
         out = self.model(input_to_net, self.current_tau, return_gradients)
+
+        if grad_keys:
+            if grad_aggregate:
+                from sirentv.utils.misc import compute_grad_frob_hutchinson_aggregate
+                # predicted visibility (this forward pass's own, detached inside the estimator)
+                # is the only visibility signal available here -- target visibility isn't
+                # passed into forward() at all, so the target-side aggregate (computed offline
+                # by the dataset) uses TRUE visibility instead. A known, accepted asymmetry for
+                # this auxiliary loss -- see discussion at the call site in train.py/config.
+                vis_weight = self._inv_xform_vis(out["v"])
+                for key in grad_keys:
+                    out[f"{key}_grad_frob"] = compute_grad_frob_hutchinson_aggregate(
+                        pos_masked, out[key], vis_weight, create_graph=grad_create_graph,
+                    )
+            else:
+                from sirentv.utils.misc import compute_grad_frob_hutchinson
+                for key in grad_keys:
+                    out[f"{key}_grad_frob"] = compute_grad_frob_hutchinson(
+                        pos_masked, out[key], self.n_pmts, create_graph=grad_create_graph,
+                        pmt_ids=grad_pmt_ids,
+                    )
 
         result = {"correct_mask": mask}
         for key, val in out.items():
