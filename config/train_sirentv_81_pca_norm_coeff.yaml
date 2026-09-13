@@ -1,0 +1,111 @@
+compressed_plib:
+    filepath: /sdf/data/neutrino/youngsam/compressed_plib_b05_quantile_log_prod_lite_n50.h5
+    lazy: true
+    n_components: 50
+    n_photon: 3.0e7
+    device: cpu
+    normalize_coeffs: true
+    evr_weight_coeffs: false 
+    weight_power: 1.0 # power of the standard deviation for the coefficient weight. Default is 1.0, which is equivalent to u/sigma penalty loss. 0 is the same as unormalized L2 loss, and 2 is the as plain L2 loss on the normalized coeffs.
+# eval-only: true (uncompressed) quantile function, for measuring the PCA-reconstruction
+# ceiling (compressed target vs. raw) separately from model error. Ignored by training.
+raw_quantile_plib:
+    filepath: /sdf/data/neutrino/pubdata/lut/optical/consolidated/full_wvfm_plib_b05_quantile_prod_lite_fixed.h5
+    mode: quantile
+physics:
+    R_index: 1.233
+device:
+    type: cuda
+model:
+  ckpt_file: null
+  mode: pca_cdf
+  network:
+    type: PcaSiren
+    in_features: 6
+    hidden_features: 512
+    hidden_layers: 6
+    n_components: 50
+    outermost_linear: true
+    first_omega_0: 30.0
+    hidden_omega_0: 30.0
+  output_scale:
+    fix: true
+transform_vis:
+    vmax: 1.0
+    eps: 1.e-8
+    sin_out: false
+data:
+    n_pmt: 81
+    use_gradient_supervision: False  # Enable gradient precomputation
+    weight:
+      coeffs:
+        enable: false
+      v:
+        enable: true
+        factor: 5000.0
+        threshold: 1.0e-08
+      t0:
+        enable: false
+    loader:
+      batch_size: 512
+      drop_last: true
+      num_workers: 4
+      pin_memory: true
+      shuffle: true
+      load_pos: true
+    dataset:
+      type: CompressedPLibDataset
+logger:
+    type: wandb
+    entity: junjiex-stanford-university
+    run_dir: /sdf/data/neutrino/junjie/SIREN/cider-ml/logs
+    dir_name: /sdf/data/neutrino/junjie/SIREN/cider-ml/logs/logs_pca_81
+    file_name: log.csv
+    grad_norm:
+      enabled: true
+      log_per_layer: true
+      log_frequency: 77
+    log_every_nsteps: 77
+    project: sirentv-pca-81
+    name: pca_siren_81
+    infer_fn:
+      type: PCAInfer
+    analysis:
+      - func: bias
+        suffix: coeffs
+        key: coeffs
+        threshold: null
+      - func: bias
+        suffix: vis
+        key: v_linear
+        threshold: 1.0e-06
+      - func: abs_bias
+        suffix: t0
+        key: t0
+        threshold: 1.0e-02
+        signed: True
+train:
+  clip_grad: 1.0
+  loss:
+    - type: WeightedL2Loss
+      key: coeffs
+      weight: 1.0
+    - type: SmoothL1Loss
+      key: v
+      weight: 1.0
+    - type: SmoothL1Loss
+      key: t0
+      weight: 1.0
+  regularization: null
+  reduction: sum
+  max_epochs: 4000
+  optimizer_class: AdamW
+  optimizer_param:
+    lr: 1.0e-05
+  resume: false
+  save_every_epochs: 100
+  save_every_iterations: -1
+  scheduler_class: CosineAnnealingLR
+  scheduler_param:
+    T_max: 2000
+    eta_min: 1.0e-07

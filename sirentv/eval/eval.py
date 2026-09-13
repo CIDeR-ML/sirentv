@@ -18,7 +18,7 @@ from tqdm import tqdm
 
 
 @torch.no_grad()
-def evaluate(cfg: dict, output_file: str = "eval_results.pt"):
+def evaluate(cfg: dict, output_file: str = "eval_results.pt", ckpt_file: str | None = None):
     rank = dist.get_rank() if dist.is_initialized() else 0
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     is_distributed = world_size > 1
@@ -29,7 +29,10 @@ def evaluate(cfg: dict, output_file: str = "eval_results.pt"):
     else:
         device = torch.device("cpu")
 
-    net = SirenTV(cfg).to(device)
+    if ckpt_file is not None:
+        cfg.setdefault("model", {})["ckpt_file"] = ckpt_file
+
+    net = SirenTV(cfg, weights_only=True).to(device)
     if is_distributed:
         net = create_ddp_model(net, device_ids=[local_rank])
     net.eval()
@@ -198,12 +201,12 @@ def evaluate(cfg: dict, output_file: str = "eval_results.pt"):
             if rank == 0:
                 vis_strs = [f"r{i}:{v.item():.3e}" for i, v in enumerate(all_vis)]
                 time_strs = [f"r{i}:{t.item():.3e}" for i, t in enumerate(all_time)]
-                print(f"  [batch {batch_idx+1}] bias_vis: [{', '.join(vis_strs)}] | bias_time: [{', '.join(time_strs)}]")
+                #print(f"  [batch {batch_idx+1}] bias_vis: [{', '.join(vis_strs)}] | bias_time: [{', '.join(time_strs)}]")
         elif (batch_idx + 1) % log_every == 0 and rank == 0:
             # non-distributed case
             running_vis = overall_vis_bias_sum / overall_vis_bias_count.clamp(min=1)
             running_time = overall_time_bias_sum / overall_time_bias_count.clamp(min=1)
-            print(f"  [batch {batch_idx+1}] bias_vis: {running_vis.item():.4e}, bias_time: {running_time.item():.4e}")
+            #print(f"  [batch {batch_idx+1}] bias_vis: {running_vis.item():.4e}, bias_time: {running_time.item():.4e}")
 
     # concatenate local results
     local_pred_vis = torch.cat(all_pred_vis, dim=0)
@@ -365,6 +368,25 @@ def main():
     default_config_path = "/sdf/home/y/youngsam/sw/dune/sirentv/config/cfg.yaml"
     parser.add_argument("--config", type=str, default=default_config_path)
     parser.add_argument("--output", type=str, default="eval_results.pt", help="output .pt file path")
+    parser.add_argument(
+        "--pmt-ids", type=int, nargs="+", default=None,
+        help="If set (pca/quantile pipelines only), also compute spatial-slice diagnostics "
+             "for these PMT indices, e.g. --pmt-ids 0 40 80.",
+    )
+    parser.add_argument(
+        "--ckpt", type=str, default=None,
+        help="Checkpoint file to evaluate. Overrides model.ckpt_file in --config -- without "
+             "this, the config's own ckpt_file is used (often null, i.e. a fresh random model).",
+    )
+    parser.add_argument(
+        "--compare", type=str, nargs="+", default=None,
+        choices=["pred_vs_compressed", "pred_vs_raw", "compressed_vs_raw"],
+        help="pca pipeline only: restrict to one or more of these comparisons, e.g. "
+             "--compare pred_vs_compressed. Default: all three (if raw_quantile_plib is "
+             "configured) or just pred_vs_compressed (if not). pred_vs_raw/compressed_vs_raw "
+             "need the raw quantile file loaded -- omitting both skips that entirely, useful "
+             "for isolating whether that code path is responsible for a crash.",
+    )
     args = parser.parse_args()
 
     # Check if running in distributed mode (torchrun sets these env vars)
@@ -386,9 +408,18 @@ def main():
     with open(args.config, "r") as f:
         cfg = yaml.safe_load(f)
 
-    evaluate(cfg, output_file=args.output)
+    dataset_type = cfg.get("data", {}).get("dataset", {}).get("type", "")
+    if dataset_type == "CompressedPLibDataset":
+        from sirentv.eval.eval_pca import evaluate_pca
+        evaluate_pca(cfg, output_file=args.output, pmt_ids=args.pmt_ids, ckpt_file=args.ckpt, comparisons=args.compare)
+    elif dataset_type == "QuantilePLibDataset":
+        from sirentv.eval.eval_quantile import evaluate_quantile
+        evaluate_quantile(cfg, output_file=args.output, pmt_ids=args.pmt_ids, ckpt_file=args.ckpt)
+    else:
+        evaluate(cfg, output_file=args.output, ckpt_file=args.ckpt)
 
-    dist.destroy_process_group()
+    if is_distributed_env:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
