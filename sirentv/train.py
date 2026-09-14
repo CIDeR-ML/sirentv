@@ -44,6 +44,20 @@ def train(cfg: dict):
     else:
         DEVICE = torch.device("cpu")
 
+    # --- float32 matmul precision -------------------------------------------------
+    # A SIREN is almost entirely matmul, and on an A100 TF32 tensor cores are far faster
+    # than strict fp32 for those. PyTorch defaults to "highest" (no tensor cores) and
+    # emits a warning about it every run, which is what the ablation logs were showing.
+    #
+    # "high"    -> TF32: ~10-bit mantissa for the matmul accumulate, fp32 accumulate
+    # "highest" -> strict fp32, the previous behaviour
+    # Set device.matmul_precision: highest in a config to opt back out. This CHANGES
+    # NUMERICS, so runs made under different settings are not bit-comparable.
+    matmul_precision = cfg.get("device", {}).get("matmul_precision", "high")
+    torch.set_float32_matmul_precision(matmul_precision)
+    if rank == 0:
+        print(f"[train] float32 matmul precision: {matmul_precision}")
+
     iteration_ctr = 0
     epoch_ctr = 0
 
@@ -84,6 +98,29 @@ def train(cfg: dict):
         epoch_ctr = int(epoch)
         if rank == 0:
             print(f"[train] resuming from iteration {iteration_ctr}, epoch {epoch_ctr}")
+
+        # Restore the learning rate the SCHEDULER implies at this epoch.
+        #
+        # slar's optimizer_factory overwrites every param_group's lr with the config's
+        # `optimizer_param.lr` AFTER loading the checkpoint, which throws away the
+        # scheduler-derived value. That matters because CosineAnnealingLR is "chainable":
+        # get_lr() derives the next lr RECURSIVELY from the current group lr, not from
+        # base_lr. Re-seeding it with the base 1e-5 instead of the restored 1e-7 (100x too
+        # high) compounds across the schedule's rising half -- a 6-epoch chunk resumed at
+        # epoch 6 of T_max=6 climbed to 1.6e-4, i.e. 16x ABOVE base_lr, instead of
+        # returning symmetrically to 1e-5.
+        #
+        # load_state_dict restores the scheduler's own _last_lr, so get_last_lr() is
+        # exactly the value the schedule specifies here. Applied only on resume, and only
+        # when a scheduler owns the lr; without a scheduler the config's lr is authoritative
+        # and is left alone. Fixed here rather than in slar, which is shared with other
+        # projects.
+        if sch is not None:
+            restored = sch.get_last_lr()
+            for group, lr in zip(opt.param_groups, restored):
+                group["lr"] = lr
+            if rank == 0:
+                print(f"[train] restored scheduler lr: {restored}")
 
     # --- Losses, regularizer, logger (all config-driven) ---
     loss_fns = build_losses(cfg)
@@ -338,7 +375,16 @@ def train(cfg: dict):
 
         if sch is not None:
             epoch_avg_loss = epoch_loss_sum / max(epoch_batch_count, 1)
-            sch.step(epoch_avg_loss)
+            # ReduceLROnPlateau is the only scheduler here that consumes a metric. Every
+            # other torch scheduler takes an optional EPOCH INDEX, so passing the loss
+            # assigned it straight to last_epoch: a CosineAnnealingLR driven this way sat
+            # at last_epoch ~= loss (order 1) forever and never annealed -- after 2000
+            # epochs its lr was still 9.9999e-06 instead of reaching eta_min=1e-07, and a
+            # resumed chunk had its restored last_epoch overwritten by the next loss value.
+            if isinstance(sch, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                sch.step(epoch_avg_loss)
+            else:
+                sch.step()
 
         epoch_ctr += 1
 
