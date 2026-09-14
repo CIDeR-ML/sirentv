@@ -1,14 +1,34 @@
+from __future__ import annotations
+
 from typing import List
 
-from slar.base import Siren
-from torch import nn
-
 from sirentv.models import MODELS
+from sirentv.models.multibranch import MultiBranchSiren, _as_list
 
 
 @MODELS.register_module()
-class DualPcaSiren(nn.Module):
-    """Two independent SIREN branches: one for PCA coefficients, one for vis + log_t0."""
+class DualPcaSiren(MultiBranchSiren):
+    """Two independent SIREN branches: one for vis + log_t0, one for PCA coefficients.
+
+    Thin wrapper over MultiBranchSiren, registering the branches under the submodule
+    names `vt0_net` and `coeff_net` so that state_dicts from before the refactor load
+    unchanged -- which is what makes the existing coeffs_only / high_omega checkpoints
+    reusable in Stage 1. Equivalent config:
+
+        type: MultiBranchSiren
+        branches:
+          - {name: vt0_net,   keys: [v, t0],   hidden_features: 256, first_omega_0: 30}
+          - {name: coeff_net, keys: [coeffs],  hidden_features: 512, first_omega_0: 150}
+
+    The [vt0_branch, coeff_branch] list convention is preserved for every argument: a
+    bare scalar applies uniformly to both branches (backward compatible with every
+    existing config), a 2-element list lets them differ. Per-branch omega_0 exists
+    specifically to test whether coeff_net's steep-near-PMT / flat-far-field difficulty
+    is a SIREN bandwidth limit -- raising omega_0 raises the range of spatial frequencies
+    the branch can represent, at the cost of needing a cleaner signal (dynamic_weight, or
+    a longer warmup) to keep that extra bandwidth from showing up as ringing in the
+    otherwise smooth far field.
+    """
 
     def __init__(
         self,
@@ -21,52 +41,35 @@ class DualPcaSiren(nn.Module):
         hidden_omega_0: List[float] | float = 30.0,
         **kwargs,
     ):
-        super().__init__()
-        if isinstance(hidden_features, int):
-            hidden_features = [hidden_features, hidden_features]
-        if isinstance(hidden_layers, int):
-            hidden_layers = [hidden_layers, hidden_layers]
-        # same [vt0_branch, coeff_branch] convention as hidden_features/hidden_layers above --
-        # a bare scalar still applies uniformly to both branches (backward compatible with
-        # every existing config), a 2-element list lets them differ. Added specifically to test
-        # whether coeff_net's steep-near-PMT/flat-far-field fitting difficulty is a SIREN
-        # bandwidth limit (see loss/grad_frob.py's dynamic_weight docstring and the
-        # ex-junjie.ipynb investigation) -- raising omega_0 raises the range of spatial
-        # frequencies the branch can represent, at the cost of needing a cleaner signal
-        # (dynamic_weight, or a longer warmup) to avoid that extra bandwidth manifesting as
-        # ringing in the (otherwise smooth) far field instead.
-        if isinstance(first_omega_0, (int, float)):
-            first_omega_0 = [first_omega_0, first_omega_0]
-        if isinstance(hidden_omega_0, (int, float)):
-            hidden_omega_0 = [hidden_omega_0, hidden_omega_0]
+        hf = _as_list(hidden_features, 2)
+        hl = _as_list(hidden_layers, 2)
+        fo = _as_list(first_omega_0, 2)
+        ho = _as_list(hidden_omega_0, 2)
 
-        self.n_components = n_components
+        super().__init__(
+            in_features=in_features,
+            n_components=n_components,
+            outermost_linear=outermost_linear,
+            branches=[
+                dict(
+                    name="vt0_net",
+                    keys=["v", "t0"],
+                    hidden_features=hf[0],
+                    hidden_layers=hl[0],
+                    first_omega_0=fo[0],
+                    hidden_omega_0=ho[0],
+                ),
+                dict(
+                    name="coeff_net",
+                    keys=["coeffs"],
+                    hidden_features=hf[1],
+                    hidden_layers=hl[1],
+                    first_omega_0=fo[1],
+                    hidden_omega_0=ho[1],
+                ),
+            ],
+            **kwargs,
+        )
+        # legacy value: [vt0 width, coeff width]; identical to what this topology
+        # produces anyway, kept explicit so the intent is obvious
         self.out_features = [2, n_components]
-
-        self.vt0_net = Siren(
-            in_features,
-            hidden_features[0],
-            hidden_layers[0],
-            2,  # vis + log_t0
-            outermost_linear,
-            first_omega_0[0],
-            hidden_omega_0[0],
-        )
-
-        self.coeff_net = Siren(
-            in_features,
-            hidden_features[1] if len(hidden_features) > 1 else hidden_features[0],
-            hidden_layers[1] if len(hidden_layers) > 1 else hidden_layers[0],
-            n_components,
-            outermost_linear,
-            first_omega_0[1] if len(first_omega_0) > 1 else first_omega_0[0],
-            hidden_omega_0[1] if len(hidden_omega_0) > 1 else hidden_omega_0[0],
-        )
-
-    def forward(self, x, *args, **kwargs):
-        vt0 = self.vt0_net(x)        # (B, N_pmt, 2)
-        coeffs = self.coeff_net(x)    # (B, N_pmt, n_components)
-
-        vis = vt0[..., 0]             # (B, N_pmt)
-        log_t0 = vt0[..., 1]         # (B, N_pmt)
-        return dict(v=vis, coeffs=coeffs, t0=log_t0)

@@ -1,13 +1,25 @@
-import torch
-from slar.base import Siren
-from torch import nn
+from __future__ import annotations
 
 from sirentv.models import MODELS
+from sirentv.models.multibranch import MultiBranchSiren
 
 
 @MODELS.register_module()
-class QuantileSiren(nn.Module):
-    """Single SIREN network outputting raw quantile values + visibility + log_t0."""
+class QuantileSiren(MultiBranchSiren):
+    """Single SIREN trunk outputting raw quantile values + visibility + log_t0.
+
+    Thin wrapper over MultiBranchSiren: one branch emitting [v, t0, quantiles],
+    registered under the submodule name `net` so that state_dicts from before the
+    refactor load unchanged. Equivalent config:
+
+        type: MultiBranchSiren
+        branches:
+          - {name: net, keys: [v, t0, quantiles]}
+
+    For the split topologies, use MultiBranchSiren directly:
+        [{keys: [v, t0]}, {keys: [quantiles]}]          # split representation
+        [{keys: [v]}, {keys: [t0]}, {keys: [quantiles]}] # split everything
+    """
 
     def __init__(
         self,
@@ -20,24 +32,22 @@ class QuantileSiren(nn.Module):
         hidden_omega_0=30.0,
         **kwargs,
     ):
-        super().__init__()
-        out_features = n_quantile + 2  # quantiles + vis + log_t0
-        self.n_quantile = n_quantile
-        self.out_features = [2, n_quantile]  # for SirenTV wrapper compatibility
-
-        self.net = Siren(
-            in_features,
-            hidden_features,
-            hidden_layers,
-            out_features,
-            outermost_linear,
-            first_omega_0,
-            hidden_omega_0,
+        super().__init__(
+            in_features=in_features,
+            n_quantile=n_quantile,
+            outermost_linear=outermost_linear,
+            branches=[
+                dict(
+                    name="net",
+                    keys=["v", "t0", "quantiles"],
+                    hidden_features=hidden_features,
+                    hidden_layers=hidden_layers,
+                    first_omega_0=first_omega_0,
+                    hidden_omega_0=hidden_omega_0,
+                )
+            ],
+            **kwargs,
         )
-
-    def forward(self, x, *args, **kwargs):
-        out = self.net(x)              # (B, N_pmt, n_quantile+2)
-        vis = out[..., 0]              # (B, N_pmt)
-        log_t0 = out[..., 1]          # (B, N_pmt)
-        quantiles = out[..., 2:]      # (B, N_pmt, n_quantile)
-        return dict(v=vis, quantiles=quantiles, t0=log_t0)
+        self.n_quantile = n_quantile
+        # preserve the legacy split (see PcaSiren) -- total is unchanged either way
+        self.out_features = [2, n_quantile]
