@@ -1,0 +1,153 @@
+# s3df variant of stage1_gs_q3_omega060.yaml -- generated, do not hand-edit.
+# Differs ONLY in site-bound paths and num_workers (s3df CPUS_PER_TASK=8, so 16
+# workers per rank would oversubscribe). Every physics/training knob is identical,
+# which is what keeps these comparable to the NERSC arms.
+photonlib:
+    filepath: /sdf/data/neutrino/pubdata/lut/optical/consolidated/full_wvfm_plib_b05_quantile_prod_lite_fixed.h5
+    lazy: true
+    mode: log_quantile
+    combine_every_quantile: 2
+    n_photon: 3.0e7
+    device: cpu
+physics:
+    R_index: 1.233
+device:
+    type: cuda
+model:
+  # ckpt_file: /sdf/data/neutrino/junjie/SIREN/cider-ml/logs/logs_quantile_81/latest.ckpt
+  mode: quantile_cdf
+  network:
+    type: MultiBranchSiren
+    in_features: 6
+    n_quantile: 256
+    outermost_linear: true
+    # Grad-supervision omega_0 sweep, rep branch at 60.0. v_net and t0_net stay at
+    # 30 so omega_0 on the representation branch is the single variable. The
+    # 2-branch coeffs_only/high_omega runs are deliberately NOT reused as cells
+    # here -- they are a different topology, which would confound the two.
+    branches:
+      - name: v_net
+        keys: [v]
+        hidden_features: 256
+        hidden_layers: 6
+        first_omega_0: 30.0
+        hidden_omega_0: 30.0
+      - name: t0_net
+        keys: [t0]
+        hidden_features: 256
+        hidden_layers: 6
+        first_omega_0: 30.0
+        hidden_omega_0: 30.0
+      - name: quantile_net
+        keys: [quantiles]
+        hidden_features: 512
+        hidden_layers: 6
+        first_omega_0: 60.0
+        hidden_omega_0: 60.0
+  output_scale:
+    fix: true
+transform_vis:
+    vmax: 1.0
+    eps: 1.e-8
+    sin_out: false
+data:
+    n_pmt: 81
+    weight:
+      quantiles:
+        enable: false
+      v:
+        enable: true
+        factor: 5000.0
+        threshold: 1.0e-08
+      t0:
+        enable: false
+    loader:
+      batch_size: 1024   # 4 ranks x 1024 = 4096 global, matching the 8-rank NERSC arms (8 x 512)
+      drop_last: true
+      num_workers: 8
+      prefetch_factor: 4
+      pin_memory: true
+      shuffle: true
+      load_pos: true
+    dataset:
+      type: QuantilePLibDataset
+logger:
+    type: wandb
+    entity: junjiex-stanford-university
+    run_dir: /sdf/data/neutrino/junjie/SIREN/cider-ml/logs
+    dir_name: logs_stage1_gs_q3_omega060
+    file_name: log.csv
+    grad_norm:
+      enabled: true
+      log_per_layer: true
+      log_frequency: 77
+    log_every_nsteps: 77
+    project: sirentv_ablations
+    name: stage1_gs_q3_omega060
+    infer_fn:
+      type: QuantileInfer
+    analysis:
+      - func: bias
+        suffix: vis
+        key: v_linear
+        threshold: 1.0e-06
+      - func: abs_bias
+        suffix: t0
+        key: t0
+        threshold: 1.0e-02
+        signed: True
+train:
+  clip_grad: {v_net: 1.0, t0_net: 1.0, quantile_net: 3.0}
+  # --- gradient supervision (3-branch only; see the omega_0 sweep note above) ---
+  grad_supervision_keys: {quantiles: 1000}
+  grad_supervision_warmup_unit: epoch
+  grad_supervision_aggregate: true  # per-PMT mode OOMs; visibility-weighted aggregate
+  grad_target_agg_chunk_size: 20000
+  grad_target_n_projections: 100
+  grad_target_chunk_size: 20000
+  # representation-matched cache -- the two are NOT interchangeable (coefficient-space
+  # vs quantile-space targets), and a mismatched lut_filepath in its meta silently
+  # triggers a full recompute rather than an error
+  grad_target_cache_file: /sdf/data/neutrino/junjie/SIREN/cider-ml/sirentv/grad_frob_cache/quantile_grad_frob.h5
+  loss:
+    - type: WeightedL2Loss
+      key: quantiles
+      mask_key: quantiles_mask
+      weight: 1.0
+    # Poisson NLL on visibility, not SmoothL1: the target is a Monte Carlo count
+    # estimate, so its noise is heteroscedastic -- Var(t) ~ p/n, meaning
+    # low-visibility voxels have proportionally noisier targets. An L2/SmoothL1
+    # loss assumes constant variance and so over-weights exactly the far-field
+    # region where the target is least trustworthy.
+    #
+    # inv_xform and n_photon are NOT set here -- build_losses injects both from
+    # this file's own transform_vis and plib n_photon (training/utils.py), which
+    # is what keeps them from drifting out of sync with the dataset.
+    #
+    # weight 1.0e-7 is NOT a target-scale correction: the loss multiplies by
+    # n_photon = 3.0e7 internally (that factor is what makes the fraction-domain
+    # formula n*(p - t*log p) gradient-equivalent to the true count-domain NLL --
+    # see the derivation in loss/poisson.py). 3.0e7 * 1.0e-7 = 3, so the EFFECTIVE
+    # prefactor on this term relative to the other losses is ~3, not 1e-7.
+    - type: WeightedPoissonNLLLoss
+      key: v
+      weight: 1.0e-7
+    - type: SmoothL1Loss
+      key: t0
+      weight: 1.0
+    - type: WeightedGradFrobLoss
+      key: quantiles
+      weight: 1.0
+  regularization: null
+  reduction: sum
+  max_epochs: 5000
+  optimizer_class: AdamW
+  optimizer_param:
+    lr: 1.0e-05
+  resume: false
+  save_every_epochs: 100
+  save_every_iterations: -1
+  scheduler_class: CosineAnnealingLR
+  scheduler_param:
+    T_max: 2000
+    eta_min: 1.0e-07
