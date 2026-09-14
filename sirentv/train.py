@@ -1,6 +1,14 @@
 from __future__ import annotations
 
 import os
+
+# Pin the matplotlib backend before anything imports pyplot (log.py does, transitively via
+# the sirentv imports below). On a batch node with no DISPLAY matplotlib already picks
+# "agg" on its own, so this is NOT a speedup -- it just removes the dependence on that
+# autodetection, which would pick a GUI backend if DISPLAY happened to be set (a Jupyter
+# kernel, X11 forwarding). setdefault so an explicit MPLBACKEND still wins.
+os.environ.setdefault("MPLBACKEND", "Agg")
+
 import time
 from contextlib import nullcontext
 
@@ -157,6 +165,25 @@ def train(cfg: dict):
     grad_norm_type = grad_norm_cfg.get("norm_type", 2.0)
     grad_norm_per_layer = grad_norm_cfg.get("log_per_layer", False)
     grad_norm_frequency = grad_norm_cfg.get("log_frequency", 1)
+
+    # Cadence of the expensive per-iteration diagnostics block: two extra no_grad inference
+    # passes, three matplotlib figures through wandb.Image, and the bias/abs_bias analysis.
+    #
+    # This was hardcoded to every 10 iterations, which measured 0.5-3.5 s per occurrence
+    # against a 0.031 s training step -- roughly 98% of wall time. Being a fixed per-call
+    # cost, it got proportionally WORSE the faster the job ran: at ~0.167 s/iteration on
+    # s3df it fired 0.6 times/second, but at 0.031 s on 8 ranks here it fired 3.2
+    # times/second, which is why the same code looked fine there and pathological here.
+    #
+    # logger.plot_every_nsteps: <int> to set it explicitly; <= 0 or unset means once per
+    # epoch (len(dl) iterations), which is the default.
+    plot_every_nsteps = cfg.get("logger", {}).get("plot_every_nsteps")
+    if plot_every_nsteps is None or int(plot_every_nsteps) <= 0:
+        plot_every_nsteps = max(1, len(dl))
+    plot_every_nsteps = int(plot_every_nsteps)
+    if rank == 0:
+        print(f"[train] diagnostics/plot cadence: every {plot_every_nsteps} iterations "
+              f"({len(dl)} iterations/epoch)")
 
     # Unwrap model once (stable for lifetime of training)
     net_module = unwrap_net(net)
@@ -338,7 +365,7 @@ def train(cfg: dict):
                     if log_grad_norm and iteration_ctr % grad_norm_frequency == 0:
                         logger.log_grad_norms(iteration_ctr, net_module, grad_norm_type, grad_norm_per_layer)
 
-                if rank == 0 and iteration_ctr % 10 == 0:
+                if rank == 0 and iteration_ctr % plot_every_nsteps == 0:
                     with torch.no_grad():
                         inferred = infer(net, x, target, meta)
                     logger.plot(iteration_ctr, inferred)
