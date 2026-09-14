@@ -50,7 +50,11 @@ GRAD_CACHE_DIR = _env("SIRENTV_GRAD_CACHE_DIR", REPO_DIR / "grad_frob_cache")
 # migration. On s3df they live in two different shared locations, so the file paths are
 # given individually rather than derived from a single DATA_DIR.
 if SITE == "nersc":
-    DATA_DIR = _env("SIRENTV_DATA_DIR", REPO_DIR.parent / "data")
+    # $SCRATCH (Lustre), not CFS (GPFS). The lazy dataset path issues one random HDF5 read
+    # per voxel -- 1536 reads per 512-voxel batch -- and on CFS that dominated the iteration
+    # (data 0.1-1.4 s vs fwd+bwd 0.009 s). The staged copy is striped over 8 OSTs; a
+    # stripe_count of 1, the $SCRATCH default, would put every read on a single OST.
+    DATA_DIR = _env("SIRENTV_DATA_DIR", Path("/pscratch/sd/j/junjiex/SIREN/data"))
     LUT_N50 = DATA_DIR / "compressed_plib_b05_quantile_log_prod_lite_n50.h5"
     LUT_QUANTILE = DATA_DIR / "full_wvfm_plib_b05_quantile_prod_lite_fixed.h5"
     RUN_DIR = _env("SIRENTV_RUN_DIR", Path("/pscratch/sd/j/junjiex/SIREN/logs"))
