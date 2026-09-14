@@ -575,6 +575,14 @@ class QuantilePLibDataset(Dataset):
                 "v": self._v[idx],
                 "t0": self._t0[idx],
                 "quantiles": self._quantiles[idx],
+                # A (voxel, PMT) pair with zero visibility has no waveform, and its
+                # quantiles are NaN in the LUT (~0.02% of pairs; 56 of 65 zero-visibility
+                # pairs in a 324k-pair sample). WeightedL2Loss(key="quantiles",
+                # mask_key="quantiles_mask") -- which every quantile config already
+                # requests -- needs this to exist: without it the loss raises KeyError,
+                # and with the mask dropped instead those NaNs poison the mean and produce
+                # NaN gradients on the first iteration.
+                "quantiles_mask": self._vis_raw[idx] > 0,
             }
             for key in self._grad_keys:
                 target[f"{key}_grad_frob"] = self._grad_targets[key][idx]
@@ -606,6 +614,7 @@ class QuantilePLibDataset(Dataset):
             "v": v,
             "t0": t0,
             "quantiles": quantiles,
+            "quantiles_mask": vis_raw > 0,
         }
         for key in self._grad_keys:
             target[f"{key}_grad_frob"] = self._grad_targets[key][idx]
