@@ -105,10 +105,7 @@ def train(cfg: dict):
         # `optimizer_param.lr` AFTER loading the checkpoint, which throws away the
         # scheduler-derived value. That matters because CosineAnnealingLR is "chainable":
         # get_lr() derives the next lr RECURSIVELY from the current group lr, not from
-        # base_lr. Re-seeding it with the base 1e-5 instead of the restored 1e-7 (100x too
-        # high) compounds across the schedule's rising half -- a 6-epoch chunk resumed at
-        # epoch 6 of T_max=6 climbed to 1.6e-4, i.e. 16x ABOVE base_lr, instead of
-        # returning symmetrically to 1e-5.
+        # base_lr.
         #
         # load_state_dict restores the scheduler's own _last_lr, so get_last_lr() is
         # exactly the value the schedule specifies here. Applied only on resume, and only
