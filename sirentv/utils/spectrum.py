@@ -1,11 +1,7 @@
 """
 Spatial-frequency (kx, ky, kz) power spectra of the truth fields, the gradient
-targets, and a model's predictions of them.
-
-Extracted from ex-junjie.ipynb's frequency-domain cells so it can be run as an
-evaluation item instead of only interactively. Deliberately self-contained: it
-imports nothing from sirentv.eval, so it works against either eval implementation
-and can be wired into whichever one you settle on with a few lines.
+targets, and a model's predictions of them. Imports nothing from sirentv.eval, 
+so it works against either eval implementation.
 
 Why this diagnostic exists: a SIREN layer sin(w0*(Wx+b)) has a characteristic
 frequency scale, and the question driving the omega_0 / depth ablations is whether
@@ -15,7 +11,7 @@ directly: prediction far BELOW truth at some k means that frequency is not being
 reproduced (over-smoothed); far ABOVE means the model is injecting power the data
 does not have (ringing).
 
-Conventions preserved from the notebook, each load-bearing:
+Conventions preserved from the playground notebook, each load-bearing:
 
 * **Invalid voxels are inpainted, never constant-filled.** Filling with any
   constant creates a discontinuity at every invalid voxel. Those are scattered
@@ -137,11 +133,10 @@ def power_spectrum_3d(grid, hann=True):
 def axis_marginal_spectrum(power_3d, axis, spacing):
     """Marginalize a 3D power spectrum onto one axis by averaging over the other two.
 
-    Unlike radial_average, this keeps direction: x (the PMT-facing axis, left
-    un-tapered) can behave quite differently from y and z, which a radial average
-    would blend away. Two-sided -- for real input the spectrum is symmetric under
-    k -> -k, and plotting both sides is itself a check that the symmetry holds.
-    DC is dropped.
+    This keeps direction: x (the PMT-facing axis, left un-tapered) can behave
+    quite differently from y and z, which a radial average would blend away. Two-
+    sided -- for real input the spectrum is symmetric under k -> -k, and plotting
+    both sides is itself a check that the symmetry holds. DC is dropped.
     """
     others = tuple(a for a in (0, 1, 2) if a != axis)
     marginal = np.asarray(power_3d).mean(axis=others)
