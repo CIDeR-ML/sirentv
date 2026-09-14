@@ -628,6 +628,55 @@ class QuantilePLibDataset(Dataset):
             },
         }
 
+    def __getitems__(self, indices):
+        """Fetch a whole batch with ONE read per field instead of one read per sample.
+
+        See CompressedPLibDataset.__getitems__ for the mechanism and the measurements. The
+        payoff is larger here: one voxel of `quantiles` is 162 KiB, and the per-sample path
+        reaches only ~79 MB/s against ~1.2 GB/s for a single multi-row selection through the
+        same three-level VDS chain.
+        """
+        if hasattr(self, "_v"):
+            # Precomputed path: already resident, nothing to coalesce.
+            return [self[i] for i in indices]
+
+        idx = np.asarray(indices)
+        vox = self.indices[torch.as_tensor(idx, dtype=torch.long)].numpy()
+        data = self._quantile_plib[vox]
+        vis_raw = data["vis"].float()           # (B, n_pmt)
+        t0_raw = data["t0"].float()             # (B, n_pmt)
+        quantiles = data["quantiles"].float()   # (B, n_pmt, n_quantile)
+
+        v = self._xform_vis(vis_raw / self._n_photon)
+        t0 = torch.log(t0_raw.clamp(min=1e-3))
+        if self._log_quantile:
+            quantiles = torch.log10(quantiles.clamp(min=0.0) + self._log_quantile_C)
+        # Zero-visibility (voxel, PMT) pairs have NaN quantiles in the LUT; the mask is what
+        # keeps them out of the loss. Computed from the RAW visibility, as in __getitem__.
+        mask = vis_raw > 0
+        pos = torch.from_numpy(self._quantile_plib.pos[vox]).float()
+        grads = {k: self._grad_targets[k][idx] for k in self._grad_keys}
+
+        out = []
+        for j in range(idx.shape[0]):
+            target = {
+                "v": v[j],
+                "t0": t0[j],
+                "quantiles": quantiles[j],
+                "quantiles_mask": mask[j],
+            }
+            for k in self._grad_keys:
+                target[f"{k}_grad_frob"] = grads[k][j]
+            out.append({
+                "position": pos[j],
+                "target": target,
+                "meta": {
+                    "v_linear": vis_raw[j],
+                    "t0_raw": t0_raw[j],
+                },
+            })
+        return out
+
 
 def create_quantile_dataloader(cfg, rank=0, world_size=1):
     """Create DataLoader for QuantilePLibDataset."""
@@ -638,6 +687,9 @@ def create_quantile_dataloader(cfg, rank=0, world_size=1):
     pin_memory = loader_cfg.get("pin_memory", False)
     drop_last = loader_cfg.get("drop_last", True)
     shuffle = loader_cfg.get("shuffle", False)
+    # See create_compressed_dataloader: queue depth per worker, raised above torch's
+    # default of 2 because the lazy path's per-voxel HDF5 reads are what stalls the GPU.
+    prefetch_factor = loader_cfg.get("prefetch_factor")
 
     # GPU data requires num_workers=0 (workers can't access GPU tensors)
     if dataset._on_gpu:
@@ -649,6 +701,10 @@ def create_quantile_dataloader(cfg, rank=0, world_size=1):
     if world_size > 1:
         sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=shuffle)
         shuffle = False
+    # DataLoader rejects prefetch_factor when num_workers == 0 (which _on_gpu forces above).
+    extra = {}
+    if num_workers > 0 and prefetch_factor is not None:
+        extra["prefetch_factor"] = int(prefetch_factor)
     dl = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -658,6 +714,7 @@ def create_quantile_dataloader(cfg, rank=0, world_size=1):
         pin_memory=pin_memory,
         drop_last=drop_last,
         persistent_workers=True if num_workers > 0 else False,
+        **extra,
     )
     if sampler is not None:
         dl.set_epoch = lambda e: sampler.set_epoch(e)

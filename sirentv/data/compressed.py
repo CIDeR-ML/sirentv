@@ -786,6 +786,67 @@ class CompressedPLibDataset(Dataset):
             },
         }
 
+    def __getitems__(self, indices):
+        """Fetch a whole batch with ONE read per field instead of one read per sample.
+
+        torch's _MapDatasetFetcher calls this in place of a per-index __getitem__ loop when
+        it exists (torch >= 2.0). The DataLoader still owns index selection, so the sampler,
+        shuffling and DistributedSampler sharding are completely unchanged -- only the fetch
+        is batched. Returns a list of per-sample dicts, so default_collate stays as-is.
+
+        Why this is worth a second code path: `coeffs` is contiguous and uncompressed, so a
+        one-voxel read is a single pread at a computed offset, and the per-sample path pays
+        that round-trip 3 * batch_size times serially -- measured at ~11 MB/s effective,
+        which is latency, not bandwidth. One multi-row selection lets the filesystem
+        coalesce and prefetch instead (~1.2 GB/s measured). Everything below must stay
+        numerically identical to __getitem__; the only change is read granularity.
+        """
+        if hasattr(self, "_v"):
+            # Precomputed path: targets are already resident in RAM/VRAM, so there is no I/O
+            # to coalesce and per-sample indexing is already free. Defer to __getitem__
+            # rather than duplicate its slicing.
+            return [self[i] for i in indices]
+
+        idx = np.asarray(indices)
+        # dataset index -> LUT voxel id. _read_slice sorts and de-duplicates internally
+        # (np.unique + ds[uniq][inv]), which is what makes an arbitrary index list legal for
+        # h5py -- it rejects unsorted or repeated fancy indices.
+        vox = self.indices[torch.as_tensor(idx, dtype=torch.long)].numpy()
+        data = self._plib[vox]
+        vis_raw = data["vis"].float()          # (B, n_pmt)
+        t0_raw = data["t0"].float()            # (B, n_pmt)
+        coeffs = data["coeffs"].float()        # (B, n_pmt, K)
+
+        if self._normalize_coeffs:
+            coeffs = self._plib.normalize_coeffs(coeffs)
+        v = self._xform_vis(vis_raw / self._n_photon)
+        t0 = torch.log(t0_raw.clamp(min=1e-3))
+        pos = torch.from_numpy(self._plib.pos[vox]).float()
+
+        # same (1, K) tensor for every sample, exactly as __getitem__ hands it over
+        coeffs_weight = (
+            self._plib.coeff_weight.unsqueeze(0).cpu() if self._normalize_coeffs else None
+        )
+        grads = {k: self._grad_targets[k][idx] for k in self._grad_keys}
+
+        out = []
+        for j in range(idx.shape[0]):
+            target = {"v": v[j], "t0": t0[j], "coeffs": coeffs[j]}
+            if coeffs_weight is not None:
+                target["coeffs_weight"] = coeffs_weight
+            for k in self._grad_keys:
+                target[f"{k}_grad_frob"] = grads[k][j]
+            out.append({
+                "position": pos[j],
+                "target": target,
+                "meta": {
+                    "v_linear": vis_raw[j],
+                    "t0_raw": t0_raw[j],
+                    "voxel_id": self.indices[idx[j]],
+                },
+            })
+        return out
+
 
 def create_compressed_dataloader(cfg, rank=0, world_size=1):
     """Create DataLoader for CompressedPLibDataset."""
@@ -796,6 +857,11 @@ def create_compressed_dataloader(cfg, rank=0, world_size=1):
     pin_memory = loader_cfg.get("pin_memory", False)
     drop_last = loader_cfg.get("drop_last", True)
     shuffle = loader_cfg.get("shuffle", False)
+    # Depth of each worker's ready queue. Worth raising above torch's default of 2 on the
+    # lazy CPU path, where __getitem__ is one random HDF5 read per voxel and the queue is
+    # what hides read latency behind compute -- with a 0.009 s/iteration model, a shallow
+    # queue drains faster than the workers can refill it and the GPU stalls.
+    prefetch_factor = loader_cfg.get("prefetch_factor")
 
     # GPU data requires num_workers=0 (workers can't access GPU tensors)
     if dataset._on_gpu:
@@ -807,6 +873,11 @@ def create_compressed_dataloader(cfg, rank=0, world_size=1):
     if world_size > 1:
         sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=shuffle)
         shuffle = False
+    # DataLoader rejects prefetch_factor outright when num_workers == 0, which is exactly
+    # what the _on_gpu branch above just forced -- so only pass it when it is legal.
+    extra = {}
+    if num_workers > 0 and prefetch_factor is not None:
+        extra["prefetch_factor"] = int(prefetch_factor)
     dl = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -816,6 +887,7 @@ def create_compressed_dataloader(cfg, rank=0, world_size=1):
         pin_memory=pin_memory,
         drop_last=drop_last,
         persistent_workers=True if num_workers > 0 else False,
+        **extra,
     )
     if sampler is not None:
         dl.set_epoch = lambda e: sampler.set_epoch(e)
