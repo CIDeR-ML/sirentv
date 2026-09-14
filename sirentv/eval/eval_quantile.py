@@ -19,11 +19,20 @@ from sirentv.eval.utils import (
     BinnedMeanAccumulator,
     gather_to_rank0,
     build_spatial_slice_diagnostics,
+    build_power_spectra,
 )
 
 
 @torch.no_grad()
-def evaluate_quantile(cfg: dict, output_file: str = "eval_quantile_results.pt", pmt_ids: list[int] | None = None, ckpt_file: str | None = None):
+def evaluate_quantile(
+    cfg: dict,
+    output_file: str = "eval_quantile_results.pt",
+    pmt_ids: list[int] | None = None,
+    ckpt_file: str | None = None,
+    spectra: bool = False,
+    spectra_components: list[int] | None = None,
+    grad_cache_file: str | None = None,
+):
     rank = dist.get_rank() if dist.is_initialized() else 0
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     is_distributed = world_size > 1
@@ -91,6 +100,34 @@ def evaluate_quantile(cfg: dict, output_file: str = "eval_quantile_results.pt", 
     spacing_acc = BinnedMeanAccumulator(n_quantile - 1, device)
 
     log_every = 1
+
+    # (kx, ky, kz) power spectra, one set per requested PMT. Only the requested quantile
+    # bins are kept: a full (N_voxel, n_pmt_sel, n_quantile) slice would be ~100x larger
+    # than the rest of the gathered results for no gain, since the diagnostic compares the
+    # spatial bandwidth of individual quantile levels, not their joint structure.
+    do_spectra = bool(spectra and pmt_ids)
+    if spectra_components:
+        spectra_components = [int(c) for c in spectra_components]
+        bad = [c for c in spectra_components if not 0 <= c < n_quantile]
+        if bad:
+            raise ValueError(
+                f"spectra_components {bad} out of range for n_quantile={n_quantile} "
+                f"(combine_every_quantile={combine_every_quantile})"
+            )
+    else:
+        # Evenly spaced quantile levels u ~ 0, 0.25, 0.5, 0.75, 1 rather than the first five
+        # bins: unlike PCA components (ordered by explained variance, so the low indices are
+        # the interesting ones), quantile bins are ordered in probability and the first five
+        # are five nearly identical views of the CDF's leading edge.
+        spectra_components = sorted(
+            {int(round(f * (n_quantile - 1))) for f in (0.0, 0.25, 0.5, 0.75, 1.0)}
+        )
+    all_pred_quantiles_slice = []
+    all_target_quantiles_slice = []
+
+    if do_spectra and rank == 0:
+        print(f"[eval_quantile] Power spectra enabled for PMTs {pmt_ids}, "
+              f"quantile bins {spectra_components}")
 
     all_pred_vis = []
     all_target_vis = []
@@ -165,6 +202,20 @@ def evaluate_quantile(cfg: dict, output_file: str = "eval_quantile_results.pt", 
         target_dt = target_time[..., 1:] - target_time[..., :-1]  # (B, n_pmts, n_quantile-1)
         spacing_acc.update(target_dt, target_vis_mask)
 
+        if do_spectra:
+            # The network's own output domain (log-quantile if that is the mode), NOT the
+            # to_linear_time values -- the spectrum is meant to measure the spatial bandwidth
+            # the network actually has to represent, and it is also the domain the cached
+            # grad_frob targets were computed in.
+            sel = torch.as_tensor(pmt_ids, device=pred_quantiles.device)
+            comp = torch.as_tensor(spectra_components, device=pred_quantiles.device)
+            all_pred_quantiles_slice.append(
+                pred_quantiles.detach()[:, sel][..., comp].cpu()
+            )
+            all_target_quantiles_slice.append(
+                target_quantiles.detach()[:, sel][..., comp].cpu()
+            )
+
         all_pred_vis.append(pred_v_linear.detach().cpu())
         all_target_vis.append(target_v_linear.detach().cpu())
         all_pred_t0.append(pred_t0.detach().cpu())
@@ -199,6 +250,9 @@ def evaluate_quantile(cfg: dict, output_file: str = "eval_quantile_results.pt", 
         "quantile_errors": torch.cat(all_quantile_errors, dim=0),
         "time_bias": torch.cat(all_time_bias, dim=0),
     }
+    if do_spectra:
+        local_results["pred_quantiles_slice"] = torch.cat(all_pred_quantiles_slice, dim=0)
+        local_results["target_quantiles_slice"] = torch.cat(all_target_quantiles_slice, dim=0)
 
     if is_distributed:
         acc_pred_vs_target.all_reduce()
@@ -298,6 +352,55 @@ def evaluate_quantile(cfg: dict, output_file: str = "eval_quantile_results.pt", 
                     pmt_id=pid,
                 )
 
+        if do_spectra:
+            positions_np = all_positions_tensor.numpy()
+            target_vis_np = all_target_vis_tensor.numpy()
+            pred_quantiles_np = gathered["pred_quantiles_slice"].numpy()
+            target_quantiles_np = gathered["target_quantiles_slice"].numpy()
+
+            # Cached gradient targets are per-(voxel, PMT) and indexed by voxel_id over the
+            # FULL LUT, while this eval may have run on a subset -- so it is only usable when
+            # the row counts line up. Prediction-side gradient spectra are NOT computed here:
+            # they need a forward pass with grad_keys enabled (create_graph), which
+            # @torch.no_grad() eval deliberately does not do.
+            grad_targets = None
+            if grad_cache_file:
+                with h5py.File(grad_cache_file, "r") as gf:
+                    if gf["v"].shape[0] == positions_np.shape[0]:
+                        grad_targets = {
+                            "grad_v": gf["v"][:],
+                            "grad_quantiles": gf["quantiles"][:],
+                        }
+                    else:
+                        print(f"[eval_quantile] grad cache has {gf['v'].shape[0]} rows but eval "
+                              f"covered {positions_np.shape[0]} -- skipping gradient spectra")
+
+            results["power_spectra"] = {}
+            for i, pid in enumerate(pmt_ids):
+                print(f"[eval_quantile] Building power spectra for PMT {pid}...")
+                valid = target_vis_np[:, pid] > 0
+                fields = {
+                    "v": {
+                        "pred": all_pred_vis_tensor.numpy()[:, pid],
+                        "target": target_vis_np[:, pid],
+                    },
+                    "t0": {
+                        "pred": all_pred_t0_tensor.numpy()[:, pid],
+                        "target": all_target_t0_tensor.numpy()[:, pid],
+                    },
+                    "quantiles": {
+                        "pred": pred_quantiles_np[:, i, :],
+                        "target": target_quantiles_np[:, i, :],
+                    },
+                }
+                if grad_targets is not None:
+                    fields["grad_v"] = {"target": grad_targets["grad_v"][:, pid]}
+                    fields["grad_quantiles"] = {"target": grad_targets["grad_quantiles"][:, pid]}
+
+                spec = build_power_spectra(positions_np, fields, valid)
+                spec["_components"] = list(spectra_components)
+                results["power_spectra"][pid] = spec
+
         output_dir = os.path.dirname(output_file)
         if output_dir:
             os.makedirs(output_dir, exist_ok=True)
@@ -327,7 +430,27 @@ def main():
         help="Checkpoint file to evaluate. Overrides model.ckpt_file in --config -- without "
              "this, the config's own ckpt_file is used (often null, i.e. a fresh random model).",
     )
+    parser.add_argument(
+        "--spectra", action="store_true", default=False,
+        help="Also compute (kx, ky, kz) spatial-frequency power spectra of v/t0/quantiles, "
+             "truth vs prediction, for each --pmt-ids PMT. Requires --pmt-ids.",
+    )
+    parser.add_argument(
+        "--spectra-components", type=int, nargs="+", default=None,
+        help="Quantile bin indices to include in the quantile spectra (default: five evenly "
+             "spaced levels u ~ 0, 0.25, 0.5, 0.75, 1). Only used with --spectra.",
+    )
+    parser.add_argument(
+        "--grad-cache", type=str, default=None,
+        help="Cached grad_frob targets (HDF5 with 'v' and 'quantiles'). When its row count "
+             "matches the evaluated set, target-side grad_v/grad_quantiles spectra are added. "
+             "Prediction-side gradient spectra are not available under no_grad eval. Defaults "
+             "to train.grad_target_cache_file from the config.",
+    )
     args = parser.parse_args()
+
+    if args.spectra and not args.pmt_ids:
+        parser.error("--spectra requires --pmt-ids (spectra are computed per PMT)")
 
     is_distributed_env = all(k in os.environ for k in ["RANK", "WORLD_SIZE", "LOCAL_RANK"])
 
@@ -345,7 +468,15 @@ def main():
     with open(args.config, "r") as f:
         cfg = yaml.safe_load(f)
 
-    evaluate_quantile(cfg, output_file=args.output, pmt_ids=args.pmt_ids, ckpt_file=args.ckpt)
+    evaluate_quantile(
+        cfg,
+        output_file=args.output,
+        pmt_ids=args.pmt_ids,
+        ckpt_file=args.ckpt,
+        spectra=args.spectra,
+        spectra_components=args.spectra_components,
+        grad_cache_file=args.grad_cache or cfg.get("train", {}).get("grad_target_cache_file"),
+    )
 
     if is_distributed_env:
         dist.destroy_process_group()

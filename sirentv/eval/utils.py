@@ -360,6 +360,53 @@ def build_spatial_slice_diagnostics(
     }
 
 
+def build_power_spectra(
+    positions: np.ndarray,
+    fields: dict,
+    valid: np.ndarray,
+    hann: bool = True,
+    n_bins: int = 50,
+):
+    """Spatial-frequency (kx, ky, kz) power spectra of truth and prediction, one PMT.
+
+    positions: (N, 3) voxel positions, as gathered by the eval loop.
+    fields:    {name: {"pred": arr, "target": arr}} where each arr is (N,) or (N, C),
+               ALREADY sliced to the single PMT this call is for. A "target"-only entry
+               is allowed (e.g. a cached gradient target with no prediction available).
+    valid:     (N,) boolean, from the TARGET side. Deliberately applied to the
+               prediction too -- including the model's untrained output at invalid
+               (voxel, PMT) locations would inject structure into the predicted
+               spectrum with no counterpart on the truth side to compare against.
+
+    Returns {name: {"pred": {axis: (k, power)}, "target": {...}}}, all plain numpy so the
+    result pickles into the eval .pt alongside the other diagnostics.
+
+    The FFT conventions (x left un-tapered while y/z are Hann-windowed; invalid voxels
+    inpainted rather than constant-filled; unnormalized transform with DC dropped) live in
+    sirentv.utils.spectrum and are load-bearing -- see that module's docstring.
+    """
+    from sirentv.utils.spectrum import GridIndex, field_spectra
+
+    grid = GridIndex(positions)
+    out = {}
+    for name, sides in fields.items():
+        entry = {}
+        for side in ("target", "pred"):
+            if sides.get(side) is None:
+                continue
+            entry[side] = field_spectra(
+                grid, {name: sides[side]}, valid=valid, hann=hann, n_bins=n_bins
+            )[name]
+        out[name] = entry
+
+    out["_grid"] = {
+        "shape": grid.shape,
+        "spacings": grid.spacings,
+        "n_valid": int(np.count_nonzero(valid)),
+    }
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Interactive single-batch evaluation (notebook use, CompressedPLib-specific)
 # ---------------------------------------------------------------------------

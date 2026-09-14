@@ -387,7 +387,24 @@ def main():
              "need the raw quantile file loaded -- omitting both skips that entirely, useful "
              "for isolating whether that code path is responsible for a crash.",
     )
+    parser.add_argument(
+        "--spectra", action="store_true", default=False,
+        help="pca pipeline only: also compute (kx, ky, kz) spatial-frequency power spectra of "
+             "v/t0/coeffs, truth vs prediction, per --pmt-ids PMT. Requires --pmt-ids.",
+    )
+    parser.add_argument(
+        "--spectra-components", type=int, nargs="+", default=None,
+        help="PCA components for the coefficient spectra (default: 0 1 2 3 4).",
+    )
+    parser.add_argument(
+        "--grad-cache", type=str, default=None,
+        help="Cached gradient-target .h5; adds target-side grad_v/grad_coeffs spectra when its "
+             "row count matches the evaluated set. Defaults to train.grad_target_cache_file.",
+    )
     args = parser.parse_args()
+
+    if args.spectra and not args.pmt_ids:
+        parser.error("--spectra requires --pmt-ids (spectra are computed per PMT)")
 
     # Check if running in distributed mode (torchrun sets these env vars)
     is_distributed_env = all(k in os.environ for k in ['RANK', 'WORLD_SIZE', 'LOCAL_RANK'])
@@ -411,10 +428,21 @@ def main():
     dataset_type = cfg.get("data", {}).get("dataset", {}).get("type", "")
     if dataset_type == "CompressedPLibDataset":
         from sirentv.eval.eval_pca import evaluate_pca
-        evaluate_pca(cfg, output_file=args.output, pmt_ids=args.pmt_ids, ckpt_file=args.ckpt, comparisons=args.compare)
+        evaluate_pca(cfg, output_file=args.output, pmt_ids=args.pmt_ids, ckpt_file=args.ckpt,
+                     comparisons=args.compare, spectra=args.spectra,
+                     spectra_components=args.spectra_components,
+                     grad_cache_file=args.grad_cache or cfg.get("train", {}).get("grad_target_cache_file"))
     elif dataset_type == "QuantilePLibDataset":
         from sirentv.eval.eval_quantile import evaluate_quantile
-        evaluate_quantile(cfg, output_file=args.output, pmt_ids=args.pmt_ids, ckpt_file=args.ckpt)
+        evaluate_quantile(
+            cfg,
+            output_file=args.output,
+            pmt_ids=args.pmt_ids,
+            ckpt_file=args.ckpt,
+            spectra=args.spectra,
+            spectra_components=args.spectra_components,
+            grad_cache_file=args.grad_cache or cfg.get("train", {}).get("grad_target_cache_file"),
+        )
     else:
         evaluate(cfg, output_file=args.output, ckpt_file=args.ckpt)
 

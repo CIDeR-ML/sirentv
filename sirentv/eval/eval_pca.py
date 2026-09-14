@@ -19,6 +19,7 @@ from sirentv.eval.utils import (
     BinnedMeanAccumulator,
     gather_to_rank0,
     build_spatial_slice_diagnostics,
+    build_power_spectra,
 )
 
 
@@ -32,6 +33,9 @@ def evaluate_pca(
     pmt_ids: list[int] | None = None,
     ckpt_file: str | None = None,
     comparisons: list[str] | None = None,
+    spectra: bool = False,
+    spectra_components: list[int] | None = None,
+    grad_cache_file: str | None = None,
 ):
     rank = dist.get_rank() if dist.is_initialized() else 0
     world_size = dist.get_world_size() if dist.is_initialized() else 1
@@ -154,6 +158,18 @@ def evaluate_pca(
     all_time_bias = []
     all_ceiling_time_bias = []
 
+    # Power-spectrum diagnostic: PCA coefficients are accumulated ONLY for the requested
+    # PMTs and components, never the full (N, 81, 50) grid -- that full array is what
+    # silently OOM-killed the notebook kernel doing the same diagnostic interactively.
+    # v and t0 need no extra accumulation; they are already gathered above.
+    do_spectra = bool(spectra and pmt_ids)
+    spectra_components = list(spectra_components) if spectra_components else [0, 1, 2, 3, 4]
+    all_pred_coeffs_slice = []
+    all_compressed_coeffs_slice = []
+    if do_spectra and rank == 0:
+        print(f"[eval_pca] Power spectra enabled for PMTs {pmt_ids}, "
+              f"coeff components {spectra_components}")
+
     for batch_idx, data in enumerate(tqdm(dl, desc=f"Rank {rank} eval", disable=(rank != 0))):
         x = data["position"].contiguous().to(device)
         target = {k: v.contiguous().to(device) for k, v in data["target"].items()}
@@ -271,6 +287,19 @@ def evaluate_pca(
         all_compressed_t0.append(compressed_t0.detach().cpu())
         all_positions.append(x.detach().cpu())
 
+        if do_spectra:
+            # pred_coeffs/compressed_coeffs are already denormalized above when
+            # normalize_coeffs is set, so both sides are in the same physical units the
+            # truth spectra were computed in.
+            sel = torch.as_tensor(pmt_ids, device=pred_coeffs.device)
+            comp = torch.as_tensor(spectra_components, device=pred_coeffs.device)
+            all_pred_coeffs_slice.append(
+                pred_coeffs.detach()[:, sel][..., comp].cpu()
+            )
+            all_compressed_coeffs_slice.append(
+                compressed_coeffs.detach()[:, sel][..., comp].cpu()
+            )
+
         # print running bias values (pred vs. compressed target) from all ranks
         if (batch_idx + 1) % log_every == 0 and is_distributed:
             local_running_vis = acc_pred_vs_compressed.overall_vis_bias_sum / acc_pred_vs_compressed.overall_vis_bias_count.clamp(min=1)
@@ -300,6 +329,9 @@ def evaluate_pca(
         "vis_errors": torch.cat(all_vis_errors, dim=0),
         "quantile_errors": torch.cat(all_quantile_errors, dim=0),
     }
+    if do_spectra:
+        local_results["pred_coeffs_slice"] = torch.cat(all_pred_coeffs_slice, dim=0)
+        local_results["compressed_coeffs_slice"] = torch.cat(all_compressed_coeffs_slice, dim=0)
     if do_pred_vs_compressed:
         local_results["time_bias"] = torch.cat(all_time_bias, dim=0)
     if do_compressed_vs_raw:
@@ -454,6 +486,57 @@ def evaluate_pca(
                     pmt_id=pid,
                 )
 
+        if do_spectra:
+            positions_np = all_positions_tensor.numpy()
+            target_vis_np = all_compressed_vis_tensor.numpy()
+            pred_coeffs_np = gathered["pred_coeffs_slice"].numpy()
+            target_coeffs_np = gathered["compressed_coeffs_slice"].numpy()
+
+            # Cached gradient targets are per-(voxel, PMT) and indexed by voxel_id over the
+            # FULL LUT, while this eval may have run on a subset -- so it is only usable when
+            # the row counts line up. Prediction-side gradient spectra are NOT computed here:
+            # they need a forward pass with grad_keys enabled (create_graph), which
+            # @torch.no_grad() eval deliberately does not do.
+            grad_targets = None
+            if grad_cache_file:
+                import h5py
+
+                with h5py.File(grad_cache_file, "r") as gf:
+                    if gf["v"].shape[0] == positions_np.shape[0]:
+                        grad_targets = {
+                            "grad_v": gf["v"][:],
+                            "grad_coeffs": gf["coeffs"][:],
+                        }
+                    else:
+                        print(f"[eval_pca] grad cache has {gf['v'].shape[0]} rows but eval "
+                              f"covered {positions_np.shape[0]} -- skipping gradient spectra")
+
+            results["power_spectra"] = {}
+            for i, pid in enumerate(pmt_ids):
+                print(f"[eval_pca] Building power spectra for PMT {pid}...")
+                valid = target_vis_np[:, pid] > 0
+                fields = {
+                    "v": {
+                        "pred": all_pred_vis_tensor.numpy()[:, pid],
+                        "target": target_vis_np[:, pid],
+                    },
+                    "t0": {
+                        "pred": all_pred_t0_tensor.numpy()[:, pid],
+                        "target": all_compressed_t0_tensor.numpy()[:, pid],
+                    },
+                    "coeffs": {
+                        "pred": pred_coeffs_np[:, i, :],
+                        "target": target_coeffs_np[:, i, :],
+                    },
+                }
+                if grad_targets is not None:
+                    fields["grad_v"] = {"target": grad_targets["grad_v"][:, pid]}
+                    fields["grad_coeffs"] = {"target": grad_targets["grad_coeffs"][:, pid]}
+
+                spec = build_power_spectra(positions_np, fields, valid)
+                spec["_components"] = list(spectra_components)
+                results["power_spectra"][pid] = spec
+
         output_dir = os.path.dirname(output_file)
         if output_dir:
             os.makedirs(output_dir, exist_ok=True)
@@ -491,7 +574,27 @@ def main():
              "Default: all three (if raw_quantile_plib is configured) or just pred_vs_compressed "
              "(if not).",
     )
+    parser.add_argument(
+        "--spectra", action="store_true", default=False,
+        help="Also compute (kx, ky, kz) spatial-frequency power spectra of v/t0/coeffs, truth "
+             "vs prediction, for each --pmt-ids PMT. Requires --pmt-ids. Off by default, so "
+             "existing eval runs are unchanged.",
+    )
+    parser.add_argument(
+        "--spectra-components", type=int, nargs="+", default=None,
+        help="PCA components to include in the coefficient spectra (default: 0 1 2 3 4). Only "
+             "these are accumulated, never the full 50-component grid.",
+    )
+    parser.add_argument(
+        "--grad-cache", type=str, default=None,
+        help="Cached gradient-target .h5 (train.grad_target_cache_file). If given and its row "
+             "count matches the evaluated set, target-side grad_v/grad_coeffs spectra are "
+             "added. Prediction-side gradient spectra are not available under no_grad eval.",
+    )
     args = parser.parse_args()
+
+    if args.spectra and not args.pmt_ids:
+        parser.error("--spectra requires --pmt-ids (spectra are computed per PMT)")
 
     # Check if running in distributed mode (torchrun sets these env vars)
     is_distributed_env = all(k in os.environ for k in ["RANK", "WORLD_SIZE", "LOCAL_RANK"])
@@ -510,7 +613,10 @@ def main():
     with open(args.config, "r") as f:
         cfg = yaml.safe_load(f)
 
-    evaluate_pca(cfg, output_file=args.output, pmt_ids=args.pmt_ids, ckpt_file=args.ckpt, comparisons=args.compare)
+    evaluate_pca(cfg, output_file=args.output, pmt_ids=args.pmt_ids, ckpt_file=args.ckpt,
+                 comparisons=args.compare, spectra=args.spectra,
+                 spectra_components=args.spectra_components,
+                 grad_cache_file=args.grad_cache or cfg.get("train", {}).get("grad_target_cache_file"))
 
     if is_distributed_env:
         dist.destroy_process_group()
