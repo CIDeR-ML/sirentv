@@ -1,5 +1,5 @@
 compressed_plib:
-    filepath: /global/cfs/cdirs/m5238/users/junjiex/CIDER-ML/data/compressed_plib_b05_quantile_log_prod_lite_n50.h5
+    filepath: /pscratch/sd/j/junjiex/SIREN/data/compressed_plib_b05_quantile_log_prod_lite_n50.h5
     lazy: true
     n_components: 50
     n_photon: 3.0e7
@@ -10,7 +10,7 @@ compressed_plib:
 # eval-only: true (uncompressed) quantile function, for measuring the PCA-reconstruction
 # ceiling (compressed target vs. raw) separately from model error. Ignored by training.
 raw_quantile_plib:
-    filepath: /global/cfs/cdirs/m5238/users/junjiex/CIDER-ML/data/full_wvfm_plib_b05_quantile_prod_lite_fixed.h5
+    filepath: /pscratch/sd/j/junjiex/SIREN/data/full_wvfm_plib_b05_quantile_prod_lite_fixed.h5
     mode: quantile
 physics:
     R_index: 1.233
@@ -68,7 +68,8 @@ data:
     loader:
       batch_size: 512
       drop_last: true
-      num_workers: 4
+      num_workers: 16
+      prefetch_factor: 4
       pin_memory: true
       shuffle: true
       load_pos: true
