@@ -26,9 +26,7 @@ nothing except through those per-branch knobs.
 
 Note what is deliberately NOT a branch: `*_grad_frob`. The predicted gradient magnitude
 is not a network output -- SirenTV.forward autograd-differentiates a branch's value
-output with respect to position (see compute_grad_frob_hutchinson). Giving it its own
-branch would supervise the slope of a function never evaluated at inference, while
-leaving the field actually used unconstrained.
+output with respect to position (see compute_grad_frob_hutchinson).
 
 Branch naming and checkpoint compatibility
 ------------------------------------------
