@@ -69,6 +69,31 @@ def train(cfg: dict):
     iteration_ctr = 0
     epoch_ctr = 0
 
+    # --- Reproducibility ---------------------------------------------------------
+    # Off by default (None): every existing config that doesn't set this is unaffected.
+    # Without it, SirenTV's weight init below draws from whatever unseeded state the
+    # process's global RNGs happen to be in -- different every submission, which is what
+    # let an ablation sweep's cells confound "the swept variable" with "which random init
+    # this particular run happened to draw" (see the stage1 q3 omega030 dead-v_net incident).
+    # Same seed value on every DDP rank is intentional, not a bug: create_ddp_model's
+    # DistributedDataParallel wrapper broadcasts rank 0's parameters to every other rank on
+    # construction regardless, so rank-dependent seeding here would only matter if something
+    # read the RNG before that broadcast -- nothing does. The data loader's own shuffle order
+    # is already deterministic independent of this (DistributedSampler defaults to seed=0),
+    # so this one setting is what closes the actual gap.
+    seed = cfg.get("train", {}).get("seed")
+    if seed is not None:
+        import random
+
+        import numpy as np
+
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        if rank == 0:
+            print(f"[train] seed set to {seed}")
+
     # --- Model ---
     net = SirenTV(cfg).to(DEVICE)
     if is_distributed:
