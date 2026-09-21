@@ -160,44 +160,44 @@ class QuantilePLib:
             arr = arr[..., ::self._combine_every_quantile]
         return torch.from_numpy(np.asarray(arr)).to(self._device)
 
-    def __getitem__(self, voxel_ids):
+    FIELDS = ("vis", "t0", "quantiles")
+
+    def __getitem__(self, voxel_ids, fields=None):
+        """Read the requested fields for these voxel(s). Default: all of FIELDS.
+
+        `fields` exists because a single-target run consumes only one of them, and the
+        payloads are wildly asymmetric: one voxel of `quantiles` is 81 x 512 x 4 B = 162 KiB
+        against ~0.3 KiB for `vis` or `t0`. Reading all three for a v-only or t0-only branch
+        therefore costs ~500x the bandwidth it uses and makes those runs data-bound on data
+        they discard. QuantilePLibDataset derives the set from which targets it was asked
+        for -- see _fields_for_targets.
+        """
+        fields = self.FIELDS if fields is None else tuple(fields)
+        unknown = [f for f in fields if f not in self.FIELDS]
+        if unknown:
+            raise ValueError(f"unknown field(s) {unknown}; expected a subset of {self.FIELDS}")
+
+        out = {}
         if self._file is None and not isinstance(voxel_ids, (int, np.integer)):
             vox = voxel_ids
             if isinstance(vox, np.ndarray):
                 vox = torch.from_numpy(vox).long().to(self.vis.device)
             uniq, inv = torch.unique(vox, return_inverse=True)
             # index_select can be faster than [uniq] for large plibs (gather from huge tensor)
-            vis = torch.index_select(self.vis, 0, uniq)[inv].clone()
-            t0 = torch.index_select(self.t0, 0, uniq)[inv].clone()
-            quantiles = torch.index_select(self.quantiles, 0, uniq)[inv].clone()
+            for f in fields:
+                out[f] = torch.index_select(getattr(self, f), 0, uniq)[inv].clone()
         else:
-            if self._debug_timing:
-                t_start = time.perf_counter()
-                vis = self._read_slice("vis", voxel_ids)
-                t_vis = time.perf_counter()
-                t0 = self._read_slice("t0", voxel_ids)
-                t_t0 = time.perf_counter()
-                quantiles = self._read_slice("quantiles", voxel_ids)
-                t_quantiles = time.perf_counter()
+            # The old per-field perf_counter timing here fed a _timing_stats accumulator that
+            # is commented out at the top of this module, so it was dead code. Re-add it
+            # together with that accumulator if the per-field breakdown is wanted again.
+            for f in fields:
+                out[f] = self._read_slice(f, voxel_ids)
 
-                """_timing_stats["vis"] += t_vis - t_start
-                _timing_stats["t0"] += t_t0 - t_vis
-                _timing_stats["quantiles"] += t_quantiles - t_t0
-                _timing_stats["count"] += 1
-                if _timing_stats["count"] % _TIMING_PRINT_EVERY == 0:
-                    _report_timing()
-                """
-            else:
-                vis = self._read_slice("vis", voxel_ids)
-                t0 = self._read_slice("t0", voxel_ids)
-                quantiles = self._read_slice("quantiles", voxel_ids)
-
-        if quantiles.dim() == 2:
-            quantiles = quantiles[:, : self._n_quantiles//self._combine_every_quantile]
-        else:
-            quantiles = quantiles[..., : self._n_quantiles//self._combine_every_quantile]
-            
-        return {"vis": vis, "t0": t0, "quantiles": quantiles}
+        if "quantiles" in out:
+            q = out["quantiles"]
+            n = self._n_quantiles // self._combine_every_quantile
+            out["quantiles"] = q[:, :n] if q.dim() == 2 else q[..., :n]
+        return out
 
     def contain(self, pos):
         """Check containment in the (possibly full symmetric) volume."""
@@ -375,6 +375,27 @@ class QuantilePLibDataset(Dataset):
             indices = torch.arange(effective, dtype=torch.long)
 
         self.indices = indices
+
+        # Which targets to emit, and therefore which LUT fields to READ. Default None means
+        # all of them, so existing configs are unaffected.
+        #
+        # This matters a lot for the single-branch runs: one voxel of `quantiles` is 162 KiB
+        # against ~0.3 KiB for `vis`/`t0`, so a v-only or t0-only branch that still reads
+        # quantiles moves ~500x the bytes it uses and goes data-bound on data it throws away.
+        # Set data.target_keys: [v] (or [t0], [quantiles]) to read only what is consumed.
+        self._target_keys = data_cfg.get("target_keys")
+        if self._target_keys is not None:
+            self._target_keys = list(self._target_keys)
+            known = ("v", "t0", "quantiles")
+            unknown = [k for k in self._target_keys if k not in known]
+            if unknown:
+                raise ValueError(
+                    f"data.target_keys {unknown} unknown; expected a subset of {known}"
+                )
+        self._read_fields = self._fields_for_targets(self._target_keys)
+        if self._target_keys is not None and rank == 0:
+            print(f"[QuantilePLibDataset] targets {self._target_keys} "
+                  f"-> reading LUT fields {sorted(self._read_fields)}")
 
         # Target-side spatial-gradient precomputation (Frobenius norm across channels) for
         # whichever keys train.grad_supervision_keys asks for -- identical mechanism to
@@ -568,6 +589,23 @@ class QuantilePLibDataset(Dataset):
     def __len__(self):
         return len(self.indices)
 
+    @staticmethod
+    def _fields_for_targets(target_keys):
+        """Which LUT fields must be read to build the requested targets.
+
+        `quantiles` needs `vis` as well, not just `quantiles`: quantiles_mask is derived
+        from the RAW target visibility (vis_raw > 0), because a zero-visibility (voxel, PMT)
+        pair has no waveform and its quantiles are NaN in the LUT. Dropping vis there would
+        silently feed those NaNs into the loss.
+        """
+        if target_keys is None:
+            return set(QuantilePLib.FIELDS)
+        need = {"v": {"vis"}, "t0": {"t0"}, "quantiles": {"quantiles", "vis"}}
+        fields = set()
+        for k in target_keys:
+            fields |= need[k]
+        return fields
+
     def __getitem__(self, idx):
         if hasattr(self, "_v"):
             # Precomputed path (GPU or eager CPU)
@@ -598,35 +636,29 @@ class QuantilePLibDataset(Dataset):
         # Lazy CPU path
         vox_id = self.indices[idx].item()
         pos = torch.from_numpy(self._quantile_plib.pos[vox_id]).float()
-        data = self._quantile_plib[vox_id]
-        vis_raw = data["vis"].float()
-        t0_raw = data["t0"].float()
-        quantiles = data["quantiles"].float()
+        data = self._quantile_plib.__getitem__(vox_id, fields=self._read_fields)
 
-        vis_norm = vis_raw / self._n_photon
-        v = self._xform_vis(vis_norm)
-        t0 = torch.log(t0_raw.clamp(min=1e-3))
-
-        if self._log_quantile:
-            quantiles = torch.log10(quantiles.clamp(min=0.0) + self._log_quantile_C)
-
-        target = {
-            "v": v,
-            "t0": t0,
-            "quantiles": quantiles,
-            "quantiles_mask": vis_raw > 0,
-        }
+        want = self._target_keys
+        target, meta = {}, {}
+        vis_raw = data["vis"].float() if "vis" in data else None
+        if vis_raw is not None:
+            meta["v_linear"] = vis_raw
+        if want is None or "v" in want:
+            target["v"] = self._xform_vis(vis_raw / self._n_photon)
+        if want is None or "t0" in want:
+            t0_raw = data["t0"].float()
+            target["t0"] = torch.log(t0_raw.clamp(min=1e-3))
+            meta["t0_raw"] = t0_raw
+        if want is None or "quantiles" in want:
+            quantiles = data["quantiles"].float()
+            if self._log_quantile:
+                quantiles = torch.log10(quantiles.clamp(min=0.0) + self._log_quantile_C)
+            target["quantiles"] = quantiles
+            target["quantiles_mask"] = vis_raw > 0
         for key in self._grad_keys:
             target[f"{key}_grad_frob"] = self._grad_targets[key][idx]
 
-        return {
-            "position": pos,
-            "target": target,
-            "meta": {
-                "v_linear": vis_raw,
-                "t0_raw": t0_raw,
-            },
-        }
+        return {"position": pos, "target": target, "meta": meta}
 
     def __getitems__(self, indices):
         """Fetch a whole batch with ONE read per field instead of one read per sample.
@@ -642,38 +674,39 @@ class QuantilePLibDataset(Dataset):
 
         idx = np.asarray(indices)
         vox = self.indices[torch.as_tensor(idx, dtype=torch.long)].numpy()
-        data = self._quantile_plib[vox]
-        vis_raw = data["vis"].float()           # (B, n_pmt)
-        t0_raw = data["t0"].float()             # (B, n_pmt)
-        quantiles = data["quantiles"].float()   # (B, n_pmt, n_quantile)
+        data = self._quantile_plib.__getitem__(vox, fields=self._read_fields)
 
-        v = self._xform_vis(vis_raw / self._n_photon)
-        t0 = torch.log(t0_raw.clamp(min=1e-3))
-        if self._log_quantile:
-            quantiles = torch.log10(quantiles.clamp(min=0.0) + self._log_quantile_C)
-        # Zero-visibility (voxel, PMT) pairs have NaN quantiles in the LUT; the mask is what
-        # keeps them out of the loss. Computed from the RAW visibility, as in __getitem__.
-        mask = vis_raw > 0
+        want = self._target_keys
+        cols, metacols = {}, {}
+        vis_raw = data["vis"].float() if "vis" in data else None      # (B, n_pmt)
+        if vis_raw is not None:
+            metacols["v_linear"] = vis_raw
+        if want is None or "v" in want:
+            cols["v"] = self._xform_vis(vis_raw / self._n_photon)
+        if want is None or "t0" in want:
+            t0_raw = data["t0"].float()
+            cols["t0"] = torch.log(t0_raw.clamp(min=1e-3))
+            metacols["t0_raw"] = t0_raw
+        if want is None or "quantiles" in want:
+            quantiles = data["quantiles"].float()                      # (B, n_pmt, n_quantile)
+            if self._log_quantile:
+                quantiles = torch.log10(quantiles.clamp(min=0.0) + self._log_quantile_C)
+            cols["quantiles"] = quantiles
+            # Zero-visibility (voxel, PMT) pairs have NaN quantiles in the LUT; the mask is
+            # what keeps them out of the loss. From the RAW visibility, as in __getitem__.
+            cols["quantiles_mask"] = vis_raw > 0
         pos = torch.from_numpy(self._quantile_plib.pos[vox]).float()
         grads = {k: self._grad_targets[k][idx] for k in self._grad_keys}
 
         out = []
         for j in range(idx.shape[0]):
-            target = {
-                "v": v[j],
-                "t0": t0[j],
-                "quantiles": quantiles[j],
-                "quantiles_mask": mask[j],
-            }
+            target = {k: v[j] for k, v in cols.items()}
             for k in self._grad_keys:
                 target[f"{k}_grad_frob"] = grads[k][j]
             out.append({
                 "position": pos[j],
                 "target": target,
-                "meta": {
-                    "v_linear": vis_raw[j],
-                    "t0_raw": t0_raw[j],
-                },
+                "meta": {k: v[j] for k, v in metacols.items()},
             })
         return out
 
