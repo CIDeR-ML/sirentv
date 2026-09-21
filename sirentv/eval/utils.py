@@ -53,42 +53,68 @@ class PairwiseBiasAccumulator:
         self.overall_time_bias_sum = torch.tensor(0.0, device=device)
         self.overall_time_bias_count = torch.tensor(0.0, device=device)
 
-    def update(self, pred_v: torch.Tensor, target_v: torch.Tensor, pred_cdf: torch.Tensor, target_cdf: torch.Tensor):
+        # Whether update() has ever been called with a real (non-None) pred_v/pred_cdf --
+        # lets finalize() report NaN instead of a misleading 0.0 (i.e. "perfect agreement")
+        # for a half that was never actually predicted (single-branch ablation models).
+        self._vis_used = False
+        self._time_used = False
+
+    def update(
+        self,
+        pred_v: Optional[torch.Tensor],
+        target_v: torch.Tensor,
+        pred_cdf: Optional[torch.Tensor],
+        target_cdf: torch.Tensor,
+    ):
+        """pred_v/pred_cdf may be None when the model being evaluated has no branch for
+        that output (e.g. a single-branch t0_net-only ablation predicts neither v nor
+        quantiles) -- that half is then skipped entirely rather than compared against a
+        fabricated prediction. target_v/target_cdf are always required: the dataset
+        returns the full (v, t0, quantiles) target regardless of which branches the
+        model actually has.
+        """
         from sirentv.analysis import bias as compute_bias
 
         threshold = self.threshold
-        target_dict = {"v_linear": target_v, "t_linear": target_cdf}
-        pred_dict = {"v_linear": pred_v, "t_linear": pred_cdf}
 
-        vis_masked_count = (target_v > threshold).sum()
-        time_masked_count = (target_cdf > threshold).sum()
-        self.overall_vis_bias_sum += compute_bias(target_dict, pred_dict, key="v_linear", threshold=threshold) * vis_masked_count
-        self.overall_vis_bias_count += vis_masked_count
-        self.overall_time_bias_sum += compute_bias(target_dict, pred_dict, key="t_linear", threshold=threshold) * time_masked_count
-        self.overall_time_bias_count += time_masked_count
+        if pred_v is not None:
+            self._vis_used = True
+            vis_masked_count = (target_v > threshold).sum()
+            self.overall_vis_bias_sum += compute_bias(
+                {"v_linear": target_v}, {"v_linear": pred_v}, key="v_linear", threshold=threshold
+            ) * vis_masked_count
+            self.overall_vis_bias_count += vis_masked_count
 
-        # per-PMT visibility bias
-        vis_mask = target_v > threshold
-        p, t = pred_v, target_v
-        vis_bias_vals = torch.where(
-            vis_mask, 2 * torch.abs(p - t) / (p + t).clamp(min=1e-10), torch.zeros_like(p)
-        )
-        self.vis_bias_sum += (vis_bias_vals * vis_mask).sum(dim=0)
-        self.vis_bias_sq_sum += ((vis_bias_vals ** 2) * vis_mask).sum(dim=0)
-        self.vis_count += vis_mask.sum(dim=0).float()
+            # per-PMT visibility bias
+            vis_mask = target_v > threshold
+            p, t = pred_v, target_v
+            vis_bias_vals = torch.where(
+                vis_mask, 2 * torch.abs(p - t) / (p + t).clamp(min=1e-10), torch.zeros_like(p)
+            )
+            self.vis_bias_sum += (vis_bias_vals * vis_mask).sum(dim=0)
+            self.vis_bias_sq_sum += ((vis_bias_vals ** 2) * vis_mask).sum(dim=0)
+            self.vis_count += vis_mask.sum(dim=0).float()
 
-        # per-tick CDF bias
-        n = min(self.time_bias_sum.shape[0], pred_cdf.shape[-1], target_cdf.shape[-1])
-        pt, tt = pred_cdf[..., :n], target_cdf[..., :n]
-        time_mask = tt > threshold
-        time_bias_vals = torch.where(
-            time_mask, 2 * torch.abs(pt - tt) / (pt + tt).clamp(min=1e-10), torch.zeros_like(pt)
-        )
-        time_bias_per_tick = time_bias_vals.sum(dim=1) / time_mask.sum(dim=1).clamp(min=1)
-        time_mask_any = time_mask.any(dim=1)
-        self.time_bias_sum[:n] += (time_bias_per_tick * time_mask_any).sum(dim=0)
-        self.time_bias_sq_sum[:n] += ((time_bias_per_tick ** 2) * time_mask_any).sum(dim=0)
-        self.time_count[:n] += time_mask_any.sum(dim=0).float()
+        if pred_cdf is not None:
+            self._time_used = True
+            time_masked_count = (target_cdf > threshold).sum()
+            self.overall_time_bias_sum += compute_bias(
+                {"t_linear": target_cdf}, {"t_linear": pred_cdf}, key="t_linear", threshold=threshold
+            ) * time_masked_count
+            self.overall_time_bias_count += time_masked_count
+
+            # per-tick CDF bias
+            n = min(self.time_bias_sum.shape[0], pred_cdf.shape[-1], target_cdf.shape[-1])
+            pt, tt = pred_cdf[..., :n], target_cdf[..., :n]
+            time_mask = tt > threshold
+            time_bias_vals = torch.where(
+                time_mask, 2 * torch.abs(pt - tt) / (pt + tt).clamp(min=1e-10), torch.zeros_like(pt)
+            )
+            time_bias_per_tick = time_bias_vals.sum(dim=1) / time_mask.sum(dim=1).clamp(min=1)
+            time_mask_any = time_mask.any(dim=1)
+            self.time_bias_sum[:n] += (time_bias_per_tick * time_mask_any).sum(dim=0)
+            self.time_bias_sq_sum[:n] += ((time_bias_per_tick ** 2) * time_mask_any).sum(dim=0)
+            self.time_count[:n] += time_mask_any.sum(dim=0).float()
 
     def all_reduce(self):
         for t in [
@@ -100,18 +126,29 @@ class PairwiseBiasAccumulator:
             dist.all_reduce(t, op=dist.ReduceOp.SUM)
 
     def finalize(self):
-        overall_vis_bias = self.overall_vis_bias_sum / self.overall_vis_bias_count.clamp(min=1)
-        overall_time_bias = self.overall_time_bias_sum / self.overall_time_bias_count.clamp(min=1)
+        # Never-updated half (single-branch model with no v or no quantiles prediction) --
+        # report NaN, not 0.0/(0.0/1) which would misleadingly read as "perfect agreement".
+        if not self._vis_used:
+            nan_pmt = torch.full_like(self.vis_bias_sum, float("nan")).cpu()
+            overall_vis_bias = torch.tensor(float("nan"))
+            vis_bias_mean = vis_bias_std = vis_bias_sem = nan_pmt
+        else:
+            overall_vis_bias = self.overall_vis_bias_sum / self.overall_vis_bias_count.clamp(min=1)
+            vis_bias_mean = self.vis_bias_sum / self.vis_count.clamp(min=1)
+            vis_bias_var = (self.vis_bias_sq_sum / self.vis_count.clamp(min=1)) - vis_bias_mean ** 2
+            vis_bias_std = torch.sqrt(vis_bias_var.clamp(min=0))
+            vis_bias_sem = vis_bias_std / torch.sqrt(self.vis_count.clamp(min=1))
 
-        vis_bias_mean = self.vis_bias_sum / self.vis_count.clamp(min=1)
-        vis_bias_var = (self.vis_bias_sq_sum / self.vis_count.clamp(min=1)) - vis_bias_mean ** 2
-        vis_bias_std = torch.sqrt(vis_bias_var.clamp(min=0))
-        vis_bias_sem = vis_bias_std / torch.sqrt(self.vis_count.clamp(min=1))
-
-        time_bias_mean = self.time_bias_sum / self.time_count.clamp(min=1)
-        time_bias_var = (self.time_bias_sq_sum / self.time_count.clamp(min=1)) - time_bias_mean ** 2
-        time_bias_std = torch.sqrt(time_bias_var.clamp(min=0))
-        time_bias_sem = time_bias_std / torch.sqrt(self.time_count.clamp(min=1))
+        if not self._time_used:
+            nan_tick = torch.full_like(self.time_bias_sum, float("nan")).cpu()
+            overall_time_bias = torch.tensor(float("nan"))
+            time_bias_mean = time_bias_std = time_bias_sem = nan_tick
+        else:
+            overall_time_bias = self.overall_time_bias_sum / self.overall_time_bias_count.clamp(min=1)
+            time_bias_mean = self.time_bias_sum / self.time_count.clamp(min=1)
+            time_bias_var = (self.time_bias_sq_sum / self.time_count.clamp(min=1)) - time_bias_mean ** 2
+            time_bias_std = torch.sqrt(time_bias_var.clamp(min=0))
+            time_bias_sem = time_bias_std / torch.sqrt(self.time_count.clamp(min=1))
 
         return {
             "overall": {"vis_bias": overall_vis_bias.cpu(), "time_bias": overall_time_bias.cpu()},
@@ -133,8 +170,14 @@ class ScalarErrorAccumulator:
         self.err_sum = torch.tensor(0.0, device=device)
         self.err_sq_sum = torch.tensor(0.0, device=device)
         self.count = torch.tensor(0.0, device=device)
+        # Never-updated (e.g. a single-branch ablation model with no t0 prediction at all)
+        # -- finalize() reports NaN rather than a misleading 0.0 mean/std.
+        self._used = False
 
-    def update(self, pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor):
+    def update(self, pred: torch.Tensor | None, target: torch.Tensor, mask: torch.Tensor):
+        if pred is None:
+            return
+        self._used = True
         err = torch.abs(pred - target)[mask]
         self.err_sum += err.sum()
         self.err_sq_sum += (err ** 2).sum()
@@ -145,6 +188,9 @@ class ScalarErrorAccumulator:
             dist.all_reduce(t, op=dist.ReduceOp.SUM)
 
     def finalize(self):
+        if not self._used:
+            nan = torch.tensor(float("nan"))
+            return {"mean": nan, "std": nan, "count": self.count.cpu()}
         mean = self.err_sum / self.count.clamp(min=1)
         var = (self.err_sq_sum / self.count.clamp(min=1)) - mean ** 2
         std = torch.sqrt(var.clamp(min=0))
