@@ -412,6 +412,13 @@ def main():
         help="Cached gradient-target .h5; adds target-side grad_v/grad_coeffs spectra when its "
              "row count matches the evaluated set. Defaults to train.grad_target_cache_file.",
     )
+    parser.add_argument(
+        "--no-grad-spectra", action="store_true", default=False,
+        help="Do not compute the target-side gradient (grad_v/grad_coeffs/grad_quantiles) "
+             "power spectra, even though the config names a grad_target_cache_file. Without "
+             "this, any grad-supervised config picks its cache up automatically and pays for "
+             "spectra you may not want. The v/t0/representation spectra are unaffected.",
+    )
     args = parser.parse_args()
 
     # Check if running in distributed mode (torchrun sets these env vars)
@@ -441,6 +448,15 @@ def main():
     with open(args.config, "r") as f:
         cfg = yaml.safe_load(f)
 
+    # Resolved once: an explicit --grad-cache wins, the config's own cache is the fallback,
+    # and --no-grad-spectra suppresses both. Passing None is what the evaluators read as
+    # "skip the target-side gradient spectra"; the v/t0/representation spectra still run.
+    grad_cache_file = args.grad_cache or cfg.get("train", {}).get("grad_target_cache_file")
+    if args.no_grad_spectra:
+        if grad_cache_file:
+            print(f"[main] --no-grad-spectra: ignoring grad cache {grad_cache_file}")
+        grad_cache_file = None
+
     dataset_type = cfg.get("data", {}).get("dataset", {}).get("type", "")
     if dataset_type == "CompressedPLibDataset":
         from sirentv.eval.eval_pca import evaluate_pca
@@ -448,7 +464,7 @@ def main():
                      comparisons=args.compare, spectra=args.spectra,
                      spectra_components=args.spectra_components,
                      spectra_x_margin=args.spectra_x_margin,
-                     grad_cache_file=args.grad_cache or cfg.get("train", {}).get("grad_target_cache_file"))
+                     grad_cache_file=grad_cache_file)
     elif dataset_type == "QuantilePLibDataset":
         from sirentv.eval.eval_quantile import evaluate_quantile
         evaluate_quantile(
@@ -459,7 +475,7 @@ def main():
             spectra=args.spectra,
             spectra_components=args.spectra_components,
             spectra_x_margin=args.spectra_x_margin,
-            grad_cache_file=args.grad_cache or cfg.get("train", {}).get("grad_target_cache_file"),
+            grad_cache_file=grad_cache_file,
         )
     else:
         evaluate(cfg, output_file=args.output, ckpt_file=args.ckpt)

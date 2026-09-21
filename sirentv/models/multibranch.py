@@ -41,6 +41,7 @@ from __future__ import annotations
 
 from typing import List
 
+import torch
 from slar.base import Siren
 from torch import nn
 
@@ -153,6 +154,22 @@ class MultiBranchSiren(nn.Module):
                 spec.get("first_omega_0", first_omega_0),
                 spec.get("hidden_omega_0", hidden_omega_0),
             )
+            # Optional per-key starting offset for this branch's output.
+            #
+            # Why this exists: WeightedPoissonNLLLoss does clamp(inv_xform(pred), min=eps),
+            # and torch.clamp has EXACTLY ZERO gradient below its min. A SIREN's initial
+            # output is centred near 0 with std ~0.01-0.06, and inv_xform maps that straight
+            # onto (or below) eps=1e-8 -- inv_xform(0.00) = 0 and inv_xform(-0.05) is
+            # NEGATIVE. So the v branch can start with every entry in the dead zone, receive
+            # no gradient at all, and sit at the loss floor forever. Measured: 3 of 4 seeds
+            # dead, including seed 0. The 3-branch runs only escaped because they were
+            # unseeded and drew a live init.
+            #
+            # Setting the final bias to roughly the target mean starts the output inside the
+            # live region for ANY seed, and additionally removes the "climb to the target
+            # mean" phase that would otherwise dominate an early-epoch convergence
+            # comparison. Left unset, nothing changes.
+            self._init_output_bias(net, name, spec.get("init_output_bias"), keys, widths)
             # add_module rather than a ModuleList: the submodule name (and therefore every
             # state_dict key) comes from the spec, which is what keeps the legacy wrappers
             # checkpoint-compatible.
@@ -164,6 +181,42 @@ class MultiBranchSiren(nn.Module):
         # Consumed only for the output_scale length assertion and n_outs (see
         # SirenTV.out_features), both of which care about the total, not the split.
         self.out_features = [sum(w) for w in self._branch_widths]
+
+    @staticmethod
+    def _init_output_bias(net, branch_name, bias_spec, keys, widths):
+        """Set the final layer's bias per OUTPUT KEY, in the same slice order forward uses.
+
+        bias_spec is a {key: value} mapping, so a branch emitting several keys can offset
+        them independently and any key left out keeps slar's default init. A bare scalar is
+        accepted too and applies to every key this branch emits.
+        """
+        if bias_spec is None:
+            return
+        if isinstance(bias_spec, (int, float)):
+            bias_spec = {k: float(bias_spec) for k in keys}
+        unknown = sorted(set(bias_spec) - set(keys))
+        if unknown:
+            raise ValueError(
+                f"branch {branch_name!r}: init_output_bias names key(s) {unknown} that this "
+                f"branch does not emit (it emits {keys})"
+            )
+
+        # outermost_linear=True gives a bare nn.Linear; otherwise the last entry is a
+        # SineLayer wrapping one. Reaching through .linear covers both.
+        final = net.net[-1]
+        linear = final if isinstance(final, nn.Linear) else getattr(final, "linear", None)
+        if linear is None or linear.bias is None:
+            raise ValueError(
+                f"branch {branch_name!r}: cannot apply init_output_bias -- the final layer "
+                f"({type(final).__name__}) exposes no bias to set"
+            )
+
+        with torch.no_grad():
+            offset = 0
+            for key, width in zip(keys, widths):
+                if key in bias_spec:
+                    linear.bias[offset:offset + width] = float(bias_spec[key])
+                offset += width
 
     @property
     def branch_topology(self):
