@@ -71,6 +71,14 @@ class GridIndex:
             float(self.z_unique[1] - self.z_unique[0]),
         )
 
+    def x_far_mask(self, margin_voxels):
+        """(N,) boolean, True for voxels more than `margin_voxels` away from EITHER x
+        boundary -- i.e. `margin_voxels <= ix < nx - margin_voxels`. Meant to be ANDed into
+        a validity mask upstream of to_grid/field_spectra, to see the bulk-volume spectrum
+        with the near-PMT-wall region (where the field is steepest/most structured) excluded.
+        """
+        return (self.ix >= margin_voxels) & (self.ix < self.nx - margin_voxels)
+
     def to_grid(self, values, valid=None, fill_invalid=0.0, inpaint=True):
         """Scatter a (N,) or (N, C) array -- already sliced to ONE PMT -- onto the
         lattice, giving (nx, ny, nz) or (nx, ny, nz, C).
@@ -176,28 +184,52 @@ def radial_average(power_3d, spacings, n_bins=50):
     return 0.5 * (edges[:-1] + edges[1:]), sums / np.clip(counts, 1, None)
 
 
-def field_spectra(grid_index, fields, valid, hann=True, n_bins=50):
+def field_spectra(grid_index, fields, valid, hann=True, n_bins=50, inpaint=True):
     """Per-axis marginals plus a radial average for each named field.
 
     fields: {name: (N,) or (N, C) array already sliced to one PMT}
     valid:  (N,) boolean truth-side validity mask, applied to every field
+    inpaint: forwarded to to_grid -- False fills invalid voxels with a constant 0 instead
+        of their nearest valid neighbour. Off by default reasoning still holds (see module
+        docstring); this is exposed so a 0-fill variant can be computed deliberately, e.g.
+        to show what the "false high frequencies" artifact actually looks like.
 
-    Returns {name: {"kx": (k, p), "ky": ..., "kz": ..., "radial": (k, p)}}, with a
-    channel axis (if any) summed over so each entry is one curve per axis. All
-    arrays are plain numpy, so the result serializes with np.savez.
+    Returns {name: {"kx": (k, p), "ky": ..., "kz": ..., "radial": (k, p)}}. For a
+    single-channel field, p has shape (len(k),) same as always. For a multi-channel field
+    (e.g. several quantile bins/PCA components, from to_grid's (N, C) path), the channel
+    axis is deliberately kept SEPARATE rather than summed: p has shape (C, len(k)) --
+    k stays 1D (frequencies don't depend on channel). Summing (or picking a subset) is left
+    to the caller/plotting code, not baked in here, since which is meaningful depends on
+    what's being asked (e.g. "total power across these quantile levels" vs "does level u
+    behave differently from level u'"). All arrays are plain numpy, so the result
+    serializes with np.savez.
     """
     spacings = grid_index.spacings
     out = {}
     for name, values in fields.items():
         power = power_spectrum_3d(
-            grid_index.to_grid(values, valid=valid), hann=hann
+            grid_index.to_grid(values, valid=valid, inpaint=inpaint), hann=hann
         )
-        if power.ndim == 4:
-            power = power.sum(axis=-1)
         entry = {}
-        for axis, label in enumerate(("kx", "ky", "kz")):
-            entry[label] = axis_marginal_spectrum(power, axis, spacings[axis])
-        entry["radial"] = radial_average(power, spacings, n_bins=n_bins)
+        if power.ndim == 4:
+            n_channels = power.shape[-1]
+            for axis, label in enumerate(("kx", "ky", "kz")):
+                k = None
+                per_channel = []
+                for c in range(n_channels):
+                    k, p = axis_marginal_spectrum(power[..., c], axis, spacings[axis])
+                    per_channel.append(p)
+                entry[label] = (k, np.stack(per_channel, axis=0))  # k: (len(k),), p: (C, len(k))
+            k = None
+            per_channel = []
+            for c in range(n_channels):
+                k, p = radial_average(power[..., c], spacings, n_bins=n_bins)
+                per_channel.append(p)
+            entry["radial"] = (k, np.stack(per_channel, axis=0))
+        else:
+            for axis, label in enumerate(("kx", "ky", "kz")):
+                entry[label] = axis_marginal_spectrum(power, axis, spacings[axis])
+            entry["radial"] = radial_average(power, spacings, n_bins=n_bins)
         out[name] = entry
     return out
 

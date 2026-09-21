@@ -300,7 +300,7 @@ def predict_gradient_magnitudes(
 
 def compute_grad_frob_hutchinson(
     pos_masked: torch.Tensor, output_val: torch.Tensor, n_pmts: int, create_graph: bool = True,
-    pmt_ids: list[int] | None = None,
+    pmt_ids: list[int] | None = None, n_projections: int = 1,
 ) -> torch.Tensor:
     """Unbiased per-(voxel, PMT) Frobenius-norm gradient magnitude of `output_val` w.r.t.
     `pos_masked`, via one random-projection backward pass per PMT -- NOT per output channel.
@@ -341,9 +341,24 @@ def compute_grad_frob_hutchinson(
             indices -- e.g. a read-only diagnostic that only ever looks at one fixed PMT has
             no reason to pay for the other n_pmts-1 backward passes just to discard them.
             None (default) computes all n_pmts, as training needs every PMT's gradient.
+        n_projections: independent random projections PER PMT, each its own backward pass
+            off the SAME forward pass (retain_graph=True, so the graph -- and the forward
+            activations behind it -- is built once and reused, not recomputed per projection).
+            Default 1 matches every existing call site (training included) exactly, both in
+            behavior and return shape -- this is purely additive. Raise it only for a
+            read-only diagnostic that wants several independent estimates cheaply (e.g. to look
+            at how a running mean over M projections behaves) without re-running the forward
+            pass each time; NOT a substitute for grad_target_n_projections, which controls a
+            completely different (cheap, np.gradient-based) target-side precompute -- see the
+            "Deliberately uses a SINGLE projection per call" note above for why this still
+            costs one autograd.grad call each, same as calling this function n_projections
+            separate times would, just without the redundant forward passes in between.
 
     Returns:
-        (n_valid, len(pmt_ids) if pmt_ids else n_pmts) gradient magnitude estimate.
+        (n_valid, len(pmt_ids) if pmt_ids else n_pmts) when n_projections == 1 (unchanged).
+        (n_valid, len(pmt_ids) if pmt_ids else n_pmts, n_projections) otherwise -- callers
+        average over any prefix of the trailing axis themselves (e.g. `result[..., :M].mean(-1)`
+        for a running-mean-vs-M comparison), since which M matters depends on the caller.
     """
     if output_val.dim() == 2:
         output_val = output_val.unsqueeze(-1)  # (n_valid, n_pmts, 1) -- e.g. visibility, log_t0
@@ -351,14 +366,17 @@ def compute_grad_frob_hutchinson(
     grad_mags_sq = []
     for pmt_idx in (pmt_ids if pmt_ids is not None else range(n_pmts)):
         pmt_val = output_val[:, pmt_idx]  # (n_valid, K)
-        v = torch.randint(0, 2, pmt_val.shape, device=pmt_val.device, dtype=pmt_val.dtype) * 2 - 1
-        proj = (pmt_val * v).sum()
-        grad = torch.autograd.grad(
-            outputs=proj, inputs=pos_masked, create_graph=create_graph, retain_graph=True,
-        )[0]  # (n_valid, 3)
-        grad_mags_sq.append(grad.norm(dim=-1)**2)
+        proj_mags = []
+        for _ in range(n_projections):
+            v = torch.randint(0, 2, pmt_val.shape, device=pmt_val.device, dtype=pmt_val.dtype) * 2 - 1
+            proj = (pmt_val * v).sum()
+            grad = torch.autograd.grad(
+                outputs=proj, inputs=pos_masked, create_graph=create_graph, retain_graph=True,
+            )[0]  # (n_valid, 3)
+            proj_mags.append(grad.norm(dim=-1)**2)
+        grad_mags_sq.append(proj_mags[0] if n_projections == 1 else torch.stack(proj_mags, dim=-1))
 
-    return torch.stack(grad_mags_sq, dim=1)  # (n_valid, len(pmt_ids) or n_pmts)
+    return torch.stack(grad_mags_sq, dim=1)  # (n_valid, len(pmt_ids) or n_pmts[, n_projections])
 
 
 def compute_grad_frob_hutchinson_aggregate(

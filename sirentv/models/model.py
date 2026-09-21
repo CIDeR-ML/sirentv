@@ -116,7 +116,7 @@ class SirenTV(nn.Module):
         self._meta.update(ranges)
 
     def forward(self, x, return_gradients=False, grad_keys=None, grad_aggregate=False, grad_create_graph=True,
-                grad_pmt_ids=None):
+                grad_pmt_ids=None, grad_n_projections=1):
         """
         Parameters
         ----------
@@ -149,11 +149,24 @@ class SirenTV(nn.Module):
             cost, particularly with grad_aggregate=False's O(n_pmts) backward passes per call.
         grad_pmt_ids : list[int], optional
             Only used when grad_aggregate=False. Restricts compute_grad_frob_hutchinson's
-            O(n_pmts) backward-pass loop to just these PMT indices -- e.g. a diagnostic that
-            only ever reads off one fixed PMT has no reason to pay for the other n_pmts-1
-            backward passes. None (default) computes every PMT, as training needs all of them.
-            `{key}_grad_frob` becomes (n_valid, len(grad_pmt_ids)) instead of (n_valid, n_pmts)
-            when set -- indexed in the SAME order as grad_pmt_ids, not by absolute PMT index.
+            O(n_pmts) backward-pass loop to just these PMT indices. `{key}_grad_frob` becomes
+            (n_valid, len(grad_pmt_ids)) instead of (n_valid, n_pmts) when set -- indexed in
+            the SAME order as grad_pmt_ids, not by absolute PMT index. None (default) computes
+            every PMT, as training needs all of them.
+            NOTE this only trims the BACKWARD loop, not the forward pass above it: `x` is
+            still broadcast across all self.n_pmts PMTs regardless of grad_pmt_ids (PMT
+            identity is a per-row input feature, not something this parameter subsets), so
+            forward-activation memory does not shrink just from setting this. A caller that
+            actually wants a cheaper forward pass too (e.g. a large-chunk notebook diagnostic
+            restricted to one fixed PMT) needs to narrow that itself -- e.g. temporarily
+            setting self.n_pmts = 1 and self.norm_pmt_coords to that one PMT's row before
+            calling, with grad_pmt_ids=[0] (index within the now-length-1 PMT axis, not the
+            original absolute PMT id).
+        grad_n_projections : int
+            Passed straight through to compute_grad_frob_hutchinson (grad_aggregate=False
+            only) -- see its docstring. Default 1 matches every existing call exactly; only
+            raise it for a read-only diagnostic that wants several independent projections
+            without paying for a fresh forward pass each time.
         return_pdf : bool
             If True, return the PDF of the waveform. If False, return the CDF.
 
@@ -201,7 +214,7 @@ class SirenTV(nn.Module):
                 for key in grad_keys:
                     out[f"{key}_grad_frob"] = compute_grad_frob_hutchinson(
                         pos_masked, out[key], self.n_pmts, create_graph=grad_create_graph,
-                        pmt_ids=grad_pmt_ids,
+                        pmt_ids=grad_pmt_ids, n_projections=grad_n_projections,
                     )
 
         result = {"correct_mask": mask}

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import datetime
 import os
 from typing import Literal
 
@@ -388,13 +389,23 @@ def main():
              "for isolating whether that code path is responsible for a crash.",
     )
     parser.add_argument(
-        "--spectra", action="store_true", default=False,
-        help="pca pipeline only: also compute (kx, ky, kz) spatial-frequency power spectra of "
-             "v/t0/coeffs, truth vs prediction, per --pmt-ids PMT. Requires --pmt-ids.",
+        "--spectra", action="store_true", default=True,
+        help="Also compute (kx, ky, kz) spatial-frequency power spectra of v/t0/coeffs (or "
+             "quantiles), truth vs prediction, per --pmt-ids PMT. On by default; needs "
+             "--pmt-ids to actually produce anything (silently a no-op without it). Use "
+             "--no-spectra to skip.",
     )
+    parser.add_argument("--no-spectra", action="store_false", dest="spectra")
     parser.add_argument(
         "--spectra-components", type=int, nargs="+", default=None,
-        help="PCA components for the coefficient spectra (default: 0 1 2 3 4).",
+        help="PCA components (or quantile bin indices) for the coefficient/quantile spectra "
+             "(default: 0 1 2 3 4).",
+    )
+    parser.add_argument(
+        "--spectra-x-margin", type=int, default=20,
+        help="Voxel margin for the x-boundary-excluded spectra variant "
+             "(power_spectra_x_far<N>): only voxels more than this many cells from EITHER "
+             "x boundary are included, i.e. the near-PMT-wall region is excluded.",
     )
     parser.add_argument(
         "--grad-cache", type=str, default=None,
@@ -403,15 +414,20 @@ def main():
     )
     args = parser.parse_args()
 
-    if args.spectra and not args.pmt_ids:
-        parser.error("--spectra requires --pmt-ids (spectra are computed per PMT)")
-
     # Check if running in distributed mode (torchrun sets these env vars)
     is_distributed_env = all(k in os.environ for k in ['RANK', 'WORLD_SIZE', 'LOCAL_RANK'])
 
     if is_distributed_env:
         # Running with torchrun - initialize distributed
-        dist.init_process_group(backend='nccl')
+        # timeout: default (30 min) is easily exceeded here -- rank 0 alone does every
+        # analysis print, spatial-slice diagnostic, and --spectra build (per PMT, per
+        # variant, with full-grid inpainting where applicable) while every other rank sits
+        # idle at the final dist.barrier(); once rank 0 runs long, NCCL's collective-op
+        # watchdog aborts the idle ranks with SIGABRT -- which looks like a crash but is
+        # really just this timeout (confirmed 2026-09-16: 3 ranks SIGABRT'd mid-way through
+        # --spectra's second PMT, sacct still reported the SLURM job itself as COMPLETED
+        # since eval_sirentv.sh doesn't check torchrun's exit code).
+        dist.init_process_group(backend='nccl', timeout=datetime.timedelta(hours=2))
         local_rank = int(os.environ.get('LOCAL_RANK', 0))
         if torch.cuda.is_available():
             torch.cuda.set_device(local_rank)
@@ -431,6 +447,7 @@ def main():
         evaluate_pca(cfg, output_file=args.output, pmt_ids=args.pmt_ids, ckpt_file=args.ckpt,
                      comparisons=args.compare, spectra=args.spectra,
                      spectra_components=args.spectra_components,
+                     spectra_x_margin=args.spectra_x_margin,
                      grad_cache_file=args.grad_cache or cfg.get("train", {}).get("grad_target_cache_file"))
     elif dataset_type == "QuantilePLibDataset":
         from sirentv.eval.eval_quantile import evaluate_quantile
@@ -441,6 +458,7 @@ def main():
             ckpt_file=args.ckpt,
             spectra=args.spectra,
             spectra_components=args.spectra_components,
+            spectra_x_margin=args.spectra_x_margin,
             grad_cache_file=args.grad_cache or cfg.get("train", {}).get("grad_target_cache_file"),
         )
     else:

@@ -366,6 +366,8 @@ def build_power_spectra(
     valid: np.ndarray,
     hann: bool = True,
     n_bins: int = 50,
+    inpaint: bool = True,
+    x_margin_voxels: int | None = None,
 ):
     """Spatial-frequency (kx, ky, kz) power spectra of truth and prediction, one PMT.
 
@@ -377,6 +379,12 @@ def build_power_spectra(
                prediction too -- including the model's untrained output at invalid
                (voxel, PMT) locations would inject structure into the predicted
                spectrum with no counterpart on the truth side to compare against.
+    inpaint:   forwarded to field_spectra/to_grid -- False 0-fills invalid voxels instead
+               of inpainting their nearest valid neighbour (see sirentv.utils.spectrum's
+               module docstring for why inpainting is the default).
+    x_margin_voxels: if given, ANDs `valid` with GridIndex.x_far_mask(x_margin_voxels)
+               first -- restricts the spectrum to voxels more than this many cells from
+               EITHER x boundary, i.e. excludes the near-PMT-wall region.
 
     Returns {name: {"pred": {axis: (k, power)}, "target": {...}}}, all plain numpy so the
     result pickles into the eval .pt alongside the other diagnostics.
@@ -388,6 +396,10 @@ def build_power_spectra(
     from sirentv.utils.spectrum import GridIndex, field_spectra
 
     grid = GridIndex(positions)
+    valid = np.asarray(valid, dtype=bool)
+    if x_margin_voxels is not None:
+        valid = valid & grid.x_far_mask(x_margin_voxels)
+
     out = {}
     for name, sides in fields.items():
         entry = {}
@@ -395,7 +407,7 @@ def build_power_spectra(
             if sides.get(side) is None:
                 continue
             entry[side] = field_spectra(
-                grid, {name: sides[side]}, valid=valid, hann=hann, n_bins=n_bins
+                grid, {name: sides[side]}, valid=valid, hann=hann, n_bins=n_bins, inpaint=inpaint
             )[name]
         out[name] = entry
 
@@ -403,6 +415,8 @@ def build_power_spectra(
         "shape": grid.shape,
         "spacings": grid.spacings,
         "n_valid": int(np.count_nonzero(valid)),
+        "inpaint": inpaint,
+        "x_margin_voxels": x_margin_voxels,
     }
     return out
 

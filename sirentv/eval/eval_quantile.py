@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import datetime
 import os
 
 import h5py
@@ -29,8 +30,9 @@ def evaluate_quantile(
     output_file: str = "eval_quantile_results.pt",
     pmt_ids: list[int] | None = None,
     ckpt_file: str | None = None,
-    spectra: bool = False,
+    spectra: bool = True,
     spectra_components: list[int] | None = None,
+    spectra_x_margin: int = 20,
     grad_cache_file: str | None = None,
 ):
     rank = dist.get_rank() if dist.is_initialized() else 0
@@ -375,7 +377,19 @@ def evaluate_quantile(
                         print(f"[eval_quantile] grad cache has {gf['v'].shape[0]} rows but eval "
                               f"covered {positions_np.shape[0]} -- skipping gradient spectra")
 
-            results["power_spectra"] = {}
+            # Three variants of the same spectra: the default (inpainted, full volume), one
+            # restricted to voxels far from either x boundary (excludes the near-PMT-wall
+            # region, where the field is steepest), and one using 0-fill instead of
+            # inpainting (to show what the inpainting is actually correcting for -- see
+            # sirentv.utils.spectrum's module docstring). Same fields/valid mask feed all
+            # three; only build_power_spectra's own inpaint/x_margin_voxels kwargs differ.
+            spectra_variants = {
+                "power_spectra": {},
+                f"power_spectra_x_far{spectra_x_margin}": {"x_margin_voxels": spectra_x_margin},
+                "power_spectra_zerofill": {"inpaint": False},
+            }
+            for variant_key in spectra_variants:
+                results[variant_key] = {}
             for i, pid in enumerate(pmt_ids):
                 print(f"[eval_quantile] Building power spectra for PMT {pid}...")
                 valid = target_vis_np[:, pid] > 0
@@ -397,9 +411,10 @@ def evaluate_quantile(
                     fields["grad_v"] = {"target": grad_targets["grad_v"][:, pid]}
                     fields["grad_quantiles"] = {"target": grad_targets["grad_quantiles"][:, pid]}
 
-                spec = build_power_spectra(positions_np, fields, valid)
-                spec["_components"] = list(spectra_components)
-                results["power_spectra"][pid] = spec
+                for variant_key, variant_kwargs in spectra_variants.items():
+                    spec = build_power_spectra(positions_np, fields, valid, **variant_kwargs)
+                    spec["_components"] = list(spectra_components)
+                    results[variant_key][pid] = spec
 
         output_dir = os.path.dirname(output_file)
         if output_dir:
@@ -431,14 +446,24 @@ def main():
              "this, the config's own ckpt_file is used (often null, i.e. a fresh random model).",
     )
     parser.add_argument(
-        "--spectra", action="store_true", default=False,
+        "--spectra", action="store_true", default=True,
         help="Also compute (kx, ky, kz) spatial-frequency power spectra of v/t0/quantiles, "
-             "truth vs prediction, for each --pmt-ids PMT. Requires --pmt-ids.",
+             "truth vs prediction, for each --pmt-ids PMT. On by default; needs --pmt-ids "
+             "to actually produce anything (silently a no-op without it). Use --no-spectra "
+             "to skip (e.g. to avoid the extra compute when you don't need it).",
     )
+    parser.add_argument("--no-spectra", action="store_false", dest="spectra")
     parser.add_argument(
         "--spectra-components", type=int, nargs="+", default=None,
         help="Quantile bin indices to include in the quantile spectra (default: five evenly "
              "spaced levels u ~ 0, 0.25, 0.5, 0.75, 1). Only used with --spectra.",
+    )
+    parser.add_argument(
+        "--spectra-x-margin", type=int, default=20,
+        help="Voxel margin for the x-boundary-excluded spectra variant "
+             "(power_spectra_x_far<N>): only voxels more than this many cells from EITHER "
+             "x boundary are included, i.e. the near-PMT-wall region is excluded. Only "
+             "used with --spectra.",
     )
     parser.add_argument(
         "--grad-cache", type=str, default=None,
@@ -449,13 +474,11 @@ def main():
     )
     args = parser.parse_args()
 
-    if args.spectra and not args.pmt_ids:
-        parser.error("--spectra requires --pmt-ids (spectra are computed per PMT)")
-
     is_distributed_env = all(k in os.environ for k in ["RANK", "WORLD_SIZE", "LOCAL_RANK"])
 
     if is_distributed_env:
-        dist.init_process_group(backend="nccl")
+        # see eval.py's own init_process_group call for why this needs a non-default timeout
+        dist.init_process_group(backend="nccl", timeout=datetime.timedelta(hours=2))
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         if torch.cuda.is_available():
             torch.cuda.set_device(local_rank)
@@ -475,6 +498,7 @@ def main():
         ckpt_file=args.ckpt,
         spectra=args.spectra,
         spectra_components=args.spectra_components,
+        spectra_x_margin=args.spectra_x_margin,
         grad_cache_file=args.grad_cache or cfg.get("train", {}).get("grad_target_cache_file"),
     )
 
