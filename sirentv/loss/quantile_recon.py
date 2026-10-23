@@ -55,8 +55,6 @@ class WeightedReconstructedQuantileLoss(nn.Module):
         # only needed/used when normalize_coeffs is on for this run -- pred[key]/target[key]
         # are then NORMALIZED coefficients ((raw - mean)/std), which must be denormalized back
         # to raw scale before reconstruct_aligned_raw's mean + coeffs @ components is valid
-        # (that formula assumes raw-scale coefficients; reconstructing straight from normalized
-        # ones would silently produce meaningless quantile-time values, not an error)
         self.coeff_mean = coeff_mean
         self.coeff_std = coeff_std
 
