@@ -22,6 +22,8 @@ from sirentv.eval.utils import (
     gather_to_rank0,
     build_spatial_slice_diagnostics,
     build_power_spectra,
+    quantile_spacing,
+    sample_poisson_spacing_err,
 )
 
 
@@ -88,6 +90,12 @@ def evaluate_quantile(
     n_pmts = cfg.get("data", {}).get("n_pmt", 81)
     n_quantile = 512 // combine_every_quantile
     threshold = 1e-6
+    n_photon = float(plib_cfg.get("n_photon", 1.0))  # same source as QuantilePLibDataset._n_photon
+    # u levels of the eval's quantile bins, same [::combine][:n] slicing as QuantilePLib
+    with h5py.File(filepath, "r") as f:
+        u_eval = torch.as_tensor(f["u_grid"][:][::combine_every_quantile][:n_quantile], dtype=torch.float32, device=device)
+    # the Monte Carlo Poisson floor (sample_poisson_spacing_err) draws random numbers
+    torch.manual_seed(20261005 + rank)
 
     if rank == 0:
         print(f"[eval_quantile] n_pmts: {n_pmts}, n_quantile: {n_quantile}, mode: {mode}, combine_every_quantile: {combine_every_quantile}")
@@ -139,6 +147,8 @@ def evaluate_quantile(
     all_vis_errors = []
     all_quantile_errors = []
     all_time_bias = []
+    all_time_abs_error = []
+    all_time_spacing_bias = []
 
     for batch_idx, data in enumerate(tqdm(dl, desc=f"Rank {rank} eval", disable=(rank != 0))):
         x = data["position"].contiguous().to(device)
@@ -159,9 +169,8 @@ def evaluate_quantile(
         target_t0 = torch.exp(target["t0"]) if has_t0 else None  # (B, n_pmts)
 
         # zero-visibility (voxel, PMT) pairs have no quantile function -- quantiles is NaN
-        # there (see quantile.py's quantiles_mask). Replace with 0 before comparing so NaN
-        # can't leak into quantile_error/.mean()/.corrcoef() later; these PMTs are already
-        # excluded from the bias accumulators via the target-value threshold below.
+        # there (see quantile.py's quantiles_mask). Replace with 0 so NaN can't leak into
+        # quantile_error/.mean()/.corrcoef() later.
         target_quantiles = torch.nan_to_num(target["quantiles"], nan=0.0) if has_q else None
         pred_quantiles = pred_out["quantiles"] if has_q else None
 
@@ -177,9 +186,31 @@ def evaluate_quantile(
             target_t0_abs = data["meta"]["t0_raw"].to(device)
             pred_t0_abs = pred_t0 if pred_t0 is not None else target_t0_abs
         pred_time = qlib.to_linear_time(pred_quantiles, t0=pred_t0_abs) if has_q else None  # (B, n_pmts, n_quantile)
-        target_time = qlib.to_linear_time(target_quantiles, t0=target_t0_abs) if has_q else None  # (B, n_pmts, n_quantile)
+        # NaN -> 0 AFTER the linear conversion (and after t0 is added back): a log-space 0 maps to
+        # 10**0 - C = 0.99 ns, which passes the target > threshold mask and leaked invisible PMTs
+        # into every time metric. A linear 0 ns is excluded by that mask.
+        target_time = (
+            torch.nan_to_num(qlib.to_linear_time(target["quantiles"], t0=target_t0_abs), nan=0.0)
+            if has_q else None
+        )  # (B, n_pmts, n_quantile)
 
-        acc_pred_vs_target.update(pred_v_linear, target_v_linear, pred_time, target_time)
+        # (voxel, PMT) pairs valid for every time metric: the same visibility cut as the
+        # visibility bias (built from the raw counts, so it exists even for a quantile-only
+        # model with no v target) AND the dataset's quantiles_mask (vis_raw > 0)
+        if has_q:
+            vis_raw = data["meta"]["v_linear"].to(device)  # (B, n_pmts) detected photon counts
+            valid_vis_mask = (vis_raw / n_photon) > threshold
+            valid_quantile_mask = target["quantiles_mask"].bool()
+            time_pair_mask = valid_vis_mask & valid_quantile_mask  # (B, n_pmts)
+            # Poisson floor of time_spacing_bias: one MC draw of the truth's own photon-count
+            # fluctuation per element, |Q_hat - t| / b_k, averaged by the accumulator
+            time_floor_err = sample_poisson_spacing_err(target_time, vis_raw, u_eval)
+        else:
+            time_pair_mask = time_floor_err = None
+
+        acc_pred_vs_target.update(
+            pred_v_linear, target_v_linear, pred_time, target_time, time_pair_mask, time_floor_err
+        )
 
         # compute per-position errors for correlation check -- needs both predictions, so
         # there is nothing to correlate for a single-branch model missing either one
@@ -195,14 +226,34 @@ def evaluate_quantile(
         # PairwiseBiasAccumulator's per-tick time_bias, but reduced over the quantile-bin axis
         # instead of over voxels/PMTs
         if has_q:
-            time_bias_mask = target_time > threshold  # (B, n_pmts, n_quantile)
+            time_bias_mask = (target_time > threshold) & time_pair_mask[..., None]  # (B, n_pmts, n_quantile)
             time_bias_vals = torch.where(
                 time_bias_mask,
                 2 * torch.abs(pred_time - target_time) / (pred_time + target_time).clamp(min=1e-10),
                 torch.zeros_like(pred_time),
             )
-            time_bias_per_pmt = time_bias_vals.sum(dim=-1) / time_bias_mask.sum(dim=-1).clamp(min=1)  # (B, n_pmts)
+            n_masked_bins = time_bias_mask.sum(dim=-1).clamp(min=1)
+            time_bias_per_pmt = time_bias_vals.sum(dim=-1) / n_masked_bins  # (B, n_pmts)
             all_time_bias.append(time_bias_per_pmt.detach().cpu())
+            # absolute counterpart, same mask: mean |p - t| over bins, in linear time units
+            abs_err = torch.abs(pred_time - target_time)
+            time_abs_err_per_pmt = torch.where(
+                time_bias_mask, abs_err, torch.zeros_like(pred_time)
+            ).sum(dim=-1) / n_masked_bins  # (B, n_pmts)
+            all_time_abs_error.append(time_abs_err_per_pmt.detach().cpu())
+            # |p - t| / b_k, b_k = local truth quantile spacing: error in units of bins. Bins with
+            # b_k == 0 (degenerate truth, e.g. a single detected photon) are undefined and
+            # excluded; a pair with no defined bin is NaN, not 0.
+            b_k = quantile_spacing(target_time)
+            spacing_mask = time_bias_mask & (b_k > 0)
+            n_spacing_bins = spacing_mask.sum(dim=-1)
+            time_spacing_bias_per_pmt = torch.where(
+                spacing_mask, abs_err / torch.where(b_k > 0, b_k, torch.ones_like(b_k)), torch.zeros_like(pred_time)
+            ).sum(dim=-1) / n_spacing_bins.clamp(min=1)  # (B, n_pmts)
+            time_spacing_bias_per_pmt = torch.where(
+                n_spacing_bins > 0, time_spacing_bias_per_pmt, torch.full_like(time_spacing_bias_per_pmt, float("nan"))
+            )
+            all_time_spacing_bias.append(time_spacing_bias_per_pmt.detach().cpu())
 
         # target visibility distribution stats
         if has_v:
@@ -275,6 +326,8 @@ def evaluate_quantile(
             local_results["pred_t0"] = torch.cat(all_pred_t0, dim=0)
     if has_q:
         local_results["time_bias"] = torch.cat(all_time_bias, dim=0)
+        local_results["time_abs_error"] = torch.cat(all_time_abs_error, dim=0)
+        local_results["time_spacing_bias"] = torch.cat(all_time_spacing_bias, dim=0)
         if do_spectra:
             local_results["target_quantiles_slice"] = torch.cat(all_target_quantiles_slice, dim=0)
             local_results["pred_quantiles_slice"] = torch.cat(all_pred_quantiles_slice, dim=0)
@@ -309,6 +362,9 @@ def evaluate_quantile(
         print(f"[eval_quantile] Total positions evaluated: {all_positions_tensor.shape[0]}")
         print(f"[eval_quantile] Overall visibility bias: {stats_pred_vs_target['overall']['vis_bias'].item():.6e}")
         print(f"[eval_quantile] Overall quantile-bin bias: {stats_pred_vs_target['overall']['time_bias'].item():.6e}")
+        print(f"[eval_quantile] Overall quantile-bin abs error: {stats_pred_vs_target['overall']['time_abs_error'].item():.6e}")
+        print(f"[eval_quantile] Overall quantile-bin spacing bias: {stats_pred_vs_target['overall']['time_spacing_bias'].item():.6e}")
+        print(f"[eval_quantile] Overall quantile-bin spacing Poisson floor (MC): {stats_pred_vs_target['overall']['time_spacing_floor'].item():.6e}")
         print(f"[eval_quantile] t0 bias mean: {t0_stats_pred_vs_target['mean'].item():.6e}, std: {t0_stats_pred_vs_target['std'].item():.6e}")
 
         results = {
@@ -349,7 +405,11 @@ def evaluate_quantile(
 
         # per-(voxel, PMT) time bias (actual 2*|p-t|/(p+t) formula, not a raw signed error)
         if has_q:
-            results["error_correlation"] = {"time_bias": all_time_bias_tensor}
+            results["error_correlation"] = {
+                "time_bias": all_time_bias_tensor,
+                "time_abs_error": gathered["time_abs_error"],
+                "time_spacing_bias": gathered["time_spacing_bias"],
+            }
             if has_v:
                 all_vis_errors_tensor = gathered["vis_errors"]
                 all_quantile_errors_tensor = gathered["quantile_errors"]
@@ -408,7 +468,12 @@ def evaluate_quantile(
 
             spectra_variants = {
                 "power_spectra": {},
-                f"power_spectra_x_far{spectra_x_margin}": {"x_margin_voxels": spectra_x_margin},
+                f"power_spectra_x_far{spectra_x_margin}": {
+                    "x_margin_voxels": spectra_x_margin, "x_margin_mode": "either",
+                },
+                f"power_spectra_x_far_pmtwall{spectra_x_margin}": {
+                    "x_margin_voxels": spectra_x_margin, "x_margin_mode": "pmt_wall",
+                },
                 "power_spectra_zerofill": {"inpaint": False},
             }
             for variant_key in spectra_variants:
