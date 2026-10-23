@@ -79,6 +79,14 @@ class GridIndex:
         """
         return (self.ix >= margin_voxels) & (self.ix < self.nx - margin_voxels)
 
+    def x_far_pmt_wall_mask(self, margin_voxels):
+        """(N,) boolean, True for voxels more than `margin_voxels` away from ONLY the
+        PMT-wall x boundary (the LOW-x end -- PMTs sit at x ~= wall_ranges[0].min(), not the
+        opposite wall) -- i.e. `ix >= margin_voxels`. Unlike x_far_mask, the far (non-PMT)
+        wall at high ix is left untouched, since nothing structurally special happens there.
+        """
+        return self.ix >= margin_voxels
+
     def to_grid(self, values, valid=None, fill_invalid=0.0, inpaint=True):
         """Scatter a (N,) or (N, C) array -- already sliced to ONE PMT -- onto the
         lattice, giving (nx, ny, nz) or (nx, ny, nz, C).
