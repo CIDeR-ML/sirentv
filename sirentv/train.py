@@ -1,12 +1,6 @@
 from __future__ import annotations
 
 import os
-
-# Pin the matplotlib backend before anything imports pyplot (log.py does, transitively via
-# the sirentv imports below). On a batch node with no DISPLAY matplotlib already picks
-# "agg" on its own, so this is NOT a speedup -- it just removes the dependence on that
-# autodetection, which would pick a GUI backend if DISPLAY happened to be set (a Jupyter
-# kernel, X11 forwarding). setdefault so an explicit MPLBACKEND still wins.
 os.environ.setdefault("MPLBACKEND", "Agg")
 
 import time
@@ -72,15 +66,7 @@ def train(cfg: dict):
     # --- Reproducibility ---------------------------------------------------------
     # Off by default (None): every existing config that doesn't set this is unaffected.
     # Without it, SirenTV's weight init below draws from whatever unseeded state the
-    # process's global RNGs happen to be in -- different every submission, which is what
-    # let an ablation sweep's cells confound "the swept variable" with "which random init
-    # this particular run happened to draw" (see the stage1 q3 omega030 dead-v_net incident).
-    # Same seed value on every DDP rank is intentional, not a bug: create_ddp_model's
-    # DistributedDataParallel wrapper broadcasts rank 0's parameters to every other rank on
-    # construction regardless, so rank-dependent seeding here would only matter if something
-    # read the RNG before that broadcast -- nothing does. The data loader's own shuffle order
-    # is already deterministic independent of this (DistributedSampler defaults to seed=0),
-    # so this one setting is what closes the actual gap.
+    # process's global RNGs happen to be in
     seed = cfg.get("train", {}).get("seed")
     if seed is not None:
         import random
@@ -98,17 +84,7 @@ def train(cfg: dict):
     net = SirenTV(cfg).to(DEVICE)
     if is_distributed:
         net = create_ddp_model(net, device_ids=[local_rank])
-    # torch.compile's default (inductor/AOTAutograd) backend generates a fixed, non-further-
-    # differentiable backward for whatever it compiles -- that limitation lives on the tensor
-    # produced by the compiled forward call itself, not on the code that later calls
-    # torch.autograd.grad(..., create_graph=True) on it (compute_grad_frob_hutchinson[_aggregate],
-    # used for gradient supervision), so a narrow dynamo.disable() around just that helper
-    # wouldn't fix it -- the disable would need to cover SirenTV's own net(...) call, for the
-    # specific step(s) where grad_keys is active. Every grad-supervision config gives "v" a
-    # warmup of 0, so grad_keys is truthy from iteration 1 onward and stays that way for the
-    # rest of training -- there's no "mostly compiled, occasionally eager" regime available
-    # here, so we just skip compilation entirely for these runs rather than adding a redundant
-    # eager forward pass that would provide no practical benefit given warmup=0.
+
     _has_grad_supervision = bool(cfg.get("train", {}).get("grad_supervision_keys", []))
     if _has_grad_supervision:
         if rank == 0:
@@ -133,18 +109,6 @@ def train(cfg: dict):
             print(f"[train] resuming from iteration {iteration_ctr}, epoch {epoch_ctr}")
 
         # Restore the learning rate the SCHEDULER implies at this epoch.
-        #
-        # slar's optimizer_factory overwrites every param_group's lr with the config's
-        # `optimizer_param.lr` AFTER loading the checkpoint, which throws away the
-        # scheduler-derived value. That matters because CosineAnnealingLR is "chainable":
-        # get_lr() derives the next lr RECURSIVELY from the current group lr, not from
-        # base_lr.
-        #
-        # load_state_dict restores the scheduler's own _last_lr, so get_last_lr() is
-        # exactly the value the schedule specifies here. Applied only on resume, and only
-        # when a scheduler owns the lr; without a scheduler the config's lr is authoritative
-        # and is left alone. Fixed here rather than in slar, which is shared with other
-        # projects.
         if sch is not None:
             restored = sch.get_last_lr()
             for group, lr in zip(opt.param_groups, restored):
@@ -177,6 +141,7 @@ def train(cfg: dict):
     save_every_epochs = train_cfg.get("save_every_epochs", -1)
     reduction = train_cfg.get("reduction", "mean")
 
+    debug_timing = bool(cfg.get("debug_timing", False))
     amp = train_cfg.get("amp", False)
     grad_clip_max_norm = train_cfg.get("clip_grad", None)
     if amp:
@@ -191,17 +156,6 @@ def train(cfg: dict):
     grad_norm_per_layer = grad_norm_cfg.get("log_per_layer", False)
     grad_norm_frequency = grad_norm_cfg.get("log_frequency", 1)
 
-    # Cadence of the expensive per-iteration diagnostics block: two extra no_grad inference
-    # passes, three matplotlib figures through wandb.Image, and the bias/abs_bias analysis.
-    #
-    # This was hardcoded to every 10 iterations, which measured 0.5-3.5 s per occurrence
-    # against a 0.031 s training step -- roughly 98% of wall time. Being a fixed per-call
-    # cost, it got proportionally WORSE the faster the job ran: at ~0.167 s/iteration on
-    # s3df it fired 0.6 times/second, but at 0.031 s on 8 ranks here it fired 3.2
-    # times/second, which is why the same code looked fine there and pathological here.
-    #
-    # logger.plot_every_nsteps: <int> to set it explicitly; <= 0 or unset means once per
-    # epoch (len(dl) iterations), which is the default.
     plot_every_nsteps = cfg.get("logger", {}).get("plot_every_nsteps")
     if plot_every_nsteps is None or int(plot_every_nsteps) <= 0:
         plot_every_nsteps = max(1, len(dl))
@@ -230,10 +184,7 @@ def train(cfg: dict):
         grad_supervision_warmup = {k: int(v) for k, v in _grad_supervision_keys_cfg.items()}
     else:
         grad_supervision_warmup = {k: 0 for k in _grad_supervision_keys_cfg}
-    # whether the warmup values above count in epochs (compared against epoch_ctr) or raw
-    # optimizer steps (compared against iteration_ctr) -- epochs are a config-independent,
-    # dataset-size-independent unit but iterations give finer-grained control when an epoch is
-    # very long.
+
     grad_supervision_warmup_unit = train_cfg.get("grad_supervision_warmup_unit", "epoch")
     assert grad_supervision_warmup_unit in ("epoch", "iteration"), (
         f"grad_supervision_warmup_unit must be 'epoch' or 'iteration', got {grad_supervision_warmup_unit!r}"
@@ -243,8 +194,7 @@ def train(cfg: dict):
     # visibility-weighted aggregate over all PMTs (O(1) backward passes), trading away per-PMT
     # granularity. See compute_grad_frob_hutchinson_aggregate.
     grad_supervision_aggregate = bool(train_cfg.get("grad_supervision_aggregate", False))
-    # tracks which grad_supervision_keys have already had their warmup-complete message printed,
-    # so each key announces exactly once (the moment it first becomes active) rather than every step.
+
     _grad_supervision_announced = set()
 
     # Physics constants for t0 computation (if applicable)
@@ -358,10 +308,10 @@ def train(cfg: dict):
             losses_display = losses_tensor.detach().cpu().tolist()
             pbar.set_postfix_str(", ".join(f"{k}={v:.2e}" for k, v in zip(keys, losses_display)))
 
-            if rank == 0 and iteration_ctr % 10 == 0:
+            if (rank == 0 or debug_timing) and iteration_ctr % 10 == 0:
                 peak_mem = torch.cuda.max_memory_allocated() / (1024**3) if torch.cuda.is_available() else 0
                 print(
-                    f"[iter {iteration_ctr:>6d}] "
+                    f"{f'[rank {rank}] ' if debug_timing else ''}[iter {iteration_ctr:>6d}] "
                     f"loss: {', '.join(f'{k}={v:.2e}' for k, v in zip(keys, losses_display))} | "
                     f"data: {data_loading_time:.3f}s | fwd+bwd: {model_time_iter:.3f}s | "
                     f"mem: {peak_mem:.2f}GB"
@@ -424,12 +374,6 @@ def train(cfg: dict):
 
         if sch is not None:
             epoch_avg_loss = epoch_loss_sum / max(epoch_batch_count, 1)
-            # ReduceLROnPlateau is the only scheduler here that consumes a metric. Every
-            # other torch scheduler takes an optional EPOCH INDEX, so passing the loss
-            # assigned it straight to last_epoch: a CosineAnnealingLR driven this way sat
-            # at last_epoch ~= loss (order 1) forever and never annealed -- after 2000
-            # epochs its lr was still 9.9999e-06 instead of reaching eta_min=1e-07, and a
-            # resumed chunk had its restored last_epoch overwritten by the next loss value.
             if isinstance(sch, torch.optim.lr_scheduler.ReduceLROnPlateau):
                 sch.step(epoch_avg_loss)
             else:
