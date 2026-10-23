@@ -33,6 +33,39 @@ from sirentv.data.compressed import CompressedPLib
 # ---------------------------------------------------------------------------
 
 
+def quantile_spacing(t: torch.Tensor) -> torch.Tensor:
+    """Local spacing b_k of a monotone quantile function along the last axis: centred
+    difference (t[k+1] - t[k-1]) / 2, one-sided at the first/last bin."""
+    b = torch.empty_like(t)
+    b[..., 1:-1] = 0.5 * (t[..., 2:] - t[..., :-2])
+    b[..., 0] = t[..., 1] - t[..., 0]
+    b[..., -1] = t[..., -1] - t[..., -2]
+    # No floor: the smallest real spacings (PDF peak, >~4e-4 ns) matter most. Callers must
+    # exclude b == 0 (degenerate truth, e.g. one detected photon), where |p-t|/b is undefined.
+    return b
+
+
+def sample_poisson_spacing_err(t: torch.Tensor, n_photons: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+    """One Monte Carlo draw per (voxel, PMT, bin) of |Q_hat(u_k) - t_k| / b_k: Q_hat is the
+    empirical quantile of n_photons photons drawn from the truth quantile function t(u).
+
+    Its order statistic is U ~ Beta(h, N+1-h), h = (N-1)u + 1 (linear-interpolation
+    quantile), mapped through t(u); only per-bin marginals are needed, so bins are drawn
+    independently. U outside [u_0, u_K-1] is clamped to the end values (truncated tails).
+    t: (B, n_pmt, K) linear ns; n_photons: (B, n_pmt) detected counts; u: (K,) sorted.
+    """
+    N = n_photons.float().clamp(min=2.0).unsqueeze(-1)  # masked-out pairs only; keeps Beta valid
+    h = (N - 1) * u + 1
+    U = torch.distributions.Beta(h, N + 1 - h).sample()
+    idx = torch.searchsorted(u, U.contiguous()).clamp(1, u.numel() - 1)
+    u_lo, u_hi = u[idx - 1], u[idx]
+    t_lo, t_hi = t.gather(-1, idx - 1), t.gather(-1, idx)
+    w = ((U - u_lo) / (u_hi - u_lo)).clamp(0.0, 1.0)
+    q_hat = t_lo + w * (t_hi - t_lo)
+    b = quantile_spacing(t)
+    return torch.abs(q_hat - t) / torch.where(b > 0, b, torch.ones_like(b))
+
+
 class PairwiseBiasAccumulator:
     """Accumulates per-PMT / per-tick / overall 2*|p-t|/(p+t) bias between a "pred" and a
     "target" quantity (visibility + CDF), matching the formula in `sirentv.analysis.bias`.
@@ -47,11 +80,27 @@ class PairwiseBiasAccumulator:
         self.time_bias_sum = torch.zeros(n_ticks, device=device)
         self.time_bias_sq_sum = torch.zeros(n_ticks, device=device)
         self.time_count = torch.zeros(n_ticks, device=device)
+        # absolute |p - t| counterpart of time_bias, same mask/reduction, in the CDF's own units
+        self.time_abs_err_sum = torch.zeros(n_ticks, device=device)
+        self.time_abs_err_sq_sum = torch.zeros(n_ticks, device=device)
+        # |p - t| / b_k, b_k = local truth quantile spacing (see quantile_spacing); own
+        # counts, since b_k == 0 bins are excluded on top of the time mask
+        self.time_spacing_bias_sum = torch.zeros(n_ticks, device=device)
+        self.time_spacing_bias_sq_sum = torch.zeros(n_ticks, device=device)
+        self.time_spacing_count = torch.zeros(n_ticks, device=device)
+        # Monte Carlo Poisson floor of time_spacing_bias, same mask/reduction/counts
+        self.time_spacing_floor_sum = torch.zeros(n_ticks, device=device)
+        self.time_spacing_floor_sq_sum = torch.zeros(n_ticks, device=device)
+        self._floor_used = False
 
         self.overall_vis_bias_sum = torch.tensor(0.0, device=device)
         self.overall_vis_bias_count = torch.tensor(0.0, device=device)
         self.overall_time_bias_sum = torch.tensor(0.0, device=device)
         self.overall_time_bias_count = torch.tensor(0.0, device=device)
+        self.overall_time_abs_err_sum = torch.tensor(0.0, device=device)
+        self.overall_time_spacing_bias_sum = torch.tensor(0.0, device=device)
+        self.overall_time_spacing_count = torch.tensor(0.0, device=device)
+        self.overall_time_spacing_floor_sum = torch.tensor(0.0, device=device)
 
         # Whether update() has ever been called with a real (non-None) pred_v/pred_cdf --
         # lets finalize() report NaN instead of a misleading 0.0 (i.e. "perfect agreement")
@@ -65,13 +114,18 @@ class PairwiseBiasAccumulator:
         target_v: torch.Tensor,
         pred_cdf: Optional[torch.Tensor],
         target_cdf: torch.Tensor,
+        time_pair_mask: Optional[torch.Tensor] = None,
+        time_floor_err: Optional[torch.Tensor] = None,
     ):
         """pred_v/pred_cdf may be None when the model being evaluated has no branch for
         that output (e.g. a single-branch t0_net-only ablation predicts neither v nor
         quantiles) -- that half is then skipped entirely rather than compared against a
         fabricated prediction. target_v/target_cdf are always required: the dataset
         returns the full (v, t0, quantiles) target regardless of which branches the
-        model actually has.
+        model actually has. time_pair_mask (B, n_pmts) bool, if given, is ANDed into every
+        time metric's mask on top of target_cdf > threshold (e.g. valid vis & quantiles_mask).
+        time_floor_err (B, n_pmts, n_ticks), if given, is a per-element Poisson-floor sample
+        (see sample_poisson_spacing_err), reduced exactly like time_spacing_bias.
         """
         from sirentv.analysis import bias as compute_bias
 
@@ -97,31 +151,67 @@ class PairwiseBiasAccumulator:
 
         if pred_cdf is not None:
             self._time_used = True
-            time_masked_count = (target_cdf > threshold).sum()
-            self.overall_time_bias_sum += compute_bias(
-                {"t_linear": target_cdf}, {"t_linear": pred_cdf}, key="t_linear", threshold=threshold
-            ) * time_masked_count
-            self.overall_time_bias_count += time_masked_count
+            overall_mask = target_cdf > threshold
+            if time_pair_mask is not None:
+                overall_mask = overall_mask & time_pair_mask[..., None]
+            abs_err = torch.abs(pred_cdf - target_cdf)
+            # same 2|p-t|/(p+t) as sirentv.analysis.bias, but under the combined mask
+            rel_err = 2 * abs_err / (pred_cdf + target_cdf).clamp(min=1e-10)
+            self.overall_time_bias_sum += torch.where(overall_mask, rel_err, torch.zeros_like(rel_err)).sum()
+            self.overall_time_bias_count += overall_mask.sum()
+            # spacing from the full-length target, before any [:n] slicing, so the end bins
+            # get their proper one-sided difference
+            b_k = quantile_spacing(target_cdf)
+            spacing_mask_full = overall_mask & (b_k > 0)
+            spacing_err = torch.where(
+                spacing_mask_full, abs_err / torch.where(b_k > 0, b_k, torch.ones_like(b_k)), torch.zeros_like(abs_err)
+            )
+            self.overall_time_abs_err_sum += torch.where(overall_mask, abs_err, torch.zeros_like(abs_err)).sum()
+            self.overall_time_spacing_bias_sum += spacing_err.sum()
+            self.overall_time_spacing_count += spacing_mask_full.sum()
+            if time_floor_err is not None:
+                self._floor_used = True
+                floor_err = torch.where(spacing_mask_full, time_floor_err, torch.zeros_like(time_floor_err))
+                self.overall_time_spacing_floor_sum += floor_err.sum()
 
             # per-tick CDF bias
             n = min(self.time_bias_sum.shape[0], pred_cdf.shape[-1], target_cdf.shape[-1])
-            pt, tt = pred_cdf[..., :n], target_cdf[..., :n]
-            time_mask = tt > threshold
-            time_bias_vals = torch.where(
-                time_mask, 2 * torch.abs(pt - tt) / (pt + tt).clamp(min=1e-10), torch.zeros_like(pt)
-            )
-            time_bias_per_tick = time_bias_vals.sum(dim=1) / time_mask.sum(dim=1).clamp(min=1)
+            pt = pred_cdf[..., :n]
+            time_mask = overall_mask[..., :n]
+            time_bias_vals = torch.where(time_mask, rel_err[..., :n], torch.zeros_like(pt))
+            time_abs_err_vals = torch.where(time_mask, abs_err[..., :n], torch.zeros_like(pt))
+            spacing_mask = spacing_mask_full[..., :n]
+            n_masked_pmts = time_mask.sum(dim=1).clamp(min=1)
+            time_bias_per_tick = time_bias_vals.sum(dim=1) / n_masked_pmts
+            time_abs_err_per_tick = time_abs_err_vals.sum(dim=1) / n_masked_pmts
+            time_spacing_per_tick = spacing_err[..., :n].sum(dim=1) / spacing_mask.sum(dim=1).clamp(min=1)
+            spacing_mask_any = spacing_mask.any(dim=1)
             time_mask_any = time_mask.any(dim=1)
             self.time_bias_sum[:n] += (time_bias_per_tick * time_mask_any).sum(dim=0)
             self.time_bias_sq_sum[:n] += ((time_bias_per_tick ** 2) * time_mask_any).sum(dim=0)
+            self.time_abs_err_sum[:n] += (time_abs_err_per_tick * time_mask_any).sum(dim=0)
+            self.time_abs_err_sq_sum[:n] += ((time_abs_err_per_tick ** 2) * time_mask_any).sum(dim=0)
+            self.time_spacing_bias_sum[:n] += (time_spacing_per_tick * spacing_mask_any).sum(dim=0)
+            self.time_spacing_bias_sq_sum[:n] += ((time_spacing_per_tick ** 2) * spacing_mask_any).sum(dim=0)
+            self.time_spacing_count[:n] += spacing_mask_any.sum(dim=0).float()
+            if time_floor_err is not None:
+                floor_per_tick = floor_err[..., :n].sum(dim=1) / spacing_mask.sum(dim=1).clamp(min=1)
+                self.time_spacing_floor_sum[:n] += (floor_per_tick * spacing_mask_any).sum(dim=0)
+                self.time_spacing_floor_sq_sum[:n] += ((floor_per_tick ** 2) * spacing_mask_any).sum(dim=0)
             self.time_count[:n] += time_mask_any.sum(dim=0).float()
 
     def all_reduce(self):
         for t in [
             self.vis_bias_sum, self.vis_bias_sq_sum, self.vis_count,
             self.time_bias_sum, self.time_bias_sq_sum, self.time_count,
+            self.time_abs_err_sum, self.time_abs_err_sq_sum,
+            self.time_spacing_bias_sum, self.time_spacing_bias_sq_sum, self.time_spacing_count,
+            self.time_spacing_floor_sum, self.time_spacing_floor_sq_sum,
+            self.overall_time_spacing_floor_sum,
             self.overall_vis_bias_sum, self.overall_vis_bias_count,
             self.overall_time_bias_sum, self.overall_time_bias_count,
+            self.overall_time_abs_err_sum,
+            self.overall_time_spacing_bias_sum, self.overall_time_spacing_count,
         ]:
             dist.all_reduce(t, op=dist.ReduceOp.SUM)
 
@@ -141,17 +231,51 @@ class PairwiseBiasAccumulator:
 
         if not self._time_used:
             nan_tick = torch.full_like(self.time_bias_sum, float("nan")).cpu()
-            overall_time_bias = torch.tensor(float("nan"))
+            overall_time_bias = overall_time_abs_err = overall_time_spacing_bias = torch.tensor(float("nan"))
             time_bias_mean = time_bias_std = time_bias_sem = nan_tick
+            time_abs_err_mean = time_abs_err_std = time_abs_err_sem = nan_tick
+            time_spacing_mean = time_spacing_std = time_spacing_sem = nan_tick
         else:
+            count = self.time_count.clamp(min=1)
             overall_time_bias = self.overall_time_bias_sum / self.overall_time_bias_count.clamp(min=1)
-            time_bias_mean = self.time_bias_sum / self.time_count.clamp(min=1)
-            time_bias_var = (self.time_bias_sq_sum / self.time_count.clamp(min=1)) - time_bias_mean ** 2
+            time_bias_mean = self.time_bias_sum / count
+            time_bias_var = (self.time_bias_sq_sum / count) - time_bias_mean ** 2
             time_bias_std = torch.sqrt(time_bias_var.clamp(min=0))
-            time_bias_sem = time_bias_std / torch.sqrt(self.time_count.clamp(min=1))
+            time_bias_sem = time_bias_std / torch.sqrt(count)
+
+            overall_time_abs_err = self.overall_time_abs_err_sum / self.overall_time_bias_count.clamp(min=1)
+            time_abs_err_mean = self.time_abs_err_sum / count
+            time_abs_err_var = (self.time_abs_err_sq_sum / count) - time_abs_err_mean ** 2
+            time_abs_err_std = torch.sqrt(time_abs_err_var.clamp(min=0))
+            time_abs_err_sem = time_abs_err_std / torch.sqrt(count)
+
+            overall_time_spacing_bias = self.overall_time_spacing_bias_sum / self.overall_time_spacing_count.clamp(min=1)
+            spacing_count = self.time_spacing_count.clamp(min=1)
+            time_spacing_mean = self.time_spacing_bias_sum / spacing_count
+            time_spacing_var = (self.time_spacing_bias_sq_sum / spacing_count) - time_spacing_mean ** 2
+            time_spacing_std = torch.sqrt(time_spacing_var.clamp(min=0))
+            time_spacing_sem = time_spacing_std / torch.sqrt(spacing_count)
+
+        if not (self._time_used and self._floor_used):
+            nan_tick = torch.full_like(self.time_bias_sum, float("nan")).cpu()
+            overall_time_spacing_floor = torch.tensor(float("nan"))
+            floor_mean = floor_std = floor_sem = nan_tick
+        else:
+            spacing_count = self.time_spacing_count.clamp(min=1)
+            overall_time_spacing_floor = self.overall_time_spacing_floor_sum / self.overall_time_spacing_count.clamp(min=1)
+            floor_mean = self.time_spacing_floor_sum / spacing_count
+            floor_var = (self.time_spacing_floor_sq_sum / spacing_count) - floor_mean ** 2
+            floor_std = torch.sqrt(floor_var.clamp(min=0))
+            floor_sem = floor_std / torch.sqrt(spacing_count)
 
         return {
-            "overall": {"vis_bias": overall_vis_bias.cpu(), "time_bias": overall_time_bias.cpu()},
+            "overall": {
+                "vis_bias": overall_vis_bias.cpu(),
+                "time_bias": overall_time_bias.cpu(),
+                "time_abs_error": overall_time_abs_err.cpu(),
+                "time_spacing_bias": overall_time_spacing_bias.cpu(),
+                "time_spacing_floor": overall_time_spacing_floor.cpu(),
+            },
             "visibility_bias": {
                 "mean": vis_bias_mean.cpu(), "std": vis_bias_std.cpu(),
                 "sem": vis_bias_sem.cpu(), "count": self.vis_count.cpu(),
@@ -159,6 +283,18 @@ class PairwiseBiasAccumulator:
             "time_bias": {
                 "mean": time_bias_mean.cpu(), "std": time_bias_std.cpu(),
                 "sem": time_bias_sem.cpu(), "count": self.time_count.cpu(),
+            },
+            "time_abs_error": {
+                "mean": time_abs_err_mean.cpu(), "std": time_abs_err_std.cpu(),
+                "sem": time_abs_err_sem.cpu(), "count": self.time_count.cpu(),
+            },
+            "time_spacing_bias": {
+                "mean": time_spacing_mean.cpu(), "std": time_spacing_std.cpu(),
+                "sem": time_spacing_sem.cpu(), "count": self.time_spacing_count.cpu(),
+            },
+            "time_spacing_floor": {
+                "mean": floor_mean.cpu(), "std": floor_std.cpu(),
+                "sem": floor_sem.cpu(), "count": self.time_spacing_count.cpu(),
             },
         }
 
@@ -414,6 +550,7 @@ def build_power_spectra(
     n_bins: int = 50,
     inpaint: bool = True,
     x_margin_voxels: int | None = None,
+    x_margin_mode: str = "either",
 ):
     """Spatial-frequency (kx, ky, kz) power spectra of truth and prediction, one PMT.
 
@@ -428,9 +565,16 @@ def build_power_spectra(
     inpaint:   forwarded to field_spectra/to_grid -- False 0-fills invalid voxels instead
                of inpainting their nearest valid neighbour (see sirentv.utils.spectrum's
                module docstring for why inpainting is the default).
-    x_margin_voxels: if given, ANDs `valid` with GridIndex.x_far_mask(x_margin_voxels)
-               first -- restricts the spectrum to voxels more than this many cells from
-               EITHER x boundary, i.e. excludes the near-PMT-wall region.
+    x_margin_voxels: if given, ANDs `valid` with an x-boundary mask first -- restricts the
+               spectrum to voxels more than this many cells from the boundary/boundaries
+               `x_margin_mode` selects. Excludes the near-PMT-wall region.
+    x_margin_mode: which mask x_margin_voxels selects -- "either" (GridIndex.x_far_mask,
+               excludes the margin from BOTH x boundaries) or "pmt_wall"
+               (GridIndex.x_far_pmt_wall_mask, excludes the margin from ONLY the PMT-wall
+               boundary, leaving the opposite non-PMT wall untouched). The caller is
+               expected to call this twice, once per mode, to get both variants in the
+               same eval pass -- see eval_quantile.py/eval_pca.py's spectra_variants dict.
+               Ignored when x_margin_voxels is None.
 
     Returns {name: {"pred": {axis: (k, power)}, "target": {...}}}, all plain numpy so the
     result pickles into the eval .pt alongside the other diagnostics.
@@ -444,7 +588,12 @@ def build_power_spectra(
     grid = GridIndex(positions)
     valid = np.asarray(valid, dtype=bool)
     if x_margin_voxels is not None:
-        valid = valid & grid.x_far_mask(x_margin_voxels)
+        if x_margin_mode == "either":
+            valid = valid & grid.x_far_mask(x_margin_voxels)
+        elif x_margin_mode == "pmt_wall":
+            valid = valid & grid.x_far_pmt_wall_mask(x_margin_voxels)
+        else:
+            raise ValueError(f"unknown x_margin_mode {x_margin_mode!r}, expected 'either' or 'pmt_wall'")
 
     out = {}
     for name, sides in fields.items():
