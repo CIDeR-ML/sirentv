@@ -67,16 +67,23 @@ def evaluate_quantile(
     if "data" in eval_cfg and "loader" in eval_cfg["data"]:
         eval_cfg["data"]["loader"]["drop_last"] = False
         eval_cfg["data"]["loader"]["shuffle"] = False
+    # a training run's resident shard would drop the voxels that don't divide evenly across
+    # ranks; eval wants every voxel, through the ordinary sampler path
+    eval_cfg.get("data", {}).pop("memory_shard", None)
     dl = create_quantile_dataloader(eval_cfg, rank=rank, world_size=world_size)
 
     plib_cfg = cfg.get("quantile_plib", cfg.get("photonlib", {}))
     filepath = plib_cfg["filepath"]
     mode = plib_cfg.get("mode", "quantile")
     combine_every_quantile = plib_cfg.get("combine_every_quantile", 1)
+    align_t0 = bool(plib_cfg.get("align_quantiles_to_t0", False))
 
     # lazy=True: to_linear_time only needs the lightweight scalar attrs (mode,
     # log_quantile_C), never bulk per-voxel data.
-    qlib = QuantilePLib.load(filepath, lazy=True, mode=mode, combine_every_quantile=combine_every_quantile)
+    qlib = QuantilePLib.load(
+        filepath, lazy=True, mode=mode, combine_every_quantile=combine_every_quantile,
+        log_quantile_C=plib_cfg.get("log_quantile_C"),
+    )
 
     n_pmts = cfg.get("data", {}).get("n_pmt", 81)
     n_quantile = 512 // combine_every_quantile
@@ -103,11 +110,6 @@ def evaluate_quantile(
     spacing_acc = BinnedMeanAccumulator(n_quantile - 1, device)
 
     log_every = 1
-
-    # (kx, ky, kz) power spectra, one set per requested PMT. Only the requested quantile
-    # bins are kept: a full (N_voxel, n_pmt_sel, n_quantile) slice would be ~100x larger
-    # than the rest of the gathered results for no gain, since the diagnostic compares the
-    # spatial bandwidth of individual quantile levels, not their joint structure.
     do_spectra = bool(spectra and pmt_ids)
     if spectra_components:
         spectra_components = [int(c) for c in spectra_components]
@@ -118,10 +120,6 @@ def evaluate_quantile(
                 f"(combine_every_quantile={combine_every_quantile})"
             )
     else:
-        # Evenly spaced quantile levels u ~ 0, 0.25, 0.5, 0.75, 1 rather than the first five
-        # bins: unlike PCA components (ordered by explained variance, so the low indices are
-        # the interesting ones), quantile bins are ordered in probability and the first five
-        # are five nearly identical views of the CDF's leading edge.
         spectra_components = sorted(
             {int(round(f * (n_quantile - 1))) for f in (0.0, 0.25, 0.5, 0.75, 1.0)}
         )
@@ -147,11 +145,6 @@ def evaluate_quantile(
         target = {k: v.contiguous().to(device) for k, v in data["target"].items()}
 
         pred_out: dict[str, torch.Tensor] = net_module(x)
-        # A single-branch ablation model only emits the key(s) its one branch has, AND its
-        # training config's data.target_keys restricts the dataset to matching fields (see
-        # QuantilePLibDataset._fields_for_targets) -- so both pred_out and target can be
-        # missing v/t0/quantiles independently. Require both sides before treating a key as
-        # available: nothing to compare against a prediction with no target, or vice versa.
         has_v = ("v" in pred_out) and ("v" in target)
         has_t0 = "t0" in target  # t0 bias needs no v prediction (see below), just its own target
         pred_has_t0 = "t0" in pred_out  # tracked separately: whether there's a t0 PREDICTION to collect
@@ -174,8 +167,17 @@ def evaluate_quantile(
 
         # invert the log transform (if log_quantile mode) but stay in quantile-index space --
         # no interpolation onto a fixed time grid.
-        pred_time = qlib.to_linear_time(pred_quantiles) if has_q else None  # (B, n_pmts, n_quantile)
-        target_time = qlib.to_linear_time(target_quantiles) if has_q else None  # (B, n_pmts, n_quantile)
+        #
+        # Aligned quantiles: the target gets its own analytical_t0 back, the prediction gets
+        # the model's predicted t0 -- the end-to-end absolute time a user of the model would
+        # reconstruct, so t0 error shows up here too. A model with no t0 head (quantile-only
+        # ablation) falls back to the target t0.
+        target_t0_abs = pred_t0_abs = None
+        if has_q and align_t0:
+            target_t0_abs = data["meta"]["t0_raw"].to(device)
+            pred_t0_abs = pred_t0 if pred_t0 is not None else target_t0_abs
+        pred_time = qlib.to_linear_time(pred_quantiles, t0=pred_t0_abs) if has_q else None  # (B, n_pmts, n_quantile)
+        target_time = qlib.to_linear_time(target_quantiles, t0=target_t0_abs) if has_q else None  # (B, n_pmts, n_quantile)
 
         acc_pred_vs_target.update(pred_v_linear, target_v_linear, pred_time, target_time)
 
@@ -191,9 +193,7 @@ def evaluate_quantile(
 
         # per-(voxel, PMT) time bias, same 2*|p-t|/(p+t) formula and time-value masking as
         # PairwiseBiasAccumulator's per-tick time_bias, but reduced over the quantile-bin axis
-        # instead of over voxels/PMTs -- lets the notebook bin the actual bias metric (not the
-        # raw signed quantile_error, which can cancel across bins) by spatial region, e.g.
-        # distance from the detector wall
+        # instead of over voxels/PMTs
         if has_q:
             time_bias_mask = target_time > threshold  # (B, n_pmts, n_quantile)
             time_bias_vals = torch.where(
@@ -204,8 +204,7 @@ def evaluate_quantile(
             time_bias_per_pmt = time_bias_vals.sum(dim=-1) / time_bias_mask.sum(dim=-1).clamp(min=1)  # (B, n_pmts)
             all_time_bias.append(time_bias_per_pmt.detach().cpu())
 
-        # target visibility distribution stats -- needs a v target, independent of whether
-        # this model predicts v at all
+        # target visibility distribution stats
         if has_v:
             target_vis_mask = target_v_linear > threshold
             target_vis_masked = torch.where(target_vis_mask, target_v_linear, torch.zeros_like(target_v_linear))
@@ -214,11 +213,6 @@ def evaluate_quantile(
             target_vis_count += target_vis_mask.sum(dim=0).float()
 
         # t0 (onset) bias -- unmasked. t0 is the geometric time-of-flight from voxel to PMT;
-        # it's just as physically meaningful for an invisible PMT (0 photons observed) as a
-        # visible one, so there's no reason to restrict it to visible PMTs the way the
-        # quantile/visibility comparisons above legitimately are (confirmed 2026-09-21 --
-        # this used to be masked by target_vis_mask, which was an unnecessary restriction,
-        # not a correctness requirement). Requires only its own target, not a v target/pred.
         if has_t0:
             t0_acc_pred_vs_target.update(pred_t0, target_t0, torch.ones_like(target_t0, dtype=torch.bool))
 
@@ -230,20 +224,9 @@ def evaluate_quantile(
             spacing_acc.update(target_dt, target_vis_mask)
 
         if do_spectra and has_q:
-            # The network's own output domain (log-quantile if that is the mode), NOT the
-            # to_linear_time values -- the spectrum is meant to measure the spatial bandwidth
-            # the network actually has to represent, and it is also the domain the cached
-            # grad_frob targets were computed in.
+
             sel = torch.as_tensor(pmt_ids, device=target_quantiles.device)
             comp = torch.as_tensor(spectra_components, device=target_quantiles.device)
-            # quantiles_mask exists whenever "quantiles" is in target_keys, INDEPENDENT of
-            # whether "v" is also exposed as a target key -- see quantile.py's
-            # QuantilePLibDataset._fields_for_targets docstring ("quantiles" needs "vis" as
-            # well, to build this mask, even for a quantile-only model with no v_net branch
-            # at all). This is the correct valid-voxel mask for the quantiles/coeffs field
-            # spectra below when has_v is False; falling back to "everything valid" there
-            # (as an earlier version of this code did) lets zero-filled invisible-voxel
-            # quantile values leak into the FFT as spurious high-frequency structure.
             if "quantiles_mask" in target:
                 all_quantiles_valid_slice.append(target["quantiles_mask"].detach()[:, sel].cpu())
             all_target_quantiles_slice.append(
@@ -279,10 +262,7 @@ def evaluate_quantile(
             running_vis = acc_pred_vs_target.overall_vis_bias_sum / acc_pred_vs_target.overall_vis_bias_count.clamp(min=1)
             running_time = acc_pred_vs_target.overall_time_bias_sum / acc_pred_vs_target.overall_time_bias_count.clamp(min=1)
             #print(f"  [batch {batch_idx+1}] bias_vis: {running_vis.item():.4e}, bias_quantile: {running_time.item():.4e}")
-
-    # Only cat lists that were actually appended to above (has_v/has_t0/pred_has_t0/has_q,
-    # set inside the loop -- same value every batch since a model's branches, and its
-    # training config's target_keys, don't change mid-eval).
+            
     local_results = {
         "positions": torch.cat(all_positions, dim=0),
     }
@@ -316,8 +296,6 @@ def evaluate_quantile(
 
     if rank == 0:
         all_positions_tensor = gathered["positions"]  # always present, regardless of target_keys
-        # None when this model/config has no target (and/or prediction) for that key --
-        # omitted from `results` below rather than compared against a fabricated value.
         all_target_vis_tensor = gathered.get("target_vis")
         all_pred_vis_tensor = gathered.get("pred_vis")
         all_target_t0_tensor = gathered.get("target_t0")
@@ -338,9 +316,6 @@ def evaluate_quantile(
                 **stats_pred_vs_target,
                 "t0_bias": t0_stats_pred_vs_target,
             },
-            # mean adjacent-quantile-time spacing per bin (target side), length n_quantile-1 --
-            # lets the notebook estimate the local density f(Q(u)) for a density-corrected
-            # per-bin Poisson floor: f(Q(u_k)) ~= delta_u / quantile_time_spacing[k]
             "quantile_time_spacing": quantile_time_spacing,
             "meta": {
                 "n_pmts": n_pmts,
@@ -349,10 +324,7 @@ def evaluate_quantile(
                 "mode": mode,
                 "combine_every_quantile": combine_every_quantile,
                 "threshold": threshold,
-                # PMT positions, (n_pmts, 3) -- lets the notebook compute voxel-PMT distance
-                # from visibility_all.positions
                 "pmt_pos": torch.as_tensor(qlib.pmt_pos, dtype=torch.float32).cpu(),
-                # detector fiducial-volume bounds (min, max) per axis, shape (3, 2)
                 "wall_ranges": qlib.meta.ranges.cpu(),
             },
         }
@@ -376,8 +348,6 @@ def evaluate_quantile(
             }
 
         # per-(voxel, PMT) time bias (actual 2*|p-t|/(p+t) formula, not a raw signed error)
-        # only exists when this model predicts quantiles at all; the vis/quantile error
-        # correlation additionally needs a v prediction to correlate against.
         if has_q:
             results["error_correlation"] = {"time_bias": all_time_bias_tensor}
             if has_v:
@@ -413,24 +383,17 @@ def evaluate_quantile(
 
         if do_spectra:
             positions_np = all_positions_tensor.numpy()
-            # None when this model/config has no v target at all (e.g. a t0-only ablation,
-            # whose data.target_keys never reads visibility -- see
-            # QuantilePLibDataset._fields_for_targets).
+
             target_vis_np = all_target_vis_tensor.numpy() if has_v else None
             pred_quantiles_np = gathered["pred_quantiles_slice"].numpy() if has_q else None
             target_quantiles_np = gathered["target_quantiles_slice"].numpy() if has_q else None
             # quantiles_mask (vis_raw > 0) is read whenever "quantiles" is in target_keys,
-            # independent of whether "v" is also exposed as its own target key -- this is
-            # the correct valid-voxel fallback for a quantile-only model with no v_net
-            # branch at all (has_v False). Without it, invisible-voxel quantile values
-            # (NaN -> 0 filled) leak into the target's FFT as spurious high-frequency noise.
+            # independent of whether "v" is also exposed as its own target key
             quantiles_valid_np = gathered["quantiles_valid_slice"].numpy() if "quantiles_valid_slice" in gathered else None
 
             # Cached gradient targets are per-(voxel, PMT) and indexed by voxel_id over the
             # FULL LUT, while this eval may have run on a subset -- so it is only usable when
-            # the row counts line up. Prediction-side gradient spectra are NOT computed here:
-            # they need a forward pass with grad_keys enabled (create_graph), which
-            # @torch.no_grad() eval deliberately does not do.
+            # the row counts line up.
             grad_targets = None
             if grad_cache_file:
                 with h5py.File(grad_cache_file, "r") as gf:
@@ -443,12 +406,6 @@ def evaluate_quantile(
                         print(f"[eval_quantile] grad cache has {gf['v'].shape[0]} rows but eval "
                               f"covered {positions_np.shape[0]} -- skipping gradient spectra")
 
-            # Three variants of the same spectra: the default (inpainted, full volume), one
-            # restricted to voxels far from either x boundary (excludes the near-PMT-wall
-            # region, where the field is steepest), and one using 0-fill instead of
-            # inpainting (to show what the inpainting is actually correcting for -- see
-            # sirentv.utils.spectrum's module docstring). Same fields/valid mask feed all
-            # three; only build_power_spectra's own inpaint/x_margin_voxels kwargs differ.
             spectra_variants = {
                 "power_spectra": {},
                 f"power_spectra_x_far{spectra_x_margin}": {"x_margin_voxels": spectra_x_margin},
@@ -458,12 +415,6 @@ def evaluate_quantile(
                 results[variant_key] = {}
             for i, pid in enumerate(pmt_ids):
                 print(f"[eval_quantile] Building power spectra for PMT {pid}...")
-                # Restrict to visible voxels when visibility is available at all (v/quantiles
-                # are only meaningful there). Prefer the full target_vis (has_v) when
-                # present; fall back to quantiles_mask (available whenever has_q, even
-                # without a v_net branch -- see the comment above); only fall back to
-                # "everything valid" when NEITHER exists (a t0-only ablation), since t0
-                # is a geometric time-of-flight, defined everywhere regardless of visibility.
                 if has_v:
                     valid = target_vis_np[:, pid] > 0
                 elif quantiles_valid_np is not None:
