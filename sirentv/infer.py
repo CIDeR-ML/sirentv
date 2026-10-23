@@ -263,7 +263,9 @@ class QuantileInfer:
 
         self._qlib = QuantilePLib.load(
             filepath, lazy=True, mode=mode, combine_every_quantile=combine_every_quantile,
+            log_quantile_C=plib_cfg.get("log_quantile_C"),
         )
+        self._align_t0 = bool(plib_cfg.get("align_quantiles_to_t0", False))
         with h5py.File(filepath, "r") as f:
             self._u_grid = f["u_grid"][::combine_every_quantile].astype("float32")
 
@@ -314,14 +316,16 @@ class QuantileInfer:
         pred_q = pred_quantiles[batch_id:batch_id + 1, :, :]
         target_q = target["quantiles"][batch_id:batch_id + 1, :, :].to(pred_quantiles.device)
 
-        pred_cdf = self._qlib.reconstruct_aligned_cdf(self._u_grid, pred_q)
-        target_cdf = self._qlib.reconstruct_aligned_cdf(self._u_grid, target_q)
-
         pred_t0_ns = torch.exp(pred_log_t0[batch_id:batch_id + 1, :])
         if self._plot_meta is not None and "t0_raw" in self._plot_meta:
             target_t0_ns = self._plot_meta["t0_raw"][batch_id:batch_id + 1, :].to(pred_quantiles.device)
         else:
             target_t0_ns = torch.exp(target["t0"][batch_id:batch_id + 1, :]).to(pred_quantiles.device)
+
+        pred_cdf = self._qlib.reconstruct_aligned_cdf(
+            self._u_grid, pred_q, t0=pred_t0_ns if self._align_t0 else None)
+        target_cdf = self._qlib.reconstruct_aligned_cdf(
+            self._u_grid, target_q, t0=target_t0_ns if self._align_t0 else None)
 
         tick_ns = self._qlib._t_max_ns / self._qlib._n_bins
         pred_cdf_pmt = pred_cdf[0, pmt_id, :]
