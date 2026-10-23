@@ -513,12 +513,14 @@ def evaluate_pca(
                         print(f"[eval_pca] grad cache has {gf['v'].shape[0]} rows but eval "
                               f"covered {positions_np.shape[0]} -- skipping gradient spectra")
 
-            # Same three variants as eval_quantile.py -- default (inpainted, full volume),
-            # x-boundary-excluded (near-PMT-wall region dropped), and 0-fill instead of
-            # inpainting. See that file's comment / sirentv.utils.spectrum's docstring.
             spectra_variants = {
                 "power_spectra": {},
-                f"power_spectra_x_far{spectra_x_margin}": {"x_margin_voxels": spectra_x_margin},
+                f"power_spectra_x_far{spectra_x_margin}": {
+                    "x_margin_voxels": spectra_x_margin, "x_margin_mode": "either",
+                },
+                f"power_spectra_x_far_pmtwall{spectra_x_margin}": {
+                    "x_margin_voxels": spectra_x_margin, "x_margin_mode": "pmt_wall",
+                },
                 "power_spectra_zerofill": {"inpaint": False},
             }
             for variant_key in spectra_variants:
