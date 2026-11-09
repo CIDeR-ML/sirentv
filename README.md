@@ -19,14 +19,6 @@ pip install -e photonlib -e siren-lartpc -e sirentv   # sirentv also pulls torch
 
 This also installs the `sirentv-train` and `sirentv-eval` commands (same flags as `python -m sirentv.train` / `sirentv/eval/eval.py`).
 
-**S3DF / NERSC (container, nothing installed):** jobs run in the site container (S3DF: `develop.sif` under Singularity; NERSC: `deeplearnphysics/larcv2:ub2204-cu121-torch251-larndsim` under Shifter) with the three checkouts on `PYTHONPATH`, set *inside* the container since the image overrides it:
-
-```bash
-export PYTHONPATH=/path/to/sirentv:/path/to/siren-lartpc:/path/to/photonlib:$PYTHONPATH
-```
-
-On NERSC, packages the image lacks (e.g. `wandb`) come from a `pip install --target` directory that also goes on `PYTHONPATH`. The Slurm scripts (`cider-ml/scripts/slurm_job_sirentv/site_env.sh`) set all of this per site.
-
 ## Quick start
 
 The reference configs are `config/{train,eval}_q3_t0align_{s3df,nersc}.yaml`; every other config is kept under `config/archive/`.
@@ -45,6 +37,28 @@ torchrun --nproc_per_node=4 -m sirentv.train --config config/train_q3_t0align_s3
 torchrun --nproc_per_node=4 sirentv/eval/eval.py --config config/eval_q3_t0align_s3df.yaml \
     --output eval-q3_t0align.pt --pmt-ids 0 40 80
 ```
+
+## Running jobs on NERSC and S3DF
+
+`sirentv/scripts/submit_nersc.sh` (Perlmutter) and `sirentv/scripts/submit_s3df.sh` are minimal Slurm scripts: one task per GPU on 2 nodes x 4 GPUs, the 8-rank shape the reference configs assume (global batch 4096, memory shard per rank). Set `#SBATCH --account` in the script first, then submit from the repository root. Everything after the config is passed to the module, and `MODULE=sirentv.eval.eval` runs the evaluator instead of training.
+
+```bash
+# NERSC Perlmutter
+sbatch sirentv/scripts/submit_nersc.sh config/train_q3_t0align_nersc.yaml --wandb
+sbatch sirentv/scripts/submit_nersc.sh config/train_q3_t0align_nersc.yaml --wandb --resume
+MODULE=sirentv.eval.eval sbatch sirentv/scripts/submit_nersc.sh config/eval_q3_t0align_nersc.yaml \
+    --output eval-q3_t0align.pt --pmt-ids 0 40 80
+
+# S3DF
+sbatch sirentv/scripts/submit_s3df.sh config/train_q3_t0align_s3df.yaml --wandb
+MODULE=sirentv.eval.eval sbatch sirentv/scripts/submit_s3df.sh config/eval_q3_t0align_s3df.yaml \
+    --output eval-q3_t0align.pt --pmt-ids 0 40 80
+
+# sbatch options override the script's, e.g. a short run in another QOS
+sbatch -q premium -t 02:00:00 sirentv/scripts/submit_nersc.sh config/train_q3_t0align_nersc.yaml
+```
+
+`train.max_epochs` counts epochs per job: to continue a run, resubmit with `--resume` and `model.ckpt_file` pointing at its latest checkpoint.
 
 ## Representations
 
@@ -139,7 +153,7 @@ tests/bitwise/compare.sh <out A> <out B>        # PASS / FAIL report in <out B>/
 ```
 sirentv/
 ├── config/              # reference configs; archive/ holds the rest
-├── docs/                # nersc_bitwise_check.md (NERSC handoff); archive/ superseded notes
+├── docs/                # archive/ superseded notes
 ├── tests/               # import/unit tests (run_tests.sh); bitwise/ regression suite
 ├── sirentv/
 │   ├── models/          # networks + SirenTV wrapper
@@ -148,7 +162,7 @@ sirentv/
 │   ├── eval/            # eval CLI, PCA / quantile evaluators, shared metrics
 │   ├── training/        # loss/logger/clipping helpers
 │   ├── utils/           # logging, gradient estimators, spectra, DDP, registry
-│   ├── scripts/         # offline gradient-target precompute
+│   ├── scripts/         # Slurm submission examples (NERSC, S3DF); offline gradient-target precompute
 │   ├── infer.py         # training-time plots (registry)
 │   ├── analysis.py      # bias metrics for logger.analysis
 │   └── train.py         # training loop + CLI
