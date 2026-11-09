@@ -8,26 +8,9 @@ from sirentv.models.multibranch import MultiBranchSiren, _as_list
 
 @MODELS.register_module()
 class DualPcaSiren(MultiBranchSiren):
-    """Two independent SIREN branches: one for vis + log_t0, one for PCA coefficients.
+    """Branches `vt0_net` -> [v, t0] and `coeff_net` -> [coeffs] (legacy submodule names).
 
-    Thin wrapper over MultiBranchSiren, registering the branches under the submodule
-    names `vt0_net` and `coeff_net` so that state_dicts from before the refactor load
-    unchanged -- which is what makes the existing coeffs_only / high_omega checkpoints
-    reusable in Stage 1. Equivalent config:
-
-        type: MultiBranchSiren
-        branches:
-          - {name: vt0_net,   keys: [v, t0],   hidden_features: 256, first_omega_0: 30}
-          - {name: coeff_net, keys: [coeffs],  hidden_features: 512, first_omega_0: 150}
-
-    The [vt0_branch, coeff_branch] list convention is preserved for every argument: a
-    bare scalar applies uniformly to both branches (backward compatible with every
-    existing config), a 2-element list lets them differ. Per-branch omega_0 exists
-    specifically to test whether coeff_net's steep-near-PMT / flat-far-field difficulty
-    is a SIREN bandwidth limit -- raising omega_0 raises the range of spatial frequencies
-    the branch can represent, at the cost of needing a cleaner signal (dynamic_weight, or
-    a longer warmup) to keep that extra bandwidth from showing up as ringing in the
-    otherwise smooth far field.
+    Each argument is a scalar for both branches or a [vt0, coeff] list.
     """
 
     def __init__(
@@ -70,6 +53,4 @@ class DualPcaSiren(MultiBranchSiren):
             ],
             **kwargs,
         )
-        # legacy value: [vt0 width, coeff width]; identical to what this topology
-        # produces anyway, kept explicit so the intent is obvious
         self.out_features = [2, n_components]

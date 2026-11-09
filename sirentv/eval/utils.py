@@ -1,35 +1,71 @@
-"""Shared evaluation building blocks for eval.py / eval_pca.py / eval_quantile.py.
-
-Two halves, kept in one file since both are "eval utilities" but serve different call
-sites -- don't conflate them:
-
-- Streaming/distributed pieces (PairwiseBiasAccumulator, ScalarErrorAccumulator,
-  first_nonzero_bin, gather_to_rank0): used by the standalone eval_*.py CLI scripts to
-  accumulate bias statistics across an entire (possibly multi-GPU) eval dataset. Pipeline-
-  specific per-batch logic (fetching pred/target, reconstructing the CDF from whatever
-  compressed representation a model uses) stays in each eval_*.py -- this only holds what's
-  identical across pipelines.
-
-- Evaluator: an interactive/notebook-style helper for a single batch at a time --
-  RMSE-style metrics and matplotlib plots (CDF, visibility, t0). CompressedPLib-specific
-  (uses its windowed reconstruct_cdf(coeffs, t0, n_bins) and _align_margin), meant for
-  ad-hoc exploration rather than full-dataset evaluation.
-"""
+"""Shared pieces of the eval_pca.py / eval_quantile.py pipelines: setup, streaming accumulators
+that all-reduce across ranks, gathering, and the post-hoc spatial diagnostics."""
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Sequence, Union
+import copy
+import os
 
 import numpy as np
 import torch
 import torch.distributed as dist
-import matplotlib.pyplot as plt
-
-from sirentv.data.compressed import CompressedPLib
 
 
 # ---------------------------------------------------------------------------
-# Streaming / distributed accumulation (eval_*.py CLI scripts)
+# Setup / output
+# ---------------------------------------------------------------------------
+
+
+def setup_eval_model(cfg: dict, ckpt_file: str | None, tag: str):
+    """Load SirenTV (ckpt_file overrides model.ckpt_file) on this rank's device, in eval mode.
+
+    Returns (rank, world_size, device, net_module) with net_module unwrapped from DDP.
+    """
+    from sirentv.models import SirenTV
+    from sirentv.utils.comm import create_ddp_model
+
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    is_distributed = world_size > 1
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    device = torch.device(f"cuda:{local_rank}") if torch.cuda.is_available() else torch.device("cpu")
+
+    if ckpt_file is not None:
+        cfg.setdefault("model", {})["ckpt_file"] = ckpt_file
+
+    net = SirenTV(cfg, weights_only=True).to(device)
+    if is_distributed:
+        net = create_ddp_model(net, device_ids=[local_rank])
+    net.eval()
+    net_module = net.module if is_distributed else net
+
+    if rank == 0:
+        print(f"[{tag}] Model device: {device}")
+        print(f"[{tag}] Distributed: {is_distributed}, world_size: {world_size}")
+        if cfg.get("model", {}).get("ckpt_file"):
+            print(f"[{tag}] Loaded checkpoint: {cfg['model']['ckpt_file']}")
+    return rank, world_size, device, net_module
+
+
+def eval_loader_cfg(cfg: dict) -> dict:
+    """Copy of cfg whose loader visits every voxel once, in a fixed order."""
+    eval_cfg = copy.deepcopy(cfg)
+    if "data" in eval_cfg and "loader" in eval_cfg["data"]:
+        eval_cfg["data"]["loader"]["drop_last"] = False
+        eval_cfg["data"]["loader"]["shuffle"] = False
+    return eval_cfg
+
+
+def save_results(results: dict, output_file: str, tag: str):
+    output_dir = os.path.dirname(output_file)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    torch.save(results, output_file)
+    print(f"[{tag}] Results saved to {output_file}")
+
+
+# ---------------------------------------------------------------------------
+# Per-batch metrics
 # ---------------------------------------------------------------------------
 
 
@@ -66,66 +102,103 @@ def sample_poisson_spacing_err(t: torch.Tensor, n_photons: torch.Tensor, u: torc
     return torch.abs(q_hat - t) / torch.where(b > 0, b, torch.ones_like(b))
 
 
+def masked_bin_bias(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """(B, n_pmt, K) -> (B, n_pmt): mean of 2|p-t|/(p+t) over the masked bins (0 if none)."""
+    vals = torch.where(
+        mask,
+        2 * torch.abs(pred - target) / (pred + target).clamp(min=1e-10),
+        torch.zeros_like(pred),
+    )
+    return vals.sum(dim=-1) / mask.sum(dim=-1).clamp(min=1)
+
+
+def error_correlation(vis_errors: torch.Tensor, quantile_errors: torch.Tensor) -> dict:
+    """z-scored per-(voxel, PMT) visibility and quantile errors, and their correlation."""
+    vis_err_flat = vis_errors.flatten()
+    quantile_err_flat = quantile_errors.flatten()
+    vis_err_z = (vis_err_flat - vis_err_flat.mean()) / vis_err_flat.std()
+    quantile_err_z = (quantile_err_flat - quantile_err_flat.mean()) / quantile_err_flat.std()
+    correlation = torch.corrcoef(torch.stack([vis_err_z, quantile_err_z]))[0, 1]
+    return {
+        "vis_errors": vis_errors,
+        "quantile_errors": quantile_errors,
+        "vis_errors_z": vis_err_z,
+        "quantile_errors_z": quantile_err_z,
+        "correlation": correlation.cpu(),
+    }
+
+
+def first_nonzero_bin(wvfm: torch.Tensor, eps: float = 0.0) -> torch.Tensor:
+    """First tick index along the last dim where `wvfm > eps`. (..., n_ticks) -> (...,) long.
+    Entries with no bin above `eps` get a sentinel of `n_ticks` (caller should mask these out)."""
+    n_ticks = wvfm.shape[-1]
+    mask = wvfm > eps
+    idx = torch.arange(n_ticks, device=wvfm.device).expand_as(wvfm)
+    idx_or_sentinel = torch.where(mask, idx, torch.full_like(idx, n_ticks))
+    return idx_or_sentinel.min(dim=-1).values
+
+
+# ---------------------------------------------------------------------------
+# Streaming accumulators (all_reduce across ranks, finalize on rank 0)
+# ---------------------------------------------------------------------------
+
+
+def _mean_std_sem(total, sq_total, count):
+    """count is already clamped to >= 1."""
+    mean = total / count
+    var = (sq_total / count) - mean ** 2
+    std = torch.sqrt(var.clamp(min=0))
+    return mean, std, std / torch.sqrt(count)
+
+
+def _all_reduce(tensors):
+    for t in tensors:
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+
+
 class PairwiseBiasAccumulator:
-    """Accumulates per-PMT / per-tick / overall 2*|p-t|/(p+t) bias between a "pred" and a
-    "target" quantity (visibility + CDF), matching the formula in `sirentv.analysis.bias`.
+    """Per-PMT / per-bin / overall 2|p-t|/(p+t) bias between a pred and a target (visibility + time),
+    same formula as `sirentv.analysis.bias`. Per-bin variants: relative bias, absolute error,
+    error in units of the local truth spacing b_k, and its Monte Carlo Poisson floor.
+    A half never updated with a prediction finalizes to NaN, not a misleading 0.
     """
 
     def __init__(self, n_pmts: int, n_ticks: int, threshold: float, device):
         self.threshold = threshold
-        self.vis_bias_sum = torch.zeros(n_pmts, device=device)
-        self.vis_bias_sq_sum = torch.zeros(n_pmts, device=device)
-        self.vis_count = torch.zeros(n_pmts, device=device)
+        zeros = lambda n: torch.zeros(n, device=device)  # noqa: E731
+        scalar = lambda: torch.tensor(0.0, device=device)  # noqa: E731
+        self.vis_bias_sum, self.vis_bias_sq_sum, self.vis_count = zeros(n_pmts), zeros(n_pmts), zeros(n_pmts)
 
-        self.time_bias_sum = torch.zeros(n_ticks, device=device)
-        self.time_bias_sq_sum = torch.zeros(n_ticks, device=device)
-        self.time_count = torch.zeros(n_ticks, device=device)
-        # absolute |p - t| counterpart of time_bias, same mask/reduction, in the CDF's own units
-        self.time_abs_err_sum = torch.zeros(n_ticks, device=device)
-        self.time_abs_err_sq_sum = torch.zeros(n_ticks, device=device)
-        # |p - t| / b_k, b_k = local truth quantile spacing (see quantile_spacing); own
-        # counts, since b_k == 0 bins are excluded on top of the time mask
-        self.time_spacing_bias_sum = torch.zeros(n_ticks, device=device)
-        self.time_spacing_bias_sq_sum = torch.zeros(n_ticks, device=device)
-        self.time_spacing_count = torch.zeros(n_ticks, device=device)
-        # Monte Carlo Poisson floor of time_spacing_bias, same mask/reduction/counts
-        self.time_spacing_floor_sum = torch.zeros(n_ticks, device=device)
-        self.time_spacing_floor_sq_sum = torch.zeros(n_ticks, device=device)
-        self._floor_used = False
+        self.time_bias_sum, self.time_bias_sq_sum, self.time_count = zeros(n_ticks), zeros(n_ticks), zeros(n_ticks)
+        self.time_abs_err_sum, self.time_abs_err_sq_sum = zeros(n_ticks), zeros(n_ticks)
+        # own count: b_k == 0 bins are excluded on top of the time mask
+        self.time_spacing_bias_sum, self.time_spacing_bias_sq_sum = zeros(n_ticks), zeros(n_ticks)
+        self.time_spacing_count = zeros(n_ticks)
+        self.time_spacing_floor_sum, self.time_spacing_floor_sq_sum = zeros(n_ticks), zeros(n_ticks)
 
-        self.overall_vis_bias_sum = torch.tensor(0.0, device=device)
-        self.overall_vis_bias_count = torch.tensor(0.0, device=device)
-        self.overall_time_bias_sum = torch.tensor(0.0, device=device)
-        self.overall_time_bias_count = torch.tensor(0.0, device=device)
-        self.overall_time_abs_err_sum = torch.tensor(0.0, device=device)
-        self.overall_time_spacing_bias_sum = torch.tensor(0.0, device=device)
-        self.overall_time_spacing_count = torch.tensor(0.0, device=device)
-        self.overall_time_spacing_floor_sum = torch.tensor(0.0, device=device)
+        self.overall_vis_bias_sum, self.overall_vis_bias_count = scalar(), scalar()
+        self.overall_time_bias_sum, self.overall_time_bias_count = scalar(), scalar()
+        self.overall_time_abs_err_sum = scalar()
+        self.overall_time_spacing_bias_sum, self.overall_time_spacing_count = scalar(), scalar()
+        self.overall_time_spacing_floor_sum = scalar()
 
-        # Whether update() has ever been called with a real (non-None) pred_v/pred_cdf --
-        # lets finalize() report NaN instead of a misleading 0.0 (i.e. "perfect agreement")
-        # for a half that was never actually predicted (single-branch ablation models).
         self._vis_used = False
         self._time_used = False
+        self._floor_used = False
 
     def update(
         self,
-        pred_v: Optional[torch.Tensor],
+        pred_v: torch.Tensor | None,
         target_v: torch.Tensor,
-        pred_cdf: Optional[torch.Tensor],
+        pred_cdf: torch.Tensor | None,
         target_cdf: torch.Tensor,
-        time_pair_mask: Optional[torch.Tensor] = None,
-        time_floor_err: Optional[torch.Tensor] = None,
+        time_pair_mask: torch.Tensor | None = None,
+        time_floor_err: torch.Tensor | None = None,
     ):
-        """pred_v/pred_cdf may be None when the model being evaluated has no branch for
-        that output (e.g. a single-branch t0_net-only ablation predicts neither v nor
-        quantiles) -- that half is then skipped entirely rather than compared against a
-        fabricated prediction. target_v/target_cdf are always required: the dataset
-        returns the full (v, t0, quantiles) target regardless of which branches the
-        model actually has. time_pair_mask (B, n_pmts) bool, if given, is ANDed into every
-        time metric's mask on top of target_cdf > threshold (e.g. valid vis & quantiles_mask).
-        time_floor_err (B, n_pmts, n_ticks), if given, is a per-element Poisson-floor sample
-        (see sample_poisson_spacing_err), reduced exactly like time_spacing_bias.
+        """pred_v/pred_cdf None (model has no such branch) skips that half.
+        time_pair_mask (B, n_pmts) is ANDed into every time mask on top of target_cdf > threshold.
+        time_floor_err (B, n_pmts, n_ticks) is a Poisson-floor sample (sample_poisson_spacing_err),
+        reduced like the spacing bias.
         """
         from sirentv.analysis import bias as compute_bias
 
@@ -139,7 +212,6 @@ class PairwiseBiasAccumulator:
             ) * vis_masked_count
             self.overall_vis_bias_count += vis_masked_count
 
-            # per-PMT visibility bias
             vis_mask = target_v > threshold
             p, t = pred_v, target_v
             vis_bias_vals = torch.where(
@@ -155,12 +227,10 @@ class PairwiseBiasAccumulator:
             if time_pair_mask is not None:
                 overall_mask = overall_mask & time_pair_mask[..., None]
             abs_err = torch.abs(pred_cdf - target_cdf)
-            # same 2|p-t|/(p+t) as sirentv.analysis.bias, but under the combined mask
             rel_err = 2 * abs_err / (pred_cdf + target_cdf).clamp(min=1e-10)
             self.overall_time_bias_sum += torch.where(overall_mask, rel_err, torch.zeros_like(rel_err)).sum()
             self.overall_time_bias_count += overall_mask.sum()
-            # spacing from the full-length target, before any [:n] slicing, so the end bins
-            # get their proper one-sided difference
+            # spacing from the full-length target, so the end bins get their one-sided difference
             b_k = quantile_spacing(target_cdf)
             spacing_mask_full = overall_mask & (b_k > 0)
             spacing_err = torch.where(
@@ -174,7 +244,7 @@ class PairwiseBiasAccumulator:
                 floor_err = torch.where(spacing_mask_full, time_floor_err, torch.zeros_like(time_floor_err))
                 self.overall_time_spacing_floor_sum += floor_err.sum()
 
-            # per-tick CDF bias
+            # per-bin: mean over PMTs, then over voxels with any masked PMT
             n = min(self.time_bias_sum.shape[0], pred_cdf.shape[-1], target_cdf.shape[-1])
             pt = pred_cdf[..., :n]
             time_mask = overall_mask[..., :n]
@@ -201,7 +271,7 @@ class PairwiseBiasAccumulator:
             self.time_count[:n] += time_mask_any.sum(dim=0).float()
 
     def all_reduce(self):
-        for t in [
+        _all_reduce([
             self.vis_bias_sum, self.vis_bias_sq_sum, self.vis_count,
             self.time_bias_sum, self.time_bias_sq_sum, self.time_count,
             self.time_abs_err_sum, self.time_abs_err_sq_sum,
@@ -212,61 +282,48 @@ class PairwiseBiasAccumulator:
             self.overall_time_bias_sum, self.overall_time_bias_count,
             self.overall_time_abs_err_sum,
             self.overall_time_spacing_bias_sum, self.overall_time_spacing_count,
-        ]:
-            dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        ])
 
     def finalize(self):
-        # Never-updated half (single-branch model with no v or no quantiles prediction) --
-        # report NaN, not 0.0/(0.0/1) which would misleadingly read as "perfect agreement".
+        nan = torch.tensor(float("nan"))
+        nan_pmt = torch.full_like(self.vis_bias_sum, float("nan")).cpu()
+        nan_tick = torch.full_like(self.time_bias_sum, float("nan")).cpu()
+
         if not self._vis_used:
-            nan_pmt = torch.full_like(self.vis_bias_sum, float("nan")).cpu()
-            overall_vis_bias = torch.tensor(float("nan"))
+            overall_vis_bias = nan
             vis_bias_mean = vis_bias_std = vis_bias_sem = nan_pmt
         else:
             overall_vis_bias = self.overall_vis_bias_sum / self.overall_vis_bias_count.clamp(min=1)
-            vis_bias_mean = self.vis_bias_sum / self.vis_count.clamp(min=1)
-            vis_bias_var = (self.vis_bias_sq_sum / self.vis_count.clamp(min=1)) - vis_bias_mean ** 2
-            vis_bias_std = torch.sqrt(vis_bias_var.clamp(min=0))
-            vis_bias_sem = vis_bias_std / torch.sqrt(self.vis_count.clamp(min=1))
+            vis_bias_mean, vis_bias_std, vis_bias_sem = _mean_std_sem(
+                self.vis_bias_sum, self.vis_bias_sq_sum, self.vis_count.clamp(min=1))
 
         if not self._time_used:
-            nan_tick = torch.full_like(self.time_bias_sum, float("nan")).cpu()
-            overall_time_bias = overall_time_abs_err = overall_time_spacing_bias = torch.tensor(float("nan"))
+            overall_time_bias = overall_time_abs_err = overall_time_spacing_bias = nan
             time_bias_mean = time_bias_std = time_bias_sem = nan_tick
             time_abs_err_mean = time_abs_err_std = time_abs_err_sem = nan_tick
             time_spacing_mean = time_spacing_std = time_spacing_sem = nan_tick
         else:
             count = self.time_count.clamp(min=1)
             overall_time_bias = self.overall_time_bias_sum / self.overall_time_bias_count.clamp(min=1)
-            time_bias_mean = self.time_bias_sum / count
-            time_bias_var = (self.time_bias_sq_sum / count) - time_bias_mean ** 2
-            time_bias_std = torch.sqrt(time_bias_var.clamp(min=0))
-            time_bias_sem = time_bias_std / torch.sqrt(count)
-
+            time_bias_mean, time_bias_std, time_bias_sem = _mean_std_sem(
+                self.time_bias_sum, self.time_bias_sq_sum, count)
             overall_time_abs_err = self.overall_time_abs_err_sum / self.overall_time_bias_count.clamp(min=1)
-            time_abs_err_mean = self.time_abs_err_sum / count
-            time_abs_err_var = (self.time_abs_err_sq_sum / count) - time_abs_err_mean ** 2
-            time_abs_err_std = torch.sqrt(time_abs_err_var.clamp(min=0))
-            time_abs_err_sem = time_abs_err_std / torch.sqrt(count)
-
+            time_abs_err_mean, time_abs_err_std, time_abs_err_sem = _mean_std_sem(
+                self.time_abs_err_sum, self.time_abs_err_sq_sum, count)
             overall_time_spacing_bias = self.overall_time_spacing_bias_sum / self.overall_time_spacing_count.clamp(min=1)
-            spacing_count = self.time_spacing_count.clamp(min=1)
-            time_spacing_mean = self.time_spacing_bias_sum / spacing_count
-            time_spacing_var = (self.time_spacing_bias_sq_sum / spacing_count) - time_spacing_mean ** 2
-            time_spacing_std = torch.sqrt(time_spacing_var.clamp(min=0))
-            time_spacing_sem = time_spacing_std / torch.sqrt(spacing_count)
+            time_spacing_mean, time_spacing_std, time_spacing_sem = _mean_std_sem(
+                self.time_spacing_bias_sum, self.time_spacing_bias_sq_sum, self.time_spacing_count.clamp(min=1))
 
         if not (self._time_used and self._floor_used):
-            nan_tick = torch.full_like(self.time_bias_sum, float("nan")).cpu()
-            overall_time_spacing_floor = torch.tensor(float("nan"))
+            overall_time_spacing_floor = nan
             floor_mean = floor_std = floor_sem = nan_tick
         else:
-            spacing_count = self.time_spacing_count.clamp(min=1)
             overall_time_spacing_floor = self.overall_time_spacing_floor_sum / self.overall_time_spacing_count.clamp(min=1)
-            floor_mean = self.time_spacing_floor_sum / spacing_count
-            floor_var = (self.time_spacing_floor_sq_sum / spacing_count) - floor_mean ** 2
-            floor_std = torch.sqrt(floor_var.clamp(min=0))
-            floor_sem = floor_std / torch.sqrt(spacing_count)
+            floor_mean, floor_std, floor_sem = _mean_std_sem(
+                self.time_spacing_floor_sum, self.time_spacing_floor_sq_sum, self.time_spacing_count.clamp(min=1))
+
+        def stats(mean, std, sem, count):
+            return {"mean": mean.cpu(), "std": std.cpu(), "sem": sem.cpu(), "count": count.cpu()}
 
         return {
             "overall": {
@@ -276,38 +333,21 @@ class PairwiseBiasAccumulator:
                 "time_spacing_bias": overall_time_spacing_bias.cpu(),
                 "time_spacing_floor": overall_time_spacing_floor.cpu(),
             },
-            "visibility_bias": {
-                "mean": vis_bias_mean.cpu(), "std": vis_bias_std.cpu(),
-                "sem": vis_bias_sem.cpu(), "count": self.vis_count.cpu(),
-            },
-            "time_bias": {
-                "mean": time_bias_mean.cpu(), "std": time_bias_std.cpu(),
-                "sem": time_bias_sem.cpu(), "count": self.time_count.cpu(),
-            },
-            "time_abs_error": {
-                "mean": time_abs_err_mean.cpu(), "std": time_abs_err_std.cpu(),
-                "sem": time_abs_err_sem.cpu(), "count": self.time_count.cpu(),
-            },
-            "time_spacing_bias": {
-                "mean": time_spacing_mean.cpu(), "std": time_spacing_std.cpu(),
-                "sem": time_spacing_sem.cpu(), "count": self.time_spacing_count.cpu(),
-            },
-            "time_spacing_floor": {
-                "mean": floor_mean.cpu(), "std": floor_std.cpu(),
-                "sem": floor_sem.cpu(), "count": self.time_spacing_count.cpu(),
-            },
+            "visibility_bias": stats(vis_bias_mean, vis_bias_std, vis_bias_sem, self.vis_count),
+            "time_bias": stats(time_bias_mean, time_bias_std, time_bias_sem, self.time_count),
+            "time_abs_error": stats(time_abs_err_mean, time_abs_err_std, time_abs_err_sem, self.time_count),
+            "time_spacing_bias": stats(time_spacing_mean, time_spacing_std, time_spacing_sem, self.time_spacing_count),
+            "time_spacing_floor": stats(floor_mean, floor_std, floor_sem, self.time_spacing_count),
         }
 
 
 class ScalarErrorAccumulator:
-    """Accumulates mean/std of a masked scalar absolute error (|pred - target|), e.g. t0 onset error."""
+    """Mean/std of a masked absolute error |pred - target|, e.g. the t0 onset error (NaN if never updated)."""
 
     def __init__(self, device):
         self.err_sum = torch.tensor(0.0, device=device)
         self.err_sq_sum = torch.tensor(0.0, device=device)
         self.count = torch.tensor(0.0, device=device)
-        # Never-updated (e.g. a single-branch ablation model with no t0 prediction at all)
-        # -- finalize() reports NaN rather than a misleading 0.0 mean/std.
         self._used = False
 
     def update(self, pred: torch.Tensor | None, target: torch.Tensor, mask: torch.Tensor):
@@ -320,35 +360,27 @@ class ScalarErrorAccumulator:
         self.count += mask.sum()
 
     def all_reduce(self):
-        for t in [self.err_sum, self.err_sq_sum, self.count]:
-            dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        _all_reduce([self.err_sum, self.err_sq_sum, self.count])
 
     def finalize(self):
         if not self._used:
             nan = torch.tensor(float("nan"))
             return {"mean": nan, "std": nan, "count": self.count.cpu()}
-        mean = self.err_sum / self.count.clamp(min=1)
-        var = (self.err_sq_sum / self.count.clamp(min=1)) - mean ** 2
-        std = torch.sqrt(var.clamp(min=0))
+        mean, std, _ = _mean_std_sem(self.err_sum, self.err_sq_sum, self.count.clamp(min=1))
         return {"mean": mean.cpu(), "std": std.cpu(), "count": self.count.cpu()}
 
 
 class BinnedMeanAccumulator:
-    """Accumulates the mean (over visible PMTs, then over voxels with any visible PMT) of an
-    arbitrary per-(voxel, PMT, bin) quantity -- same two-stage reduction PairwiseBiasAccumulator
-    uses for its per-bin bias curve, but for any quantity, not just the bias formula. Used for
-    the adjacent-quantile-time spacing needed to estimate the local density f(Q(u)) for a
-    density-corrected per-bin Poisson floor -- the visibility mask is bin-independent (a voxel's
-    PMT is either visible or not, regardless of bin), so a single scalar count suffices rather
-    than a per-bin count.
-    """
+    """Mean of a per-(voxel, PMT, bin) quantity over visible PMTs, then over voxels with any
+    visible PMT (the visibility mask is bin-independent, so one count suffices). Used for the
+    adjacent-quantile spacing behind a density-corrected Poisson floor."""
 
     def __init__(self, n_bins: int, device):
         self.sum = torch.zeros(n_bins, device=device)
         self.count = torch.zeros(1, device=device)
 
     def update(self, values: torch.Tensor, vis_mask: torch.Tensor):
-        """values: (B, n_pmt, n_bins). vis_mask: (B, n_pmt) bool, visibility mask."""
+        """values: (B, n_pmt, n_bins). vis_mask: (B, n_pmt) bool."""
         mask_f = vis_mask.unsqueeze(-1).float()
         n_visible = vis_mask.sum(dim=1).clamp(min=1).float()
         per_voxel = (values * mask_f).sum(dim=1) / n_visible.unsqueeze(-1)  # (B, n_bins)
@@ -357,27 +389,40 @@ class BinnedMeanAccumulator:
         self.count += has_any.sum().float()
 
     def all_reduce(self):
-        dist.all_reduce(self.sum, op=dist.ReduceOp.SUM)
-        dist.all_reduce(self.count, op=dist.ReduceOp.SUM)
+        _all_reduce([self.sum, self.count])
 
     def finalize(self):
         return (self.sum / self.count.clamp(min=1)).cpu()
 
 
-def first_nonzero_bin(wvfm: torch.Tensor, eps: float = 0.0) -> torch.Tensor:
-    """First tick index along the last dim where `wvfm > eps`. (..., n_ticks) -> (...,) long.
-    Entries with no bin above `eps` get a sentinel of `n_ticks` (caller should mask these out)."""
-    n_ticks = wvfm.shape[-1]
-    mask = wvfm > eps
-    idx = torch.arange(n_ticks, device=wvfm.device).expand_as(wvfm)
-    idx_or_sentinel = torch.where(mask, idx, torch.full_like(idx, n_ticks))
-    return idx_or_sentinel.min(dim=-1).values
+class VisStatsAccumulator:
+    """Per-PMT mean target visibility over v > threshold."""
+
+    def __init__(self, n_pmts: int, threshold: float, device):
+        self.threshold = threshold
+        self.sum = torch.zeros(n_pmts, device=device)
+        self.count = torch.zeros(n_pmts, device=device)
+
+    def update(self, v: torch.Tensor) -> torch.Tensor:
+        """Returns the (B, n_pmts) mask v > threshold."""
+        mask = v > self.threshold
+        masked = torch.where(mask, v, torch.zeros_like(v))
+        self.sum += (masked * mask).sum(dim=0)
+        self.count += mask.sum(dim=0).float()
+        return mask
+
+    def all_reduce(self):
+        _all_reduce([self.sum, self.count])
+
+    def finalize(self):
+        mean = self.sum / self.count.clamp(min=1)
+        return {"mean": mean.cpu()}
 
 
 def gather_to_rank0(tensors: dict, world_size: int, rank: int, device) -> dict | None:
-    """Gather a dict of same-leading-dim tensors from all ranks to rank 0, concatenated
-    along dim 0. Handles ranks contributing different row counts. Returns the gathered
-    dict (moved to CPU) on rank 0, None on other ranks. Single-process: just moves to CPU.
+    """Concatenate a dict of same-leading-dim tensors from all ranks (row counts may differ) on rank 0.
+
+    Returns the CPU dict on rank 0, None elsewhere; single-process just moves to CPU.
     """
     if world_size <= 1:
         return {k: v.cpu() for k, v in tensors.items()}
@@ -392,9 +437,7 @@ def gather_to_rank0(tensors: dict, world_size: int, rank: int, device) -> dict |
     for key, local_t in tensors.items():
         trailing_shape = local_t.shape[1:]
         bucket = [torch.zeros(sz, *trailing_shape, device=device, dtype=local_t.dtype) for sz in all_sizes] if rank == 0 else None
-        # NCCL requires GPU tensors -- local_t may be CPU-resident (callers commonly accumulate
-        # per-batch tensors on CPU throughout a long eval loop to avoid sustained GPU memory
-        # growth), so move it to device just for this one-shot collective, not for the whole loop
+        # NCCL needs GPU tensors; callers keep their per-batch lists on CPU
         dist.gather(local_t.to(device).contiguous(), bucket, dst=0)
         if rank == 0:
             gathered[key] = torch.cat(bucket, dim=0).cpu()
@@ -402,12 +445,15 @@ def gather_to_rank0(tensors: dict, world_size: int, rank: int, device) -> dict |
     return gathered if rank == 0 else None
 
 
+# ---------------------------------------------------------------------------
+# Spatial diagnostics (rank 0, on the gathered full-volume arrays)
+# ---------------------------------------------------------------------------
+
+
 def grid_from_positions(positions: np.ndarray, values: np.ndarray):
-    """positions: (N, 3), values: (N,) -> (grid, unique_coords, voxel_size, (ix, iy, iz)).
-    Regular-grid reshape of scattered (position, scalar) pairs, e.g. from an eval loop that
-    iterated over every voxel (shuffle=False, drop_last=False). Same approach as the
-    notebook's compute_gradients_from_positions_fast, factored out so it's not duplicated
-    per-notebook-cell and can be reused for pred, target, or residual fields alike.
+    """positions (N, 3), values (N,) -> (grid, unique_coords, voxel_size, (ix, iy, iz)).
+
+    Regular-grid reshape of scattered values from an eval over every voxel.
     """
     x_unique = np.unique(positions[:, 0])
     y_unique = np.unique(positions[:, 1])
@@ -428,10 +474,9 @@ def grid_from_positions(positions: np.ndarray, values: np.ndarray):
 
 
 def gradient_magnitude_field(positions: np.ndarray, values: np.ndarray):
-    """positions: (N, 3), values: (N,) -> (grad_mag_flat (N,), grid, unique_coords, voxel_size).
-    Gradient magnitude of a scalar field gridded from scattered positions (e.g. target
-    visibility for one PMT) -- used to flag high-frequency/structural regions (PMT surface,
-    wires, ...) purely from the data, no detector geometry needed.
+    """positions (N, 3), values (N,) -> (grad_mag_flat (N,), grad_mag_grid, grid, unique_coords, voxel_size).
+
+    Flags structural/high-frequency regions (PMT surface, wires, ...) from the data alone.
     """
     grid, unique_coords, voxel_size, (ix, iy, iz) = grid_from_positions(positions, values)
     gx, gy, gz = np.gradient(grid, *voxel_size)
@@ -441,14 +486,9 @@ def gradient_magnitude_field(positions: np.ndarray, values: np.ndarray):
 
 
 def find_hot_spots(grad_mag_grid: np.ndarray, n_spots: int = 5, min_separation_voxels: int = 5, invert: bool = False):
-    """Top-`n_spots` distinct voxel indices (ix, iy, iz) in `grad_mag_grid`, greedily picked
-    with a minimum voxel separation so they don't all cluster on the same feature (e.g. every
-    voxel on one wire).
+    """Top-`n_spots` voxel indices (ix, iy, iz), greedily at least `min_separation_voxels` apart.
 
-    invert=False (default): highest-gradient first -- structural/high-frequency regions
-    (PMT surface, wires, ...).
-    invert=True: lowest-gradient first -- smooth/far regions, useful as a baseline to
-    compare against the high-gradient spots.
+    invert=False: highest gradient first (structure); invert=True: lowest first (smooth baseline).
     """
     order = 1 if invert else -1
     flat_idx_sorted = np.argsort(grad_mag_grid, axis=None)[::order]
@@ -460,15 +500,11 @@ def find_hot_spots(grad_mag_grid: np.ndarray, n_spots: int = 5, min_separation_v
             break
         if all(np.max(np.abs(coord - p)) >= min_separation_voxels for p in picked):
             picked.append(coord)
-    return picked  # list of (ix, iy, iz) index tuples, ranked per `invert`
+    return picked
 
 
 def extract_slice_window(grid: np.ndarray, center_idx, axis: int, window: int):
-    """2D slice through `grid` at `center_idx` along `axis`, cropped to a `window`x`window`
-    box centered on the other two coordinates of `center_idx` -- a "magnified" local view,
-    since structural features (surfaces, wires) occupy a tiny fraction of the full volume
-    and are invisible in a full-extent slice.
-    """
+    """2D slice of `grid` through `center_idx` along `axis`, cropped to window x window around it."""
     ci = list(center_idx)
     slicer = [slice(None)] * 3
     slicer[axis] = ci[axis]
@@ -493,15 +529,10 @@ def build_spatial_slice_diagnostics(
     positions: np.ndarray, pred_vis: np.ndarray, target_vis: np.ndarray, pmt_id: int,
     n_hot_spots: int = 3, n_smooth_spots: int = 2, window: int = 15,
 ):
-    """positions: (N, 3), pred_vis/target_vis: (N, n_pmt) -- reuses whatever the eval loop
-    already gathered for the y=x visibility scatter plot, no extra per-batch computation.
+    """Magnified x/y/z slice windows of pred, target and residual around the highest- and
+    lowest-gradient spots of one PMT's target visibility, each with its window bias.
 
-    Finds high-gradient ("hot", structural: PMT surface, wires, ...) and low-gradient
-    ("smooth", far/interior) spots in the target visibility field for one PMT, and extracts
-    magnified XY/XZ/YZ slice windows of pred, target, and residual (pred-target) around each,
-    since structural features are too small a volume fraction to see in a full-extent slice.
-    Each spot also gets a scalar mean-bias-in-window per plane, for quick ranking before
-    deciding what to actually plot.
+    positions (N, 3), pred_vis/target_vis (N, n_pmt), as gathered by the eval loop.
     """
     pred_pmt = pred_vis[:, pmt_id]
     target_pmt = target_vis[:, pmt_id]
@@ -552,36 +583,16 @@ def build_power_spectra(
     x_margin_voxels: int | None = None,
     x_margin_mode: str = "either",
 ):
-    """Spatial-frequency (kx, ky, kz) power spectra of truth and prediction, one PMT.
+    """(kx, ky, kz) power spectra of truth and prediction for one PMT.
 
-    positions: (N, 3) voxel positions, as gathered by the eval loop.
-    fields:    {name: {"pred": arr, "target": arr}} where each arr is (N,) or (N, C),
-               ALREADY sliced to the single PMT this call is for. A "target"-only entry
-               is allowed (e.g. a cached gradient target with no prediction available).
-    valid:     (N,) boolean, from the TARGET side. Deliberately applied to the
-               prediction too -- including the model's untrained output at invalid
-               (voxel, PMT) locations would inject structure into the predicted
-               spectrum with no counterpart on the truth side to compare against.
-    inpaint:   forwarded to field_spectra/to_grid -- False 0-fills invalid voxels instead
-               of inpainting their nearest valid neighbour (see sirentv.utils.spectrum's
-               module docstring for why inpainting is the default).
-    x_margin_voxels: if given, ANDs `valid` with an x-boundary mask first -- restricts the
-               spectrum to voxels more than this many cells from the boundary/boundaries
-               `x_margin_mode` selects. Excludes the near-PMT-wall region.
-    x_margin_mode: which mask x_margin_voxels selects -- "either" (GridIndex.x_far_mask,
-               excludes the margin from BOTH x boundaries) or "pmt_wall"
-               (GridIndex.x_far_pmt_wall_mask, excludes the margin from ONLY the PMT-wall
-               boundary, leaving the opposite non-PMT wall untouched). The caller is
-               expected to call this twice, once per mode, to get both variants in the
-               same eval pass -- see eval_quantile.py/eval_pca.py's spectra_variants dict.
-               Ignored when x_margin_voxels is None.
-
-    Returns {name: {"pred": {axis: (k, power)}, "target": {...}}}, all plain numpy so the
-    result pickles into the eval .pt alongside the other diagnostics.
-
-    The FFT conventions (x left un-tapered while y/z are Hann-windowed; invalid voxels
-    inpainted rather than constant-filled; unnormalized transform with DC dropped) live in
-    sirentv.utils.spectrum and are load-bearing -- see that module's docstring.
+    fields: {name: {"pred": arr, "target": arr}}, each (N,) or (N, C) for this PMT; either side
+        may be missing (e.g. a target-only gradient cache).
+    valid:  (N,) target-side mask, applied to the prediction too so untrained output at invalid
+        voxels adds no structure. inpaint=False zero-fills them instead of inpainting.
+    x_margin_voxels: also drop voxels within this many cells of both x walls ("either") or
+        only the PMT wall ("pmt_wall").
+    Returns {name: {"pred"|"target": {axis: (k, power)}}, "_grid": {...}}, all numpy.
+    FFT conventions live in sirentv.utils.spectrum.
     """
     from sirentv.utils.spectrum import GridIndex, field_spectra
 
@@ -616,174 +627,43 @@ def build_power_spectra(
     return out
 
 
-# ---------------------------------------------------------------------------
-# Interactive single-batch evaluation (notebook use, CompressedPLib-specific)
-# ---------------------------------------------------------------------------
+def spectra_variants(x_margin: int) -> dict:
+    """{result key: build_power_spectra kwargs} for the four spectra each eval writes."""
+    return {
+        "power_spectra": {},
+        f"power_spectra_x_far{x_margin}": {"x_margin_voxels": x_margin, "x_margin_mode": "either"},
+        f"power_spectra_x_far_pmtwall{x_margin}": {"x_margin_voxels": x_margin, "x_margin_mode": "pmt_wall"},
+        "power_spectra_zerofill": {"inpaint": False},
+    }
 
 
-class Evaluator:
-    """Compare predicted (vis, t0, coeffs) vs ground truth; compute metrics and plots."""
+def add_power_spectra(results, positions_np, pmt_ids, fields_for_pmt, components, x_margin, tag):
+    """results[variant][pid] = build_power_spectra(...) for every variant and PMT.
 
-    EDGE_BINS = 30
+    fields_for_pmt(i, pid) -> (fields, valid) for the i-th requested PMT.
+    """
+    variants = spectra_variants(x_margin)
+    for variant_key in variants:
+        results[variant_key] = {}
+    for i, pid in enumerate(pmt_ids):
+        print(f"[{tag}] Building power spectra for PMT {pid}...")
+        fields, valid = fields_for_pmt(i, pid)
+        for variant_key, variant_kwargs in variants.items():
+            spec = build_power_spectra(positions_np, fields, valid, **variant_kwargs)
+            spec["_components"] = list(components)
+            results[variant_key][pid] = spec
 
-    def __init__(self, plib: CompressedPLib):
-        self.plib = plib
 
-    def compare(
-        self,
-        pred: Dict[str, torch.Tensor],
-        target: Dict[str, torch.Tensor],
-        n_bins: int = 1000,
-        vis_threshold: float = 100.0,
-    ) -> Dict[str, float]:
-        """
-        Reconstruct CDFs from pred and target; compute RMSE and visibility/t0 errors.
-        pred, target: dicts with keys "vis", "t0", "coeffs" (tensors, batched).
-        Returns metrics dict.
-        """
-        pred_vis = pred["vis"]
-        pred_t0 = pred["t0"].long().clamp(min=0)
-        pred_coeffs = pred["coeffs"]
-        true_vis = target["vis"]
-        true_t0 = target["t0"].long().clamp(min=0)
-        true_coeffs = target["coeffs"]
+def load_grad_targets(grad_cache_file, n_rows, rep_key, tag):
+    """{"grad_v", f"grad_{rep_key}"} from a grad-target cache, or None if absent or its rows
+    don't match the evaluated set (the cache covers the full LUT)."""
+    if not grad_cache_file:
+        return None
+    import h5py
 
-        pred_cdf = self.plib.reconstruct_cdf(pred_coeffs, pred_t0, n_bins=n_bins)
-        true_cdf = self.plib.reconstruct_cdf(true_coeffs, true_t0, n_bins=n_bins)
-
-        bright = true_vis > vis_threshold
-        cdf_diff = (pred_cdf - true_cdf) * bright.unsqueeze(-1).float()
-        n_bright = bright.sum().item() * n_bins
-        if n_bright > 0:
-            cdf_rmse_full = torch.sqrt((cdf_diff ** 2).sum() / n_bright).item()
-        else:
-            cdf_rmse_full = float("nan")
-
-        edge_slice = slice(self.plib._align_margin, self.plib._align_margin + self.EDGE_BINS)
-        pred_edge = pred_cdf[..., edge_slice]
-        true_edge = true_cdf[..., edge_slice]
-        edge_diff = (pred_edge - true_edge) * bright.unsqueeze(-1).float()
-        n_edge = bright.sum().item() * self.EDGE_BINS
-        if n_edge > 0:
-            cdf_rmse_edge = torch.sqrt((edge_diff ** 2).sum() / n_edge).item()
-        else:
-            cdf_rmse_edge = float("nan")
-
-        rel_vis = torch.abs(pred_vis - true_vis) / (true_vis + 1e-10)
-        rel_vis = rel_vis[bright]
-        vis_median_rel = rel_vis.median().item() if rel_vis.numel() > 0 else float("nan")
-        vis_p90_rel = torch.quantile(rel_vis.float(), 0.9).item() if rel_vis.numel() > 0 else float("nan")
-
-        t0_err = (pred_t0 - true_t0).float()[bright]
-        t0_mae = t0_err.abs().mean().item() if t0_err.numel() > 0 else float("nan")
-        t0_rmse = torch.sqrt((t0_err ** 2).mean()).item() if t0_err.numel() > 0 else float("nan")
-
-        return {
-            "cdf_rmse_full": cdf_rmse_full,
-            "cdf_rmse_edge": cdf_rmse_edge,
-            "vis_median_rel_err": vis_median_rel,
-            "vis_p90_rel_err": vis_p90_rel,
-            "t0_mae_bins": t0_mae,
-            "t0_rmse_bins": t0_rmse,
-        }
-
-    def plot_cdf(
-        self,
-        pred: Dict[str, torch.Tensor],
-        target: Dict[str, torch.Tensor],
-        voxel_idx: int = 0,
-        pmt_indices: Optional[Sequence[int]] = None,
-        n_bins: int = 1000,
-        n_show_bins: int = 80,
-    ) -> plt.Figure:
-        """Plot true vs predicted CDFs for one voxel, selected PMTs, zoomed on rising edge."""
-        pred_cdf = self.plib.reconstruct_cdf(
-            pred["coeffs"][voxel_idx : voxel_idx + 1],
-            pred["t0"][voxel_idx : voxel_idx + 1],
-            n_bins=n_bins,
-        ).squeeze(0)
-        true_cdf = self.plib.reconstruct_cdf(
-            target["coeffs"][voxel_idx : voxel_idx + 1],
-            target["t0"][voxel_idx : voxel_idx + 1],
-            n_bins=n_bins,
-        ).squeeze(0)
-        t0_true = target["t0"][voxel_idx]
-        if pmt_indices is None:
-            pmt_indices = list(range(min(6, pred_cdf.shape[0])))
-        n_plots = len(pmt_indices)
-        fig, axes = plt.subplots(2, n_plots, figsize=(4 * n_plots, 6), gridspec_kw={"height_ratios": [3, 1]})
-        if n_plots == 1:
-            axes = axes.reshape(-1, 1)
-        for col, pmt in enumerate(pmt_indices):
-            t0_p = int(t0_true[pmt].item())
-            lo = max(0, t0_p - 5)
-            hi = min(n_bins, t0_p + n_show_bins)
-            x = np.arange(lo, hi)
-            axes[0, col].plot(x, true_cdf[pmt].cpu().numpy()[lo:hi], "k-", lw=1.5, label="true")
-            axes[0, col].plot(x, pred_cdf[pmt].cpu().numpy()[lo:hi], "r--", lw=1, label="pred")
-            axes[0, col].axvline(t0_p, color="gray", ls=":", lw=0.5)
-            axes[0, col].set_title(f"PMT {pmt}")
-            if col == 0:
-                axes[0, col].legend(fontsize=7, frameon=False)
-                axes[0, col].set_ylabel("CDF")
-            axes[1, col].plot(
-                x,
-                (pred_cdf[pmt].cpu().numpy()[lo:hi] - true_cdf[pmt].cpu().numpy()[lo:hi]),
-                "r",
-                lw=0.8,
-            )
-            axes[1, col].axhline(0, color="gray", lw=0.5)
-            axes[1, col].set_xlabel("time bin")
-            if col == 0:
-                axes[1, col].set_ylabel("residual")
-        fig.suptitle(f"CDF comparison (voxel {voxel_idx})", fontsize=12)
-        plt.tight_layout()
-        return fig
-
-    def plot_visibility(
-        self,
-        pred_vis: Union[torch.Tensor, np.ndarray],
-        true_vis: Union[torch.Tensor, np.ndarray],
-        title: str = "Visibility",
-    ) -> plt.Figure:
-        """y=x log-log scatter of pred vs true visibility."""
-        pred_vis = np.asarray(pred_vis).ravel()
-        true_vis = np.asarray(true_vis).ravel()
-        fig, ax = plt.subplots(figsize=(6, 5))
-        ax.scatter(true_vis, pred_vis, s=1, alpha=0.1, color="steelblue", rasterized=True)
-        vmin = max(true_vis.min(), pred_vis.min(), 1e-2)
-        vmax = max(true_vis.max(), pred_vis.max())
-        ax.plot([vmin, vmax], [vmin, vmax], "r-", lw=0.8)
-        ax.set_xlabel("true visibility")
-        ax.set_ylabel("predicted visibility")
-        ax.set_xscale("log")
-        ax.set_yscale("log")
-        rel = np.abs(pred_vis - true_vis) / (true_vis + 1e-10)
-        ax.text(0.05, 0.92, f"med |Δ|/v = {np.median(rel):.2%}", transform=ax.transAxes, fontsize=9, va="top")
-        ax.set_title(title)
-        return fig
-
-    def plot_t0(
-        self,
-        pred_t0: Union[torch.Tensor, np.ndarray],
-        true_t0: Union[torch.Tensor, np.ndarray],
-        title: str = "t0 (onset)",
-    ) -> plt.Figure:
-        """y=x scatter and residual histogram for t0."""
-        pred_t0 = np.asarray(pred_t0).ravel()
-        true_t0 = np.asarray(true_t0).ravel()
-        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-        axes[0].scatter(true_t0, pred_t0, s=1, alpha=0.1, color="steelblue", rasterized=True)
-        tmax = max(true_t0.max(), pred_t0.max()) * 1.02
-        axes[0].plot([0, tmax], [0, tmax], "r-", lw=0.8)
-        axes[0].set_xlabel("true t0 (bins)")
-        axes[0].set_ylabel("predicted t0 (bins)")
-        axes[0].set_title(title)
-        axes[0].set_aspect("equal")
-        dt = pred_t0 - true_t0
-        axes[1].hist(dt, bins=100, color="steelblue", edgecolor="none", density=True)
-        axes[1].axvline(0, color="red", lw=0.8)
-        axes[1].set_xlabel("Δt0 = pred − true (bins)")
-        axes[1].set_ylabel("density")
-        axes[1].set_title(f"residual — median={np.median(dt):.1f}")
-        return fig
+    with h5py.File(grad_cache_file, "r") as gf:
+        if gf["v"].shape[0] != n_rows:
+            print(f"[{tag}] grad cache has {gf['v'].shape[0]} rows but eval "
+                  f"covered {n_rows} -- skipping gradient spectra")
+            return None
+        return {"grad_v": gf["v"][:], f"grad_{rep_key}": gf[rep_key][:]}

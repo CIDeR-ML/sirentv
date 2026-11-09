@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
 class JSDivergenceLoss(nn.Module):
     def __init__(self, reduce_method="mean"):
         super().__init__()

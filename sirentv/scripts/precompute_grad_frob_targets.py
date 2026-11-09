@@ -1,45 +1,16 @@
-"""
-One-time, offline precomputation of the exact (M-projection Hutchinson) target-side
-spatial-gradient Frobenius norm used by gradient supervision (WeightedGradFrobLoss), for
-whichever multi-channel key(s) a training config's train.grad_supervision_keys asks for
-("coeffs" for CompressedPLibDataset, "quantiles" for QuantilePLibDataset; "v" is always
-included too, but is exact for a single projection regardless -- see
-compute_grad_frob_target_exact_projected's docstring).
+"""Fill train.grad_target_cache_file once, offline, for a gradient-supervision config.
 
-Why this exists: instantiating CompressedPLibDataset/QuantilePLibDataset with
-train.grad_supervision_keys set already triggers this computation as a normal part of
-__init__ (via _precompute_grad_targets) -- so simply running training (or even just building
-the dataset once) already computes it. The problem this script solves is REPEATING that cost
-on every run: the source LUT files under /sdf/data/neutrino/pubdata/... are typically
-owned by someone else and not writable by whoever's training, so the target can't be cached
-INSIDE the LUT file itself. Instead, set train.grad_target_cache_file in the training config
-to a path you own, and run this script ONCE (optionally with --device cuda, since the
-per-chunk projection matmul is the one part of this computation that can use a GPU -- see
-compute_grad_frob_target_exact_projected's `device` argument) to populate that cache file.
-Every subsequent training/eval run using the SAME config (or any other config with an
-IDENTICAL train.grad_target_cache_file and matching n_photon/xform/n_projections/etc, see
-_grad_cache_meta on the dataset classes) then loads the cache directly instead of
-recomputing, at ordinary h5-read speed.
+Building the dataset computes the target `{key}_grad_frob` anyway; this script does only that,
+so every later run with matching cache meta (n_photon, xform, n_projections, ..., see the
+datasets' _grad_cache_meta) just reads it. The LUTs themselves are not writable, hence a
+separate cache, which covers every LUT voxel and so serves any subsampling.
 
-The cache covers ALL voxels of the source LUT (not just whatever subset a particular run's
-data.max_len/subsample_factor might use), so it's reusable across e.g. a smoke config and its
-corresponding full config, as long as every other cache-relevant setting matches.
+    python -m sirentv.scripts.precompute_grad_frob_targets --config train_*.yaml \
+        [--device cuda] [--cache-file cache.h5] [--projection-batch-size 10]
 
-Usage:
-    python -m sirentv.scripts.precompute_grad_frob_targets --config path/to/train_*.yaml \
-        [--device cuda] [--cache-file path/to/cache.h5] [--projection-batch-size 10]
-
---cache-file overrides train.grad_target_cache_file from the config; if neither is set, this
-script raises rather than silently computing without caching (that's just running training).
-
---projection-batch-size overrides train.grad_target_projection_batch_size (default 10 if unset
-anywhere). This bounds how many of the n_projections columns are held in memory at once (see
-compute_grad_frob_target_exact_projected's docstring) -- n_projections=100 WITHOUT this cap
-materializes a ~52GB array for the full dualpca LUT and gets silently OOM-killed (no traceback,
-since SIGKILL gives no chance to flush Python's stdout buffer -- which is fully block-, not
-line-buffered, whenever stdout isn't a TTY, e.g. piped through Jupyter's `!` or `> file.log`).
-If you have headroom to spare, a larger batch means fewer full passes over the source LUT (each
-batch re-reads it in full), at the cost of proportionally more memory.
+--device runs the projection matmul on a GPU. --projection-batch-size caps the projections
+held at once: 100 at once is ~52 GB for the full PCA LUT and gets SIGKILLed with no output.
+Larger batches mean fewer passes over the LUT.
 """
 
 from __future__ import annotations
@@ -54,9 +25,7 @@ from sirentv.data.builder import build_dataset
 
 
 def main():
-    # force line-buffered stdout even when piped (Jupyter's `!`, `> file.log`, etc.) -- so if
-    # this process ever dies unexpectedly (OOM-kill or otherwise), whatever was printed before
-    # that point is actually visible rather than lost in an unflushed buffer.
+    # line-buffered even when piped, so an OOM-kill doesn't swallow the output so far
     sys.stdout.reconfigure(line_buffering=True)
 
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -92,10 +61,7 @@ def main():
             "train.grad_target_cache_file in the config or pass --cache-file."
         )
 
-    # keep the rest of dataset construction lightweight -- only the grad-target
-    # precompute/cache step (triggered inside __init__ via _precompute_grad_targets) is what
-    # this script actually needs; force lazy CPU reads so the (potentially very large) main
-    # fields aren't also fully preloaded.
+    # only the grad-target step of dataset construction is needed: keep the main fields lazy
     plib_key = "compressed_plib" if "compressed_plib" in cfg else ("quantile_plib" if "quantile_plib" in cfg else "photonlib")
     cfg.setdefault(plib_key, {})["device"] = "cpu"
     cfg[plib_key]["lazy"] = True

@@ -1,6 +1,4 @@
-"""
-Compressed photon library reader and dataset for (vis, t0, quantiles) format.
-"""
+"""Reader and dataset for the quantile photon library H5 (vis, analytical_t0, quantiles)."""
 
 import os
 import time
@@ -8,25 +6,25 @@ import time
 import numpy as np
 import torch
 import h5py
-from torch.utils.data import Dataset, DataLoader, DistributedSampler
+from torch.utils.data import Dataset
 from slar.transform import partial_xform_vis
 from photonlib.meta import VoxelMeta
 
 from sirentv.data.builder import DATASETS
+from sirentv.data.common import grad_target_options, precompute_grad_targets, select_voxel_indices
+
 
 class QuantilePLib:
-    """
-    Reader for quantile waveform photon library H5 (vis, t0, quantiles).
-    """
+    """Reader for the quantile waveform photon library H5 (vis, t0, quantiles); one detector half."""
 
-    def __init__(self, filepath, lazy=True, mode="quantile", combine_every_quantile=1, device=None, reflect_x=False, pmt_flip_perm=None, debug_timing=False, log_quantile_C=None):
+    FIELDS = ("vis", "t0", "quantiles")
+
+    def __init__(self, filepath, lazy=True, mode="quantile", combine_every_quantile=1, device=None, log_quantile_C=None):
         self._path = filepath
         self._lazy = lazy
         self._device = device or torch.device("cpu")
         self._file = None
-        self._reflect_x = bool(reflect_x)
         self._mode = mode
-        self._debug_timing = debug_timing
 
         with h5py.File(filepath, "r") as f:
             self._n_voxels = f["vis"].shape[0]
@@ -50,53 +48,9 @@ class QuantilePLib:
             numvox = torch.as_tensor(f["numvox"][:], dtype=torch.float32)
             min_xyz = torch.as_tensor(f["min"][:], dtype=torch.float32)
             max_xyz = torch.as_tensor(f["max"][:], dtype=torch.float32)
-            ranges = torch.column_stack((min_xyz, max_xyz))
-            self.meta = VoxelMeta(numvox, ranges)
+            self.meta = VoxelMeta(numvox, torch.column_stack((min_xyz, max_xyz)))
 
-            if self._reflect_x:
-                full_min = torch.tensor([min_xyz[0], min_xyz[1], min_xyz[2]])
-                full_max = torch.tensor([-min_xyz[0], max_xyz[1], max_xyz[2]])
-                full_ranges = torch.column_stack((full_min, full_max))
-                self.full_meta = VoxelMeta(numvox, full_ranges)
-                if pmt_flip_perm is not None:
-                    self._pmt_flip_perm = np.asarray(pmt_flip_perm, dtype=np.int64)
-                else:
-                    # Chroma-lar 2-wall: same (y,z) order on both sides. If plib has only one wall
-                    # (all pmt_pos same sign of x), then +x PMT i has same (y,z) as plib PMT i -> identity.
-                    x = self.pmt_pos[:, 0]
-                    all_neg = np.all(x <= 0)
-                    all_pos = np.all(x >= 0)
-                    if all_neg or all_pos:
-                        self._pmt_flip_perm = np.arange(len(self.pmt_pos), dtype=np.int64)
-                    else:
-                        # Both walls in plib: find j at (-px_i, py_i, pz_i) for each i.
-                        reflected = self.pmt_pos.copy()
-                        reflected[:, 0] *= -1
-                        dist = np.sum((self.pmt_pos[:, None, :] - reflected[None, :, :]) ** 2, axis=2)
-                        self._pmt_flip_perm = np.argmin(dist, axis=1)
-                        max_d = np.sqrt(np.max(np.min(dist, axis=1)))
-                        if max_d > 1.0:
-                            import warnings
-                            warnings.warn(
-                                f"reflect_x: auto pmt_flip_perm has max match distance {max_d:.2f} mm; "
-                                "consider passing pmt_flip_perm from geometry."
-                            )
-                        inv = self._pmt_flip_perm[self._pmt_flip_perm]
-                        if not np.array_equal(inv, np.arange(len(self._pmt_flip_perm))):
-                            import warnings
-                            warnings.warn(
-                                "reflect_x: pmt_flip_perm is not an involution (perm[perm[i]] != i); "
-                                "PMT layout may not be x-symmetric. Pass pmt_flip_perm from geometry."
-                            )
-            else:
-                self.full_meta = None
-                self._pmt_flip_perm = None
-
-
-        self._event_uniq = None
-        self._event_vis = None
-        self._event_t0 = None
-        self._event_quantiles = None
+        self.clear_prefetch()
 
         if lazy:
             self._file = h5py.File(filepath, "r", swmr=True, libver="latest")
@@ -115,7 +69,7 @@ class QuantilePLib:
                     self.t0 = torch.from_numpy(t0_arr).float()
                 else:
                     self.t0 = torch.from_numpy(t0_arr).long().clamp(min=0)
-                
+
                 assert self._n_quantiles % self._combine_every_quantile == 0, "n_quantiles must be divisible by combine_every_quantile"
                 q_part = torch.from_numpy(f["quantiles"][:, :, : self._n_quantiles])
                 self.quantiles = q_part[:, :, ::self._combine_every_quantile].float().to(self._device)
@@ -124,17 +78,15 @@ class QuantilePLib:
     def __len__(self):
         return self._n_voxels
 
-
     @classmethod
-    def load(cls, filepath, lazy=True, mode="quantile", combine_every_quantile=1, device=None, reflect_x=False, pmt_flip_perm=None, debug_timing=False, log_quantile_C=None):
-        return cls(filepath, lazy=lazy, mode=mode, combine_every_quantile=combine_every_quantile, device=device, reflect_x=reflect_x, pmt_flip_perm=pmt_flip_perm, debug_timing=debug_timing, log_quantile_C=log_quantile_C)
+    def load(cls, filepath, lazy=True, mode="quantile", combine_every_quantile=1, device=None, log_quantile_C=None):
+        return cls(filepath, lazy=lazy, mode=mode, combine_every_quantile=combine_every_quantile, device=device, log_quantile_C=log_quantile_C)
 
     def read_strided(self, start, stop, step, fields=None):
-        """Read rows start:stop:step of the requested fields as ONE hyperslab per field.
+        """Rows start:stop:step of the requested fields, as ONE hyperslab per field (lazy reader only).
 
-        For loading a whole rank shard up front: a strided slice is a single HDF5 selection,
-        where the fancy-index path in _read_slice issues a point selection that is far slower
-        for tens of thousands of rows. Requires the lazy (file-backed) reader.
+        For loading a rank shard up front: _read_slice's fancy index is a point selection,
+        far slower for tens of thousands of rows.
         """
         if self._file is None:
             raise RuntimeError("read_strided needs a lazy QuantilePLib (file-backed)")
@@ -161,24 +113,19 @@ class QuantilePLib:
             if voxel_ids.ndim == 0:
                 arr = ds[int(voxel_ids)]
             else:
+                # h5py needs sorted, unique indices
                 uniq, inv = np.unique(voxel_ids, return_inverse=True)
                 arr = ds[uniq][inv]
-        
+
         if key == "quantiles":
             arr = arr[..., ::self._combine_every_quantile]
         return torch.from_numpy(np.asarray(arr)).to(self._device)
 
-    FIELDS = ("vis", "t0", "quantiles")
-
     def __getitem__(self, voxel_ids, fields=None):
-        """Read the requested fields for these voxel(s). Default: all of FIELDS.
+        """The requested fields (default: all of FIELDS) for these voxel(s).
 
-        `fields` exists because a single-target run consumes only one of them, and the
-        payloads are wildly asymmetric: one voxel of `quantiles` is 81 x 512 x 4 B = 162 KiB
-        against ~0.3 KiB for `vis` or `t0`. Reading all three for a v-only or t0-only branch
-        therefore costs ~500x the bandwidth it uses and makes those runs data-bound on data
-        they discard. QuantilePLibDataset derives the set from which targets it was asked
-        for -- see _fields_for_targets.
+        Reading only what a run needs matters: one voxel of quantiles is 162 KiB against
+        ~0.3 KiB for vis or t0 (see QuantilePLibDataset._fields_for_targets).
         """
         fields = self.FIELDS if fields is None else tuple(fields)
         unknown = [f for f in fields if f not in self.FIELDS]
@@ -194,7 +141,6 @@ class QuantilePLib:
             for f in fields:
                 out[f] = torch.index_select(getattr(self, f), 0, uniq)[inv].clone()
         else:
-
             for f in fields:
                 out[f] = self._read_slice(f, voxel_ids)
 
@@ -204,80 +150,31 @@ class QuantilePLib:
             out["quantiles"] = q[:, :n] if q.dim() == 2 else q[..., :n]
         return out
 
-    def contain(self, pos):
-        """Check containment in the (possibly full symmetric) volume."""
-        if self._reflect_x:
-            return self.full_meta.contain(pos)
-        return self.meta.contain(pos)
-
     def clear_prefetch(self):
-        """Clear event-level prefetch cache."""
         self._event_uniq = None
-        self._event_vis = None
-        self._event_t0 = None
-        self._event_quantiles = None
+        self._event_data = None
 
     def prefetch_event(self, positions, device=None):
-        """Prefetch all unique voxels for this event.
-        positions: (N, 3). device: where to store cached tensors (defaults to self._device).
-        Call clear_prefetch() or prefetch_event(None) to clear."""
+        """Cache every field for the unique voxels of `positions` (N, 3), so lookup() on those
+        points reads memory instead of HDF5. None clears the cache."""
         if positions is None:
             self.clear_prefetch()
             return
         dev = device if device is not None else self._device
-        pos = np.atleast_2d(np.asarray(positions, dtype=np.float64))
-        flip = pos[:, 0] > 0 if self._reflect_x else np.zeros(len(pos), dtype=bool)
-        pos_q = pos.copy()
-        pos_q[flip, 0] *= -1
-        vox = self.meta.coord_to_voxel(pos_q).numpy()
-        event_uniq, _ = np.unique(vox, return_inverse=True)
-        if event_uniq.size == 0:
-            self._event_uniq = np.array([], dtype=np.int64)
-            self._event_vis = torch.zeros(0, self._n_pmts, dtype=torch.float32, device=dev)
-            t0_dtype = self.t0.dtype if self.t0 is not None else torch.long
-            self._event_t0 = torch.zeros(0, self._n_pmts, dtype=t0_dtype, device=dev)
-            self._event_quantiles = torch.zeros(0, self._n_pmts, self._n_quantiles//self._combine_every_quantile, dtype=torch.float32, device=dev)
-            return
-        data = self[event_uniq]
-        self._event_uniq = event_uniq
-        self._event_vis = data["vis"].to(dev)
-        self._event_t0 = data["t0"].to(dev)
-        self._event_quantiles = data["quantiles"].to(dev)
+        vox = self.meta.coord_to_voxel(np.atleast_2d(np.asarray(positions, dtype=np.float64))).numpy()
+        self._event_uniq = np.unique(vox)
+        data = self[self._event_uniq]
+        self._event_data = {k: v.to(dev) for k, v in data.items()}
 
     def lookup(self, pos):
-        """pos: (N, 3) array or tensor -> dict with vis, t0, quantiles. Handles x-reflection and PMT permutation."""
-        pos = np.atleast_2d(np.asarray(pos, dtype=np.float64))
-        flip = pos[:, 0] > 0 if self._reflect_x else np.zeros(len(pos), dtype=bool)
-        pos_q = pos.copy()
-        pos_q[flip, 0] *= -1
-        vox = self.meta.coord_to_voxel(pos_q).numpy()
-
+        """pos: (N, 3) -> {vis, t0, quantiles}, from the prefetch cache when one is set."""
+        vox = self.meta.coord_to_voxel(np.atleast_2d(np.asarray(pos, dtype=np.float64))).numpy()
         if self._event_uniq is not None:
-            inv_b = np.searchsorted(self._event_uniq, vox)
-            dev = self._event_vis.device
-            inv_t = torch.from_numpy(inv_b).long().to(dev)
-            data = {
-                "vis": self._event_vis[inv_t].clone(),
-                "vis_mask": self._event_vis_mask[inv_t].clone(),
-                "t0": self._event_t0[inv_t].clone(),
-                "quantiles": self._event_quantiles[inv_t].clone(),
-            }
-        else:
-            if self._file is None:
-                vox = torch.from_numpy(vox).long().to(self.vis.device)
-            data = self[vox]
-
-        if np.any(flip):
-            perm = torch.from_numpy(self._pmt_flip_perm).to(data["vis"].device)
-            flip_t = torch.from_numpy(flip).to(data["vis"].device)
-            data["vis"] = data["vis"].clone()
-            data["vis_mask"] = data["vis_mask"].clone()
-            data["t0"] = data["t0"].clone()
-            data["quantiles"] = data["quantiles"].clone()
-            data["vis"][flip_t] = data["vis"][flip_t][:, perm]
-            data["t0"][flip_t] = data["t0"][flip_t][:, perm]
-            data["quantiles"][flip_t] = data["quantiles"][flip_t][:, perm, :]
-        return data
+            inv = torch.from_numpy(np.searchsorted(self._event_uniq, vox)).long()
+            return {k: v[inv.to(v.device)].clone() for k, v in self._event_data.items()}
+        if self._file is None:
+            vox = torch.from_numpy(vox).long().to(self.vis.device)
+        return self[vox]
 
     def close(self):
         if self._file is not None:
@@ -289,16 +186,15 @@ class QuantilePLib:
 
     def __exit__(self, *args):
         self.close()
-       
+
     @property
     def mode(self):
-        """Quantile mode: 'quantile' or 'log_quantile'."""
+        """'quantile' or 'log_quantile'."""
         return self._mode
 
     def reconstruct_aligned_cdf(self, u_grid, quantiles, t0=None):
-        """t0: (..., n_pmt) onset times in ns to add back for quantiles that were trained
-        t0-aligned (photonlib.align_quantiles_to_t0), so the CDF is on the absolute time axis
-        like the LUT's own. None leaves the quantiles as they are."""
+        """quantiles (..., K) at levels u_grid -> CDF (..., n_bins) on [0, t_max_ns].
+        t0 (..., n_pmt) [ns] is added back for t0-aligned quantiles (photonlib.align_quantiles_to_t0)."""
         u_np = u_grid.astype(np.float32)
         q = quantiles.detach().cpu().numpy()
 
@@ -309,7 +205,6 @@ class QuantilePLib:
         q = np.clip(q, 0.0, None)
         if t0 is not None:
             q = q + t0.detach().cpu().numpy()[..., None]
-        
 
         batch_shape = q.shape[:-1]
         flat = q.reshape(-1, q.shape[-1])
@@ -323,15 +218,8 @@ class QuantilePLib:
         )
 
     def to_linear_time(self, quantiles, t0=None):
-        """quantiles: (..., n_quantile) raw (possibly log_quantile-transformed) quantile
-        function values -> linear-ns quantile times (..., n_quantile). Unlike
-        CompressedPLib.to_linear_time, there's no PCA reconstruction step here -- quantiles
-        are already this library's native per-channel representation -- so this only inverts
-        the log_quantile transform (same formula/clamp as CompressedPLib.to_linear_time).
-
-        t0: (..., n_pmt) onset times in ns, added back after the inversion for quantiles that
-        were trained t0-aligned (photonlib.align_quantiles_to_t0), giving absolute times again.
-        """
+        """quantiles (..., K), possibly log_quantile -> linear-ns quantile times (..., K), clamped at 0.
+        t0 (..., n_pmt) [ns] is added back for t0-aligned quantiles."""
         if self._mode == "log_quantile":
             q = torch.pow(10.0, quantiles) - self._log_quantile_C
         else:
@@ -344,7 +232,13 @@ class QuantilePLib:
 
 @DATASETS.register_module()
 class QuantilePLibDataset(Dataset):
-    """Map-style dataset for QuantilePLib. Returns position + target (vis, log_vis, t0, quantiles)."""
+    """Map-style dataset over QuantilePLib: position -> target (v, t0, quantiles, quantiles_mask[, *_grad_frob]).
+
+    v = xform_vis(vis / n_photon), t0 = log(t0), quantiles via _xform_quantiles; quantiles_mask
+    (vis_raw > 0) keeps the LUT's NaN quantiles of invisible pairs out of the loss.
+    meta carries v_linear (raw counts) and t0_raw. data.target_keys limits the targets (and
+    the LUT fields read); data.memory_shard keeps this rank's shard resident (MemoryShardLoader).
+    """
 
     def __init__(self, cfg, rank=0, world_size=1):
         self.cfg = cfg
@@ -354,54 +248,26 @@ class QuantilePLibDataset(Dataset):
         filepath = plib_cfg.get("filepath")
         lazy = plib_cfg.get("lazy", True)
         combine_every_quantile = plib_cfg.get("combine_every_quantile", 1)
-        vis_eps = plib_cfg.get("vis_eps", 1e-6)
-        self._vis_eps = vis_eps
+        self._vis_eps = plib_cfg.get("vis_eps", 1e-6)
         self._n_photon = float(plib_cfg.get("n_photon", 1.0))
         mode = plib_cfg.get("mode", "quantile")
-        # Device option: "cuda" to preload everything on GPU
         self._device = torch.device(plib_cfg.get("device", "cpu"))
         self._on_gpu = self._device.type == "cuda"
 
-        debug_timing = bool(cfg.get("debug_timing", False))
         self._quantile_plib = QuantilePLib.load(
             filepath, lazy=(lazy and not self._on_gpu), mode=mode,
-            combine_every_quantile=combine_every_quantile, debug_timing=debug_timing,
+            combine_every_quantile=combine_every_quantile,
             log_quantile_C=plib_cfg.get("log_quantile_C"),
         )
-        if mode == "log_quantile":
-            self._log_quantile = True
+        self._log_quantile = mode == "log_quantile"
+        if self._log_quantile:
             self._log_quantile_C = self._quantile_plib._log_quantile_C
-        else:
-            self._log_quantile = False
-
         self._align_t0 = bool(plib_cfg.get("align_quantiles_to_t0", False))
-
-        xform_cfg = cfg.get("transform_vis", {})
-        self._xform_vis, self._inv_xform_vis = partial_xform_vis(xform_cfg)
+        self._xform_vis, self._inv_xform_vis = partial_xform_vis(cfg.get("transform_vis", {}))
 
         data_cfg = cfg.get("data", {})
-        total_voxels = len(self._quantile_plib)
-        max_len = data_cfg.get("max_len", -1)
-        if max_len is None or max_len < 0:
-            max_len = total_voxels
-        effective = min(total_voxels, max_len)
-        subsample_factor = data_cfg.get("subsample_factor", 1)
-        if subsample_factor > 1:
-            all_idx = torch.arange(effective, dtype=torch.long)
-            indices = all_idx[::subsample_factor]
-        else:
-            indices = torch.arange(effective, dtype=torch.long)
-        # data.x_min [mm]: keep only voxels with x >= x_min, e.g. -2160 for the active TPC volume
-        # (the LUT grid runs past the PMT plane at x = -2170 mm). Unset = every voxel.
-        x_min = data_cfg.get("x_min")
-        if x_min is not None:
-            keep = torch.from_numpy(self._quantile_plib.pos[indices.numpy(), 0] >= float(x_min))
-            if rank == 0:
-                print(f"[QuantilePLibDataset] data.x_min = {float(x_min):g} mm: keeping "
-                      f"{int(keep.sum())} of {len(indices)} voxels")
-            indices = indices[keep]
-
-        self.indices = indices
+        self.indices = select_voxel_indices(
+            data_cfg, len(self._quantile_plib), self._quantile_plib.pos, rank, "QuantilePLibDataset")
 
         self._target_keys = data_cfg.get("target_keys")
         if self._target_keys is not None:
@@ -417,25 +283,21 @@ class QuantilePLibDataset(Dataset):
             print(f"[QuantilePLibDataset] targets {self._target_keys} "
                   f"-> reading LUT fields {sorted(self._read_fields)}")
 
-
-        self._grad_keys = [
-            k for k in cfg.get("train", {}).get("grad_supervision_keys", []) if k in ("v", "quantiles")
-        ]
-
-        self._grad_n_projections = int(cfg.get("train", {}).get("grad_target_n_projections", 10))
-        self._grad_chunk_size = cfg.get("train", {}).get("grad_target_chunk_size", 200000)
-        self._grad_aggregate = bool(cfg.get("train", {}).get("grad_supervision_aggregate", False))
-        self._grad_agg_chunk_size = cfg.get("train", {}).get("grad_target_agg_chunk_size", 20000)
+        train_cfg = cfg.get("train", {})
+        self._grad_keys = [k for k in train_cfg.get("grad_supervision_keys", []) if k in ("v", "quantiles")]
+        self._grad_opts = grad_target_options(train_cfg)
         if self._grad_keys:
-            self._precompute_grad_targets()
+            qlib = self._quantile_plib
+            self._grad_targets = precompute_grad_targets(
+                qlib, self.indices.numpy(), self._grad_keys, "quantiles",
+                self._read_v, self._read_quantiles, qlib._n_quantiles // qlib._combine_every_quantile,
+                train_cfg, self._grad_opts, self._grad_cache_meta(), self._n_photon,
+                "QuantilePLibDataset",
+            )
 
-        # data.memory_shard: hold this rank's 1/world_size of the voxels resident in memory
-        # and iterate it with MemoryShardLoader, instead of random HDF5 reads every batch. The
-        # shard is the strided slice indices[rank::world_size], so every rank sees the whole
-        # detector, and each epoch still visits every voxel exactly once -- but a voxel stays
-        # on the same rank for the whole run, where DistributedSampler re-deals the voxels
-        # across ranks every epoch.
-
+        # data.memory_shard: this rank holds indices[rank::world_size] resident, so every rank
+        # sees the whole detector and each epoch visits every voxel once, but a voxel stays on
+        # one rank for the whole run (DistributedSampler re-deals every epoch).
         self._memory_shard = bool(data_cfg.get("memory_shard", False))
         if self._memory_shard:
             if self._on_gpu or not lazy:
@@ -445,7 +307,6 @@ class QuantilePLibDataset(Dataset):
                 )
             n_per_rank = len(self.indices) // world_size
             self.indices = self.indices[rank::world_size][:n_per_rank]
-
             self._grad_targets = {
                 k: v[rank::world_size][:n_per_rank] for k, v in getattr(self, "_grad_targets", {}).items()
             }
@@ -458,20 +319,16 @@ class QuantilePLibDataset(Dataset):
                 raise ValueError(f"data.memory_shard_device must be 'cpu' or 'cuda', got {shard_device!r}")
             self._on_gpu = self._device.type == "cuda"
             self._precompute_shard(int(data_cfg.get("memory_shard_chunk", 1024)))
-        # Precompute all targets on device (GPU or CPU)
         elif self._on_gpu or not lazy:
             self._precompute_targets()
 
     def _grad_cache_meta(self):
-        """Meta dict identifying exactly which config choices affect the cached per-(voxel,
-        PMT) grad-frob targets -- anything here changing must invalidate a cache computed under
-        the old value. See load_grad_frob_cache/save_grad_frob_cache in sirentv.utils.misc."""
+        """Every config choice the cached gradient targets depend on (a mismatch recomputes them)."""
         from sirentv.utils.misc import GRAD_CACHE_FORMAT_VERSION
 
         xform_cfg = self.cfg.get("transform_vis", {})
         plib_cfg = self.cfg.get("quantile_plib", self.cfg.get("photonlib", {}))
-        # Added only when set, so caches computed before these options existed (absolute
-        # quantiles, the file's C) still match their unchanged configs.
+        # only when set, so caches from before these options existed still match
         extra = {}
         if self._align_t0:
             extra["align_quantiles_to_t0"] = True
@@ -488,145 +345,44 @@ class QuantilePLibDataset(Dataset):
             "xform_sin_out": xform_cfg.get("sin_out", False),
             "mode": plib_cfg.get("mode", "quantile"),
             "combine_every_quantile": plib_cfg.get("combine_every_quantile", 1),
-            "n_projections": self._grad_n_projections,
+            "n_projections": self._grad_opts["n_projections"],
             "seed": 0,
         }
 
-    def _precompute_grad_targets(self):
-        """One-time finite-difference gradient-target precomputation, cached in self._grad_targets
-        (dataset-local order, matching self.indices) for whichever keys are requested. Computed
-        EXACTLY at native grid resolution via a chunked Hutchinson random-projection read (see
-        compute_grad_frob_target_exact_projected) -- reads the full volume in chunks, but never
-        materializes more than one chunk's raw (chunk, n_pmt, K) slice in memory at once,
-        regardless of K. Identical mechanism to CompressedPLibDataset._precompute_grad_targets,
-        including the offline cache (train.grad_target_cache_file) -- see that method's
-        docstring and sirentv/scripts/precompute_grad_frob_targets.py."""
-        from sirentv.utils.misc import (
-            compute_grad_frob_target_exact_projected, load_grad_frob_cache, save_grad_frob_cache,
-        )
+    def _read_v(self, rows):
+        vis_norm = self._quantile_plib[rows]["vis"].float() / self._n_photon
+        return self._xform_vis(vis_norm).numpy()[:, :, None]  # (chunk, n_pmt, 1)
 
-        idx = self.indices.numpy()
-        n_pmt = self._quantile_plib._n_pmts
-        n_quantile_channels = self._quantile_plib._n_quantiles // self._quantile_plib._combine_every_quantile
-        total_voxels = len(self._quantile_plib)
-        cache_file = self.cfg.get("train", {}).get("grad_target_cache_file")
-        meta = self._grad_cache_meta()
-
-        cached = load_grad_frob_cache(cache_file, self._grad_keys, meta)
-        if cached is not None:
-            print(f"[QuantilePLibDataset] loaded EXACT target spatial-gradient for "
-                  f"{self._grad_keys} from cache: {cache_file}")
-            full_targets = cached
-        else:
-            # compute over ALL voxels (not just self.indices) so the cache stays valid for any
-            # future run's own subsampling -- see _grad_cache_meta's docstring
-            full_idx = np.arange(total_voxels)
-            pos_np = self._quantile_plib.pos[full_idx]
-
-            n = total_voxels
-            chunk_size = self._grad_chunk_size if self._grad_chunk_size is not None else n
-            valid_per_pmt = np.empty((n, n_pmt), dtype=bool)
-            for s in range(0, n, chunk_size):
-                e = min(s + chunk_size, n)
-                vis_chunk = self._quantile_plib[full_idx[s:e]]["vis"].numpy()
-                valid_per_pmt[s:e] = vis_chunk > 0
-            valid_agg = valid_per_pmt.any(axis=1)
-
-            def read_v(chunk_idx):
-                d = self._quantile_plib[full_idx[chunk_idx]]
-                vis_norm = d["vis"].float() / self._n_photon
-                return self._xform_vis(vis_norm).numpy()[:, :, None]  # (chunk, n_pmt, 1)
-
-            def read_quantiles(chunk_idx):
-                d = self._quantile_plib.__getitem__(full_idx[chunk_idx], fields=("quantiles", "t0"))
-                quantiles = self._xform_quantiles(d["quantiles"].float(), d["t0"].float())
-                # defense-in-depth: valid_mask (above) is what actually prevents these voxels'
-                # values from corrupting a neighbor's derivative; this just keeps any NaN here from
-                # also leaking into diagnostics/logging that don't go through the masked path.
-                quantiles = torch.nan_to_num(quantiles, nan=0.0)
-                return quantiles.numpy()  # (chunk, n_pmt, K)
-
-            grad_target_device = self.cfg.get("train", {}).get("grad_target_device")
-            # caps the (N, n_pmt, batch) projected-array memory regardless of n_projections --
-            # see compute_grad_frob_target_exact_projected's projection_batch_size docstring for
-            # why this matters (n_projections=100 without batching is tens of GB for the full
-            # LUT and silently OOM-kills the process). Default 10 matches the n_projections
-            # value this was already known to run safely at.
-            grad_target_projection_batch_size = self.cfg.get("train", {}).get("grad_target_projection_batch_size", 10)
-            full_targets = {}
-            if "v" in self._grad_keys:
-                print("[QuantilePLibDataset] computing EXACT target spatial-gradient (v) ...")
-                full_targets["v"] = compute_grad_frob_target_exact_projected(
-                    pos_np, read_v, n_pmt=n_pmt, n_channels=1, n_projections=1,
-                    chunk_size=self._grad_chunk_size, valid=valid_agg, device=grad_target_device,
-                )
-            if "quantiles" in self._grad_keys:
-                print(f"[QuantilePLibDataset] computing EXACT target spatial-gradient (quantiles) "
-                      f"via {self._grad_n_projections} random projections ...")
-                full_targets["quantiles"] = compute_grad_frob_target_exact_projected(
-                    pos_np, read_quantiles, n_pmt=n_pmt, n_channels=n_quantile_channels,
-                    n_projections=self._grad_n_projections, chunk_size=self._grad_chunk_size,
-                    valid=valid_per_pmt, device=grad_target_device,
-                    projection_batch_size=grad_target_projection_batch_size,
-                )
-
-            if cache_file:
-                print(f"[QuantilePLibDataset] caching EXACT target spatial-gradient for "
-                      f"{self._grad_keys} to {cache_file}")
-                save_grad_frob_cache(cache_file, full_targets, meta)
-
-        self._grad_targets = {k: torch.from_numpy(np.asarray(v)[idx]).float() for k, v in full_targets.items()}
-
-        if self._grad_aggregate:
-            print("[QuantilePLibDataset] aggregating gradient targets across PMTs "
-                  "(visibility-weighted) ...")
-            n = len(idx)
-            chunk_size = self._grad_agg_chunk_size if self._grad_agg_chunk_size is not None else n
-            aggregated = {key: torch.empty(n, dtype=torch.float32) for key in self._grad_targets}
-            for s in range(0, n, chunk_size):
-                e = min(s + chunk_size, n)
-                vis_chunk = self._quantile_plib[idx[s:e]]["vis"].float() / self._n_photon  # (chunk, n_pmt)
-                for key, per_pmt in self._grad_targets.items():
-                    # per_pmt is already the SQUARED per-(voxel, PMT) Frobenius norm (see
-                    # compute_grad_frob_target's docstring) -- aggregating across PMTs is then
-                    # just the visibility-weighted SUM, no re-squaring and no final sqrt, to
-                    # match compute_grad_frob_hutchinson_aggregate's own squared-domain
-                    # convention on the prediction side (see loss/grad_frob.py).
-                    aggregated[key][s:e] = (vis_chunk * per_pmt[s:e]).sum(dim=1)
-            self._grad_targets = aggregated
+    def _read_quantiles(self, rows):
+        d = self._quantile_plib.__getitem__(rows, fields=("quantiles", "t0"))
+        quantiles = self._xform_quantiles(d["quantiles"].float(), d["t0"].float())
+        # invalid pairs are already masked out of the finite difference; this keeps NaN out of logs
+        return torch.nan_to_num(quantiles, nan=0.0).numpy()  # (chunk, n_pmt, K)
 
     def _precompute_targets(self):
-        """Precompute and store all transformed targets on self._device."""
+        """Store every transformed target on self._device."""
         idx = self.indices.numpy()
-        pos_np = self._quantile_plib.pos[idx]
-        self._pos = torch.from_numpy(pos_np).float().to(self._device)
+        self._pos = torch.from_numpy(self._quantile_plib.pos[idx]).float().to(self._device)
 
         data = self._quantile_plib[idx]
         vis_raw = data["vis"].float()
         t0_raw = data["t0"].float()
         quantiles = data["quantiles"].float()
 
-        vis_norm = vis_raw / self._n_photon
-        v = self._xform_vis(vis_norm)
-        t0 = torch.log(t0_raw.clamp(min=1e-3))
-        quantiles = self._xform_quantiles(quantiles, t0_raw)
-
-        self._v = v.to(self._device)
-        self._t0 = t0.to(self._device)
-        self._quantiles = quantiles.to(self._device)
+        self._v = self._xform_vis(vis_raw / self._n_photon).to(self._device)
+        self._t0 = torch.log(t0_raw.clamp(min=1e-3)).to(self._device)
+        self._quantiles = self._xform_quantiles(quantiles, t0_raw).to(self._device)
         self._vis_raw = vis_raw.to(self._device)
         self._t0_raw = t0_raw.to(self._device)
 
-        # Free the underlying plib data
         self._quantile_plib.close()
-        print(f"[CompressedPLibDataset] precomputed {len(self.indices)} voxels on {self._device}")
+        print(f"[QuantilePLibDataset] precomputed {len(self.indices)} voxels on {self._device}")
 
     def _xform_quantiles(self, quantiles, t0_raw):
         """Raw LUT quantiles (..., n_pmt, K) in ns -> the network's target domain.
 
-        The ONE place the target transform lives, shared by the eager, lazy, shard and
-        grad-target paths so they cannot drift apart. With align_quantiles_to_t0 the onset
-        is removed first, so the log acts on the delay after t0, not on absolute time.
+        The one place this transform lives (eager, lazy, shard and grad-target paths).
+        With align_quantiles_to_t0 the onset is removed first, so the log acts on the delay.
         """
         if self._align_t0:
             quantiles = quantiles - t0_raw.unsqueeze(-1)
@@ -635,12 +391,10 @@ class QuantilePLibDataset(Dataset):
         return quantiles
 
     def _precompute_shard(self, chunk_size):
-        """Load this rank's strided shard into self._device memory, chunk by chunk.
+        """Load this rank's strided shard into self._device, chunk by chunk via read_strided.
 
-        Reads rows directly through read_strided (one hyperslab per field per chunk) and
-        writes each transformed chunk into preallocated storage, so the transient footprint
-        is one chunk -- the eager _precompute_targets would hold several full-size copies
-        (raw, float, transformed) at once, which for 4 ranks per node exceeds the node's RAM.
+        Transformed chunks go straight into preallocated storage, so the transient footprint is
+        one chunk (_precompute_targets' full-size copies exceed node RAM at 4 ranks per node).
         """
         idx = self.indices.numpy()
         n = len(idx)
@@ -690,8 +444,7 @@ class QuantilePLibDataset(Dataset):
             t0_raw = data["t0"].float().to(dev)
             quantiles = data["quantiles"].float().to(dev)
             if self._align_t0:
-                # how often the first quantile falls BELOW analytical_t0 among visible pairs;
-                # those delays are clamped to 0 by _xform_quantiles, so report the rate
+                # rate of first quantiles below analytical_t0 (clamped to 0 by _xform_quantiles)
                 valid = vis_raw > 0
                 n_neg += int(((quantiles[..., 0] - t0_raw) < 0)[valid].sum())
                 n_valid += int(valid.sum())
@@ -714,14 +467,8 @@ class QuantilePLibDataset(Dataset):
 
     @staticmethod
     def _fields_for_targets(target_keys, align_t0=False):
-        """Which LUT fields must be read to build the requested targets.
-
-        `quantiles` needs `vis` as well, not just `quantiles`: quantiles_mask is derived
-        from the RAW target visibility (vis_raw > 0), because a zero-visibility (voxel, PMT)
-        pair has no waveform and its quantiles are NaN in the LUT. Dropping vis there would
-        silently feed those NaNs into the loss. With align_t0 it needs `t0` too, since the
-        target is Q - analytical_t0 even for a quantile-only branch.
-        """
+        """LUT fields needed for the requested targets. quantiles needs vis too (quantiles_mask
+        comes from the raw visibility) and, aligned, t0 (the target is Q - analytical_t0)."""
         if target_keys is None:
             return set(QuantilePLib.FIELDS)
         need = {"v": {"vis"}, "t0": {"t0"}, "quantiles": {"quantiles", "vis"}}
@@ -732,9 +479,27 @@ class QuantilePLibDataset(Dataset):
             fields |= need[k]
         return fields
 
+    def _lazy_targets(self, data):
+        """LUT fields read for one voxel or a batch -> (target, meta) dicts."""
+        want = self._target_keys
+        target, meta = {}, {}
+        vis_raw = data["vis"].float() if "vis" in data else None  # (..., n_pmt)
+        if vis_raw is not None:
+            meta["v_linear"] = vis_raw
+        t0_raw = data["t0"].float() if "t0" in data else None
+        if t0_raw is not None:
+            meta["t0_raw"] = t0_raw
+        if want is None or "v" in want:
+            target["v"] = self._xform_vis(vis_raw / self._n_photon)
+        if want is None or "t0" in want:
+            target["t0"] = torch.log(t0_raw.clamp(min=1e-3))
+        if want is None or "quantiles" in want:
+            target["quantiles"] = self._xform_quantiles(data["quantiles"].float(), t0_raw)
+            target["quantiles_mask"] = vis_raw > 0
+        return target, meta
+
     def __getitem__(self, idx):
         if hasattr(self, "_v"):
-            # Precomputed path (GPU or eager CPU)
             target = {
                 "v": self._v[idx],
                 "t0": self._t0[idx],
@@ -746,73 +511,25 @@ class QuantilePLibDataset(Dataset):
             return {
                 "position": self._pos[idx],
                 "target": target,
-                "meta": {
-                    "v_linear": self._vis_raw[idx],
-                    "t0_raw": self._t0_raw[idx],
-                },
+                "meta": {"v_linear": self._vis_raw[idx], "t0_raw": self._t0_raw[idx]},
             }
 
-        # Lazy CPU path
         vox_id = self.indices[idx].item()
         pos = torch.from_numpy(self._quantile_plib.pos[vox_id]).float()
-        data = self._quantile_plib.__getitem__(vox_id, fields=self._read_fields)
-
-        want = self._target_keys
-        target, meta = {}, {}
-        vis_raw = data["vis"].float() if "vis" in data else None
-        if vis_raw is not None:
-            meta["v_linear"] = vis_raw
-        # t0 is read for a t0 target, and also for an aligned quantile target (see
-        # _fields_for_targets); either way t0_raw goes into meta for consumers to add back
-        t0_raw = data["t0"].float() if "t0" in data else None
-        if t0_raw is not None:
-            meta["t0_raw"] = t0_raw
-        if want is None or "v" in want:
-            target["v"] = self._xform_vis(vis_raw / self._n_photon)
-        if want is None or "t0" in want:
-            target["t0"] = torch.log(t0_raw.clamp(min=1e-3))
-        if want is None or "quantiles" in want:
-            target["quantiles"] = self._xform_quantiles(data["quantiles"].float(), t0_raw)
-            target["quantiles_mask"] = vis_raw > 0
+        target, meta = self._lazy_targets(self._quantile_plib.__getitem__(vox_id, fields=self._read_fields))
         for key in self._grad_keys:
             target[f"{key}_grad_frob"] = self._grad_targets[key][idx]
-
         return {"position": pos, "target": target, "meta": meta}
 
     def __getitems__(self, indices):
-        """Fetch a whole batch with ONE read per field instead of one read per sample.
-
-        See CompressedPLibDataset.__getitems__ for the mechanism and the measurements. The
-        payoff is larger here: one voxel of `quantiles` is 162 KiB, and the per-sample path
-        reaches only ~79 MB/s against ~1.2 GB/s for a single multi-row selection through the
-        same three-level VDS chain.
-        """
+        """A whole batch with ONE read per field (see CompressedPLibDataset.__getitems__); for
+        162 KiB/voxel quantiles that is ~1.2 GB/s against ~79 MB/s per sample."""
         if hasattr(self, "_v"):
-            # Precomputed path: already resident, nothing to coalesce.
             return [self[i] for i in indices]
 
         idx = np.asarray(indices)
         vox = self.indices[torch.as_tensor(idx, dtype=torch.long)].numpy()
-        data = self._quantile_plib.__getitem__(vox, fields=self._read_fields)
-
-        want = self._target_keys
-        cols, metacols = {}, {}
-        vis_raw = data["vis"].float() if "vis" in data else None      # (B, n_pmt)
-        if vis_raw is not None:
-            metacols["v_linear"] = vis_raw
-        t0_raw = data["t0"].float() if "t0" in data else None         # (B, n_pmt)
-        if t0_raw is not None:
-            metacols["t0_raw"] = t0_raw
-        if want is None or "v" in want:
-            cols["v"] = self._xform_vis(vis_raw / self._n_photon)
-        if want is None or "t0" in want:
-            cols["t0"] = torch.log(t0_raw.clamp(min=1e-3))
-        if want is None or "quantiles" in want:
-            # (B, n_pmt, n_quantile)
-            cols["quantiles"] = self._xform_quantiles(data["quantiles"].float(), t0_raw)
-            # Zero-visibility (voxel, PMT) pairs have NaN quantiles in the LUT; the mask is
-            # what keeps them out of the loss. From the RAW visibility, as in __getitem__.
-            cols["quantiles_mask"] = vis_raw > 0
+        cols, metacols = self._lazy_targets(self._quantile_plib.__getitem__(vox, fields=self._read_fields))
         pos = torch.from_numpy(self._quantile_plib.pos[vox]).float()
         grads = {k: self._grad_targets[k][idx] for k in self._grad_keys}
 
@@ -829,57 +546,13 @@ class QuantilePLibDataset(Dataset):
         return out
 
 
-def create_quantile_dataloader(cfg, rank=0, world_size=1):
-    """Create DataLoader for QuantilePLibDataset."""
-    dataset = QuantilePLibDataset(cfg, rank=rank, world_size=world_size)
-    loader_cfg = cfg.get("data", {}).get("loader", {})
-    batch_size = loader_cfg.get("batch_size", 1)
-    num_workers = loader_cfg.get("num_workers", 0)
-    pin_memory = loader_cfg.get("pin_memory", False)
-    drop_last = loader_cfg.get("drop_last", True)
-    shuffle = loader_cfg.get("shuffle", False)
-    prefetch_factor = loader_cfg.get("prefetch_factor")
-
-    if dataset._on_gpu:
-        if num_workers > 0:
-            print("[create_quantile_dataloader] forcing num_workers=0 for GPU data")
-        num_workers = 0
-        pin_memory = False
-    sampler = None
-    if world_size > 1:
-        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=shuffle)
-        shuffle = False
-    # DataLoader rejects prefetch_factor when num_workers == 0 (which _on_gpu forces above).
-    extra = {}
-    if num_workers > 0 and prefetch_factor is not None:
-        extra["prefetch_factor"] = int(prefetch_factor)
-    dl = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        sampler=sampler,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        drop_last=drop_last,
-        persistent_workers=True if num_workers > 0 else False,
-        **extra,
-    )
-    if sampler is not None:
-        dl.set_epoch = lambda e: sampler.set_epoch(e)
-    return dl
-
-
 class MemoryShardLoader:
-    """Batches over a QuantilePLibDataset built with data.memory_shard.
+    """Batches over a QuantilePLibDataset built with data.memory_shard: one index_select per
+    field on the resident shard, no workers, no collate.
 
-    Each batch is one index_select per field on the resident shard -- no worker processes,
-    no collate -- so a step costs the gather plus (for a host-RAM shard) one host->GPU copy
-    of the batch, which train.py's .to(DEVICE) already does.
-
-    Mirrors the parts of the DataLoader interface train.py and QuantileInfer touch:
-    len(), iteration, .dataset, and .sampler.set_epoch (train.py reshuffles through it).
-    The permutation is seeded by (seed, epoch, rank), so a resumed chain link replays the
-    same order for the same epoch, the way DistributedSampler's seed + epoch does.
+    Provides what train.py and QuantileInfer use from a DataLoader: len(), iteration,
+    .dataset and .sampler.set_epoch. The order is seeded by (seed, epoch, rank), so a resumed
+    run replays the same order for the same epoch.
     """
 
     def __init__(self, dataset, batch_size, shuffle=True, drop_last=True, seed=0, rank=0, world_size=1):

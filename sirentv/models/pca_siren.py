@@ -6,16 +6,7 @@ from sirentv.models.multibranch import MultiBranchSiren
 
 @MODELS.register_module()
 class PcaSiren(MultiBranchSiren):
-    """Single SIREN trunk outputting PCA coefficients + visibility + log_t0.
-
-    Thin wrapper over MultiBranchSiren: one branch emitting [v, t0, coeffs], registered
-    under the submodule name `net` so that state_dicts from before the refactor load
-    unchanged. Equivalent config:
-
-        type: MultiBranchSiren
-        branches:
-          - {name: net, keys: [v, t0, coeffs]}
-    """
+    """Single trunk emitting [v, t0, coeffs], under the legacy submodule name `net`."""
 
     def __init__(
         self,
@@ -44,6 +35,5 @@ class PcaSiren(MultiBranchSiren):
             ],
             **kwargs,
         )
-        # preserve the legacy split so output_scale init lists written against
-        # [2, n_components] keep validating identically (the total is unchanged either way)
+        # legacy split, so output_scale lists written as [2, n_components] still validate
         self.out_features = [2, n_components]

@@ -104,18 +104,6 @@ def search_paths():
     return out
 
 
-def pythonpath():
-    """search_paths() as a ':'-joined string, for a subprocess or a shell command.
-
-    Notebook cells that shell out to `python3 -m sirentv.train` need this rather than
-    just REPO_DIR: without the siblings the child process dies on `import slar`, and
-    without PACKAGE_DIR on `import hist`. Note that the larcv2 image declares its own
-    PYTHONPATH in its ENV, so this has to be applied INSIDE the container (a value
-    exported outside shifter is overridden and silently has no effect).
-    """
-    return ":".join(search_paths())
-
-
 GRAD_CACHE = _env("SIRENTV_GRAD_CACHE", GRAD_CACHE_DIR / "dualpca_n50_grad_frob.h5")
 GRAD_CACHE_QUANTILE = _env(
     "SIRENTV_GRAD_CACHE_QUANTILE", GRAD_CACHE_DIR / "quantile_grad_frob.h5"
@@ -152,15 +140,3 @@ def summary(check: bool = True):
             mark = "" if Path(value).exists() else "   <-- MISSING"
         print(f"  {key:<{width}} {value}{mark}")
 
-
-def ensure_importable():
-    """Put every search path on sys.path, for a notebook outside an installed package.
-
-    Returns REPO_DIR, which is what the notebooks bind to DEFAULT_SIRENTV_SRC.
-    """
-    import sys
-
-    for p in reversed(search_paths()):
-        if p not in sys.path:
-            sys.path.insert(0, p)
-    return str(REPO_DIR)

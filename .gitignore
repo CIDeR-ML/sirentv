@@ -8,3 +8,9 @@ logs*/
 *.out
 *.err
 *.ckpt
+analysis/
+grad_frob_cache/
+config/generated/
+*~
+!tests/bitwise/*.sh
+!tests/*.sh

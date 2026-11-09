@@ -6,20 +6,7 @@ from sirentv.models.multibranch import MultiBranchSiren
 
 @MODELS.register_module()
 class QuantileSiren(MultiBranchSiren):
-    """Single SIREN trunk outputting raw quantile values + visibility + log_t0.
-
-    Thin wrapper over MultiBranchSiren: one branch emitting [v, t0, quantiles],
-    registered under the submodule name `net` so that state_dicts from before the
-    refactor load unchanged. Equivalent config:
-
-        type: MultiBranchSiren
-        branches:
-          - {name: net, keys: [v, t0, quantiles]}
-
-    For the split topologies, use MultiBranchSiren directly:
-        [{keys: [v, t0]}, {keys: [quantiles]}]          # split representation
-        [{keys: [v]}, {keys: [t0]}, {keys: [quantiles]}] # split everything
-    """
+    """Single trunk emitting [v, t0, quantiles], under the legacy submodule name `net`."""
 
     def __init__(
         self,
@@ -49,5 +36,5 @@ class QuantileSiren(MultiBranchSiren):
             **kwargs,
         )
         self.n_quantile = n_quantile
-        # preserve the legacy split (see PcaSiren) -- total is unchanged either way
+        # legacy split (see PcaSiren)
         self.out_features = [2, n_quantile]

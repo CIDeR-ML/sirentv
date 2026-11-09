@@ -1,0 +1,128 @@
+# q3_t0align: 3-branch quantile SIREN (v / t0 / quantiles), quantiles aligned to the analytical t0.
+# Reference training config, S3DF. Launch: scripts/slurm_job_sirentv/submit_train.sh train_q3_t0align_s3df.yaml
+# NERSC twin: train_q3_t0align_nersc.yaml (differs only in paths).
+photonlib:
+  filepath: /sdf/data/neutrino/pubdata/lut/optical/consolidated/full_wvfm_plib_b05_quantile_prod_lite_fixed.h5
+  lazy: true
+  device: cpu
+  mode: log_quantile          # target = log10(Q - t0 + C)
+  log_quantile_C: 0.1
+  align_quantiles_to_t0: true # quantiles are delays after the analytical t0
+  combine_every_quantile: 1   # all 512 quantile levels
+  n_photon: 3.0e7
+physics:
+  R_index: 1.233
+device:
+  type: cuda
+transform_vis: &xform_vis
+  vmax: 1.0
+  eps: 1.0e-08
+  sin_out: false
+model:
+  ckpt_file: null
+  mode: quantile_cdf
+  output_scale:
+    fix: true
+  network:
+    type: MultiBranchSiren
+    in_features: 6
+    n_quantile: 512
+    outermost_linear: true
+    use_CDF: false
+    xform_vis: *xform_vis
+    branches:
+    - name: v_net
+      keys: [v]
+      hidden_features: 256
+      hidden_layers: 9
+      first_omega_0: 30.0
+      hidden_omega_0: 30.0
+      init_output_bias: {v: 0.57}  # start v inside the Poisson loss's live (non-clamped) region
+    - name: t0_net
+      keys: [t0]
+      hidden_features: 256
+      hidden_layers: 9
+      first_omega_0: 15.0
+      hidden_omega_0: 15.0
+    - name: quantile_net
+      keys: [quantiles]
+      hidden_features: 512
+      hidden_layers: 6
+      first_omega_0: 120.0
+      hidden_omega_0: 120.0
+data:
+  n_pmt: 81
+  target_keys: [v, t0, quantiles]
+  memory_shard: true          # each rank keeps its 1/world_size of the voxels in RAM
+  memory_shard_device: cpu
+  # x_min: -2160              # optional: active volume only (drops voxels behind the PMT plane)
+  dataset:
+    type: QuantilePLibDataset
+  loader:
+    batch_size: 512           # per rank
+    drop_last: true
+    shuffle: true
+    load_pos: true
+    num_workers: 16
+    pin_memory: true
+    prefetch_factor: 4
+  weight:
+    v:
+      enable: true
+      factor: 5000.0
+      threshold: 1.0e-08
+    t0:
+      enable: false
+    quantiles:
+      enable: false
+logger:
+  type: wandb                 # train.py without --wandb falls back to the CSV logger
+  entity: junjiex-stanford-university
+  project: sirentv_production
+  name: train_sirentv_81_q3_t0align
+  run_dir: /sdf/data/neutrino/junjie/SIREN/cider-ml/logs
+  dir_name: logs_train_sirentv_81_q3_t0align
+  file_name: log.csv
+  log_every_nsteps: 77
+  grad_norm:
+    enabled: true
+    log_per_layer: true
+    log_frequency: 77
+  infer_fn:
+    type: QuantileInfer
+  analysis:
+  - func: bias
+    suffix: vis
+    key: v_linear
+    threshold: 1.0e-06
+  - func: abs_bias
+    suffix: t0
+    key: t0
+    signed: true
+    threshold: 0.01
+train:
+  seed: 0
+  max_epochs: 400             # per job (chained jobs resume)
+  save_every_epochs: 50
+  save_every_iterations: -1
+  resume: true
+  optimizer_class: AdamW
+  optimizer_param:
+    lr: 1.0e-05
+  scheduler_class: CosineAnnealingLR
+  scheduler_param:
+    T_max: 2000
+    eta_min: 1.0e-07
+  clip_grad: {v_net: 1.0, t0_net: 1.0, quantile_net: 1.0}  # per-branch clipping
+  reduction: sum
+  loss:
+  - type: WeightedL2Loss
+    key: quantiles
+    mask_key: quantiles_mask  # invisible pairs have NaN quantiles
+    weight: 1.0
+  - type: WeightedPoissonNLLLoss
+    key: v
+    weight: 1.0e-07           # x n_photon (3e7) inside the loss = effective weight 3
+  - type: SmoothL1Loss
+    key: t0
+    weight: 1.0

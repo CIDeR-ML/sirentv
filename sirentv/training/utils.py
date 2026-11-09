@@ -1,8 +1,8 @@
+import os
+
 import torch
-import torch.nn as nn
 
 from sirentv.loss.builder import build_loss as _build_loss_fn
-from sirentv.loss.builder import build_regularizer as _build_regularizer_fn
 
 
 def unwrap_net(net):
@@ -16,17 +16,11 @@ def unwrap_net(net):
 
 
 def _clip_grad_(grad_clip_max_norm, net):
-    """Applies grad_clip_max_norm, either a single float (one global clip across every
-    parameter -- the original behavior) or a dict (per-NAMED-SUBNETWORK clip, e.g.
-    {"vt0_net": 1.0, "coeff_net": 1.0} for DualPcaSiren -- each key's matching parameters are
-    clipped TOGETHER as one group, by their combined norm, so one branch's gradient can no
-    longer dominate the global norm and throttle an unrelated branch's otherwise-fine gradient
-    via a single shared clip.
+    """Clip by global norm (float), or per named subnetwork (dict, e.g. {"v_net": 1.0, ...}).
 
-    Matching is by dotted-path SEGMENT, e.g.
-    "model.vt0_net.net.0.linear.weight"), optionally wrapped again in DDP's "module." prefix --
-    neither wrapper's prefix, nor the surrounding path depth, should matter for matching a bare
-    submodule name like "vt0_net". A parameter matching more than one key, or none, is an error
+    Dict keys match a parameter when they equal one segment of its dotted name, so the
+    compile/DDP prefixes don't matter. Each group is clipped by its own combined norm, so one
+    branch can't throttle another. Every parameter must match exactly one key.
     """
     if grad_clip_max_norm is None:
         return
@@ -79,32 +73,20 @@ def get_weight_by_vis(vis, factor=None, threshold=1e-8):
 
 
 def build_losses(cfg):
+    """Build train.loss, injecting the dataset-side constants some losses need."""
     loss_cfg = cfg.get("train", dict()).get("loss", [])
     losses = []
     for c in loss_cfg:
         c = dict(c)
-        # plib_cfg mirrors the same "compressed_plib, falling back to quantile_plib/photonlib"
-        # lookup the datasets themselves use, so pca/dualpca and quantile-family configs both
-        # work here without needing separate branches
         plib_cfg = cfg.get("compressed_plib", cfg.get("quantile_plib", cfg.get("photonlib", {})))
         if c.get("type") == "WeightedPoissonNLLLoss" and c.get("key") == "v":
-            # reuse the same xform_vis/n_photon the model and dataset already build from, rather
-            # than duplicating these values into the loss config entry (that duplication is
-            # exactly what caused the stale raw_n_photon drift bug in the eval notebook)
+            # same xform_vis / n_photon as the dataset, so they can't drift apart
             from slar.transform import partial_xform_vis
             _, inv_xform = partial_xform_vis(cfg.get("transform_vis", {}))
             c.setdefault("inv_xform", inv_xform)
-            # float(...) -- PyYAML's float regex requires an explicit sign after "e" (1.0e-3
-            # parses as a float, 3.0e7 does not), so bare-positive-exponent values like this
-            # codebase's own n_photon: 3.0e7 configs parse as strings; every other n_photon
-            # read site already defends against this (e.g. compressed.py's
-            # float(plib_cfg.get("n_photon", 1.0))), this one needs the same treatment
-            c.setdefault("n_photon", float(plib_cfg["n_photon"]))
+            c.setdefault("n_photon", float(plib_cfg["n_photon"]))  # PyYAML reads 3.0e7 as str
         if c.get("type") == "WeightedReconstructedQuantileLoss" and c.get("key") == "coeffs":
-            # only the PCA-coefficient-supervision variant needs the basis to reconstruct into
-            # quantile-function space -- direct quantile-function supervision (key="quantiles")
-            # has no compressed_plib section at all, so pca_mean/pca_components stay None and
-            # the loss skips reconstruction (see WeightedReconstructedQuantileLoss docstring)
+            # coefficient supervision needs the PCA basis to reconstruct quantile space
             if "compressed_plib" in cfg:
                 from sirentv.data.compressed import CompressedPLib
                 _cplib = CompressedPLib.load(
@@ -113,25 +95,12 @@ def build_losses(cfg):
                 c.setdefault("pca_mean", _cplib.pca_mean)
                 c.setdefault("pca_components", _cplib.pca_components)
                 if bool(plib_cfg.get("normalize_coeffs", False)):
-                    # pred[coeffs]/target[coeffs] are normalized ((raw-mean)/std) when this is
-                    # on -- reconstruction needs raw-scale coefficients, so the loss denormalizes
-                    # internally using these. NOTE: this repeats the same full-dataset
-                    # compute_coeff_stats() pass the dataset itself already does at startup (see
-                    # CompressedPLibDataset.__init__) -- a known, currently-accepted redundant
-                    # one-time cost, not a per-step one; only worth deduplicating if this startup
-                    # overhead actually becomes a problem in practice.
+                    # repeats the dataset's one-time stats pass (accepted startup cost)
                     _cplib.compute_coeff_stats()
                     c.setdefault("coeff_mean", _cplib.coeff_mean)
                     c.setdefault("coeff_std", _cplib.coeff_std)
         losses.append(_build_loss_fn(c))
     return losses
-
-
-def build_regularizer(cfg) -> nn.Module | None:
-    regularizer_cfg = cfg.get("train", dict()).get("regularization", None)
-    if regularizer_cfg is None:
-        return None
-    return _build_regularizer_fn(regularizer_cfg)
 
 
 def build_logger(cfg, net, rank=0):
@@ -159,12 +128,9 @@ def build_weight_fn(cfg):
         weights = {}
         for k in target.keys():
             if k == "coeffs_weight":
-                continue  # auxiliary per-component weight vector, not a prediction target itself
+                continue  # auxiliary weight vector, not a target
             if k == "coeffs" and "coeffs_weight" in target:
-                # per-component magnitude-proportional weight (see CompressedPLib.compute_coeff_stats)
-                # -- only present when normalize_coeffs is on, takes precedence over the
-                # vis-based weighting below since it's a different (per-component, not
-                # per-PMT/visibility) axis of weighting
+                # per-component weight from normalize_coeffs; takes precedence over vis weighting
                 weights[k] = target["coeffs_weight"]
             elif k in weight_cfg and weight_cfg[k].get("enable", False):
                 weights[k] = get_weight_by_vis(
@@ -177,3 +143,15 @@ def build_weight_fn(cfg):
         return weights
 
     return weight_fn
+
+
+CONFIG_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "config")
+
+
+def resolve_config(path, archive=False):
+    """--config as a path, or a bare name looked up in <repo>/config (config/archive with archive=True)."""
+    if archive:
+        return os.path.join(CONFIG_DIR, "archive", os.path.basename(path))
+    if os.path.exists(path):
+        return path
+    return os.path.join(CONFIG_DIR, path)

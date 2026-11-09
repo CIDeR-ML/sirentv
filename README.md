@@ -1,235 +1,156 @@
 # SirenTV
 
-A neural network-based photon visibility model for [DUNE](https://www.dunescience.org/) (Deep Underground Neutrino Experiment). SirenTV learns to predict photon time distributions (PDF/CDF) and visibility for photomultiplier tubes (PMTs) from 3D spatial positions using [SIREN](https://arxiv.org/abs/2006.09661) (Sinusoidal Representation Networks) architectures.
+A neural photon visibility model for [DUNE](https://www.dunescience.org/): from a 3D position, SirenTV predicts, per PMT, the visibility, the first-photon time t0 and the photon arrival-time distribution, using [SIREN](https://arxiv.org/abs/2006.09661) (sinusoidal representation) networks. It models one detector half.
 
 ## Installation
 
+Python >= 3.10. SirenTV needs two packages that are not on PyPI:
+[`photonlib`](https://github.com/CIDeR-ML/photonlib) (photon library I/O, voxel metadata) and
+`slar` from [`siren-lartpc`](https://github.com/CIDeR-ML/siren-lartpc) (SIREN layers, optimizers, visibility transforms).
+
+**Own environment (pip):**
+
 ```bash
+git clone https://github.com/CIDeR-ML/photonlib.git
+git clone https://github.com/CIDeR-ML/siren-lartpc.git
 git clone https://github.com/CIDeR-ML/sirentv.git
-cd sirentv
-pip install -e .
+pip install -e photonlib -e siren-lartpc -e sirentv   # sirentv also pulls torch, numpy, h5py, pyyaml, tqdm, wandb, matplotlib, scipy
 ```
 
-**Dependencies**: `torch`, `numpy`, `pyyaml`, `tqdm`, `wandb`, `hist`
+This also installs the `sirentv-train` and `sirentv-eval` commands (same flags as `python -m sirentv.train` / `sirentv/eval/eval.py`).
 
-**External packages** (install separately):
-- [`photonlib`](https://github.com/CIDeR-ML/photonlib) — Photon library I/O and voxel metadata
-- [`slar`](https://github.com/CIDeR-ML/slar) — SIREN base layers, optimizers, visibility transforms
-
-## Quick Start
+**S3DF / NERSC (container, nothing installed):** jobs run in the site container (S3DF: `develop.sif` under Singularity; NERSC: `deeplearnphysics/larcv2:ub2204-cu121-torch251-larndsim` under Shifter) with the three checkouts on `PYTHONPATH`, set *inside* the container since the image overrides it:
 
 ```bash
-# Single GPU
-python -m sirentv.train --config config/train_sirentv_81_branched.yaml
-
-# Multi-GPU (via torchrun)
-torchrun --nproc_per_node=4 -m sirentv.train --config config/train_sirentv_81_branched.yaml
-
-# Enable Weights & Biases logging (default: CSV)
-python -m sirentv.train --config config/train_sirentv_81_pca.yaml --wandb
+export PYTHONPATH=/path/to/sirentv:/path/to/siren-lartpc:/path/to/photonlib:$PYTHONPATH
 ```
 
-## Architecture
+On NERSC, packages the image lacks (e.g. `wandb`) come from a `pip install --target` directory that also goes on `PYTHONPATH`. The Slurm scripts (`cider-ml/scripts/slurm_job_sirentv/site_env.sh`) set all of this per site.
 
-### Models
+## Quick start
 
-SirenTV supports multiple network architectures, selected via the `model.network.type` config key:
+The reference configs are `config/{train,eval}_q3_t0align_{s3df,nersc}.yaml`; every other config is kept under `config/archive/`.
 
-| Architecture | Config Type | Description |
-|---|---|---|
-| `BranchedSiren` | Waveform | Shared encoder + separate visibility and timing decoders |
-| `ParallelSiren` | Waveform | Two independent SIREN networks for visibility and timing |
-| `ConditionalSiren` | Waveform | Conditional architecture with position/time/PMT embeddings |
-| `PcaSiren` | PCA | Single SIREN outputting PCA coefficients + visibility + log(t0) |
-| `DualPcaSiren` | PCA | Two branches: one for vis+t0, one for PCA coefficients |
+```bash
+# Single GPU (CSV logging); add --wandb for Weights & Biases
+python -m sirentv.train --config config/train_q3_t0align_s3df.yaml
 
-All models are wrapped by `SirenTV` (`sirentv/models/model.py`), which handles coordinate normalization, visibility transforms, and masking.
+# Archived configs by name
+python -m sirentv.train --config abl_q_w120_d6_s3df.yaml --archive
 
-### Training Modes
+# Multi-GPU
+torchrun --nproc_per_node=4 -m sirentv.train --config config/train_q3_t0align_s3df.yaml --wandb
 
-The training loop is fully generic — mode-specific behavior is resolved at setup time through config-driven registries:
+# Evaluation (routes on data.dataset.type)
+torchrun --nproc_per_node=4 sirentv/eval/eval.py --config config/eval_q3_t0align_s3df.yaml \
+    --output eval-q3_t0align.pt --pmt-ids 0 40 80
+```
 
-**Waveform mode**: Trains on full photon library waveforms (PDF or CDF). The model predicts per-PMT visibility and time distributions directly.
+## Representations
+
+The time distribution is learned in one of two compressed forms, each with its own LUT and dataset:
+
+| Representation | Dataset | LUT section | Output key | Evaluator |
+|---|---|---|---|---|
+| Quantile function (u-grid levels) | `QuantilePLibDataset` | `photonlib` / `quantile_plib` | `quantiles` | `eval/eval_quantile.py` |
+| PCA coefficients | `CompressedPLibDataset` | `compressed_plib` | `coeffs` | `eval/eval_pca.py` |
+
+Targets: `v = xform_vis(vis / n_photon)` (a log transform), `t0 = log(t0 [ns])`, and the representation. With `photonlib.mode: log_quantile` the quantiles are `log10(Q + C)`; with `align_quantiles_to_t0` the onset is removed first, so they are delays after t0.
+
+## Models
+
+`model.network.type`, wrapped by `SirenTV` (`sirentv/models/model.py`), which normalizes positions, tiles them against the PMT positions, and masks points outside the volume.
+
+| Network | Description |
+|---|---|
+| `MultiBranchSiren` | Any split of the outputs into independent SIREN branches, each with its own width, depth and omega_0 |
+| `PcaSiren`, `QuantileSiren` | One trunk for `[v, t0, coeffs]` / `[v, t0, quantiles]` (legacy checkpoint names) |
+| `DualPcaSiren` | `vt0_net` for `[v, t0]`, `coeff_net` for `[coeffs]` (legacy checkpoint names) |
 
 ```yaml
-data:
-  dataset:
-    type: PLibDataset
 model:
-  mode: cdf        # or "pdf"
+  mode: quantile_cdf
   network:
-    type: BranchedSiren
-```
-
-**PCA mode**: Trains on compressed photon libraries where waveforms are represented as PCA coefficients + first-photon time (t0). The model predicts PCA coefficients, visibility, and log(t0).
-
-```yaml
-data:
-  dataset:
-    type: CompressedPLibDataset
-model:
-  mode: pca_cdf
-  network:
-    type: PcaSiren
-```
-
-### First Photon Time (t0)
-
-t0 represents the earliest photon arrival time at each PMT and is handled differently depending on the training mode:
-
-**Waveform mode**: The model predicts t0 in units of time ticks. During training, if `load_pos: true` in the data config, the training loop computes target t0 as the geometric time-of-flight from each voxel position to each PMT:
-
-```
-target_t0 = distance(position, pmt_position) / speed_of_light_in_LAr
-```
-
-The predicted t0 is scaled by `tick_size` (ns per tick) before comparison. t0 is used to apply a sigmoid ramp mask (`t0_mask()`) that zeros out the timing distribution before the predicted first photon arrival.
-
-**PCA mode**: The compressed photon library stores t0 directly in nanoseconds. The dataset applies a log transform (`log(t0_raw)`) and the model predicts log(t0) via its `t0` output head. The loss operates in log-space, which handles the large dynamic range of arrival times across PMTs. During inference, the predicted log(t0) is exponentiated to recover t0 in nanoseconds for CDF reconstruction and alignment.
-
-### Data Flow
-
-1. Dataset loads photon library data (full waveform or compressed PCA)
-2. Positions are normalized to [-1, 1] via `AABox.norm_coord()`
-3. Visibility targets are log-transformed: `log(v + eps)` normalized to `[0, vmax]`
-4. Network predicts visibility (`v`), timing (`t` or `coeffs`), and optionally `t0` per PMT
-5. Loss is computed in the transformed domain; metrics in the linear domain
-
-## Configuration
-
-Training is fully driven by YAML config files. Key sections:
-
-```yaml
-# Data source
-photonlib:                          # Waveform mode
-  filepath: path/to/plib.h5
-compressed_plib:                    # PCA mode
-  filepath: path/to/compressed.h5
-  n_components: 50
-
-# Dataset (registry-based)
-data:
-  dataset:
-    type: PLibDataset               # or CompressedPLibDataset
-  n_pmt: 81
-  loader:
-    batch_size: 2048
-    num_workers: 8
-    shuffle: true
-  weight:
-    v:
-      enable: true
-      factor: 5000.0
-      threshold: 1.0e-08
-
-# Model
-model:
-  mode: cdf                         # pdf, cdf, or pca_cdf
-  network:
-    type: BranchedSiren
+    type: MultiBranchSiren
     in_features: 6
-    hidden_features: [512, 256, 1024]
-    hidden_layers: [3, 3, 3]
-
-# Visibility transform
-transform_vis:
-  vmax: 1.0
-  eps: 1.e-8
-
-# Training
-train:
-  max_epochs: 500
-  optimizer_class: AdamW
-  optimizer_param:
-    lr: 2.0e-05
-  scheduler_class: ReduceLROnPlateau
-  reduction: mean                   # mean, sum, or geometric_mean
-  amp: false                        # mixed precision
-  clip_grad: null                   # gradient clipping max norm
-  loss:
-    - type: SmoothL1Loss
-      key: t
-      weight: 1.0
-    - type: SmoothL1Loss
-      key: v
-      weight: 1.0
-
-# Logging
-logger:
-  type: wandb                       # or csv
-  project: my-project
-  infer_fn:
-    type: WaveformInfer             # or PCAInfer
-  grad_norm:
-    enabled: false
-    log_per_layer: false
+    n_quantile: 512
+    branches:
+    - {name: v_net, keys: [v], hidden_features: 256, hidden_layers: 9, first_omega_0: 30.0, hidden_omega_0: 30.0}
+    - {name: t0_net, keys: [t0], hidden_features: 256, hidden_layers: 9, first_omega_0: 15.0, hidden_omega_0: 15.0}
+    - {name: quantile_net, keys: [quantiles], hidden_features: 512, hidden_layers: 6, first_omega_0: 120.0, hidden_omega_0: 120.0}
 ```
 
-### Available Losses
+## Configuration notes
 
-All losses use the registry pattern (`type` key in config):
+- `data.target_keys` limits the targets (and the LUT fields read). `data.x_min` [mm] keeps only voxels with x >= x_min, e.g. -2160 for the active volume. `data.subsample_factor` / `data.max_len` thin the voxels.
+- `data.memory_shard: true` keeps each rank's 1/world_size of the voxels in RAM (quantile dataset).
+- `train.clip_grad`: a float (global) or `{branch_name: max_norm}`.
+- `train.grad_supervision_keys` (`[v, coeffs]` or `{coeffs: <start epoch>}`) adds `WeightedGradFrobLoss` targets. Fill `train.grad_target_cache_file` once with `python -m sirentv.scripts.precompute_grad_frob_targets --config ...`.
+- `logger.analysis`: a list of `{func: bias|abs_bias, suffix, key, threshold[, signed]}`, logged every `logger.log_every_nsteps` steps.
+- `train.reduction`: `mean`, `sum` or `geometric_mean` over the loss terms. `train.seed` seeds the weight init.
+
+## Losses
 
 | Loss | Description |
 |---|---|
-| `WeightedL2Loss` / `L2Loss` | L2 (MSE) with optional sample weighting |
-| `SmoothL1Loss` / `WeightedSmoothL1Loss` | Huber loss with optional masking |
-| `WeightedPoissonNLLLoss` | Poisson NLL for count data |
-| `WeightedCosineDissimilarity` | Cosine dissimilarity loss |
-| `JSDivergenceLoss` | Jensen-Shannon divergence |
-| `VisibilityGradient_L2Loss` | Gradient magnitude supervision (L2) |
-| `VisibilityGradient_SmoothL1Loss` | Gradient magnitude supervision (Huber) |
+| `WeightedL2Loss` | L2 with optional per-sample weights and `mask_key` |
+| `SmoothL1Loss` / `WeightedSmoothL1Loss` | Huber, unweighted / weighted |
+| `WeightedPoissonNLLLoss` | Poisson NLL in count units (n_photon and the inverse xform are injected) |
+| `WeightedReconstructedQuantileLoss` | L2 in quantile space, weighted by the target's local density |
+| `WeightedGradFrobLoss` | Matches the squared spatial-gradient Frobenius norm (gradient supervision) |
+| `WeightedCosineDissimilarity`, `JSDivergenceLoss` | Kept, unused by current configs |
 
-Regularizers: `L1Regularization`, `L2Regularization`, `LNRegularization`
+The production configs use the Poisson NLL on `v`; the loss-ablation notes are in `docs/archive/loss_ablations.md`.
 
-## Evaluation
+## Evaluation output
 
-```bash
-python -m sirentv.eval --config config/eval_sirentv_81_branched.yaml --output results.pt
-```
+`eval.py` writes a `.pt` with overall / per-PMT / per-quantile-bin bias and absolute error, the error in units of the local quantile spacing with its Monte Carlo Poisson floor, t0 error, per-voxel arrays, and with `--pmt-ids` spatial-slice diagnostics and (kx, ky, kz) power spectra (`--no-spectra` to skip). For PCA runs, `--compare` selects pred_vs_compressed / pred_vs_raw / compressed_vs_raw.
 
-Computes per-PMT visibility bias, per-tick timing bias, and stores predictions/targets/errors to a `.pt` file.
+## Extending
 
-## Distributed Training
+Components are registry-based (mmcv-style); none need changes to the training loop:
 
-SirenTV supports multi-GPU training via PyTorch DDP:
+- model: `@MODELS.register_module()` in `sirentv/models/`
+- dataset: `@DATASETS.register_module()` in `sirentv/data/` (import it in `data/builder.py`)
+- loss: `@LOSSES.register_module()` in `sirentv/loss/`
+- inference/plotting: `@INFER_FNS.register_module()` in `sirentv/infer.py`
 
-```bash
-torchrun --nproc_per_node=4 -m sirentv.train --config config/train.yaml --wandb
-```
+## Tests
 
-For SLURM clusters, see example scripts in `scripts/`:
+**Run the tests before every push to the remote.**
 
 ```bash
-sbatch scripts/run_sirentv.sh
+tests/run_tests.sh       # import/compile + unit tests, in the active environment (needs photonlib, slar)
+tests/submit_tests.sh    # S3DF: the same as a CPU job inside the container -> ./tests-<jobid>.out
 ```
 
-## Extending SirenTV
+`tests/test_imports.py` compiles and imports every module; the other `tests/test_*.py` are fast unit tests (no LUT, no GPU).
 
-The codebase uses mmcv-style registries. Adding a new component requires no changes to the training loop:
+For a change that should not alter numerics (a refactor), also run the bitwise regression suite: `tests/bitwise/` trains `q3_t0align` and a gradient-supervised PCA config for a few epochs and evaluates two production checkpoints, then compares two runs tensor by tensor:
 
-**New model**: Register with `@MODELS.register_module()` in `sirentv/models/`, specify `type` in config.
+```bash
+tests/bitwise/submit.sh <checkout A> <out A>    # S3DF, 4 GPUs, inside the container (~1 h)
+tests/bitwise/submit.sh <checkout B> <out B>
+tests/bitwise/compare.sh <out A> <out B>        # PASS / FAIL report in <out B>/compare-*.out
+```
 
-**New dataset**: Register with `@DATASETS.register_module()` in `sirentv/data/`, return the [standardized batch format](#data-flow), specify `type` in config.
-
-**New loss**: Register with `@LOSSES.register_module()` in `sirentv/loss/`, specify `type` and `key` in config.
-
-**New inference/plotting**: Register with `@INFER_FNS.register_module()` in `sirentv/infer.py`, specify `type` in config.
-
-## Project Structure
+## Project structure
 
 ```
 sirentv/
-├── config/              # YAML training/eval configs
-├── scripts/             # SLURM job scripts
+├── config/              # reference configs; archive/ holds the rest
+├── docs/                # nersc_bitwise_check.md (NERSC handoff); archive/ superseded notes
+├── tests/               # import/unit tests (run_tests.sh); bitwise/ regression suite
 ├── sirentv/
-│   ├── models/          # Network architectures + SirenTV wrapper
-│   ├── loss/            # Loss functions (registry-based)
-│   ├── data/            # Datasets + dataloaders (registry-based)
-│   ├── training/        # Shared training utilities
-│   ├── utils/           # Logging, transforms, DDP, misc
-│   ├── infer.py         # Inference/plotting (registry-based)
-│   ├── analysis.py      # Post-training analysis
-│   ├── train.py         # Unified training loop + CLI
-│   └── eval.py          # Evaluation loop + CLI
+│   ├── models/          # networks + SirenTV wrapper
+│   ├── loss/            # losses (registry)
+│   ├── data/            # LUT readers, datasets, loaders (registry)
+│   ├── eval/            # eval CLI, PCA / quantile evaluators, shared metrics
+│   ├── training/        # loss/logger/clipping helpers
+│   ├── utils/           # logging, gradient estimators, spectra, DDP, registry
+│   ├── scripts/         # offline gradient-target precompute
+│   ├── infer.py         # training-time plots (registry)
+│   ├── analysis.py      # bias metrics for logger.analysis
+│   └── train.py         # training loop + CLI
 └── setup.py
 ```

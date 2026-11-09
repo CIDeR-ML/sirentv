@@ -1,40 +1,15 @@
-"""
-Generic multi-branch SIREN.
+"""Generic multi-branch SIREN: one independent `slar.base.Siren` per branch, each emitting named outputs.
 
-One independent `slar.base.Siren` per branch, each branch emitting one or more named
-outputs. The representation key is just another output name, so every topology works
-identically for PCA coefficients and for raw quantiles:
+Topologies, for either representation (`coeffs` or `quantiles`, which differ only in width):
 
-    topology                     PCA representation                quantile representation
-    -------------------------------------------------------------------------------------
-    single trunk                 [{keys: [v, t0, coeffs]}]         [{keys: [v, t0, quantiles]}]
-                                 (== legacy PcaSiren)              (== legacy QuantileSiren)
-    split representation         [{keys: [v, t0]}, {keys: [coeffs]}]
-                                 (== legacy DualPcaSiren)          [{keys: [v, t0]}, {keys: [quantiles]}]
-    split everything (triple)    [{keys: [v]}, {keys: [t0]}, {keys: [coeffs]}]
-                                                                   [{keys: [v]}, {keys: [t0]}, {keys: [quantiles]}]
+    single trunk    [{keys: [v, t0, coeffs]}]                      == PcaSiren / QuantileSiren
+    split repr.     [{keys: [v, t0]}, {keys: [coeffs]}]            == DualPcaSiren
+    split all       [{keys: [v]}, {keys: [t0]}, {keys: [coeffs]}]
 
-Nothing in this class is specific to either representation -- `coeffs` and `quantiles`
-differ only in their output width (n_components vs n_quantile), so any topology above can
-be built for either by swapping that one key.
-
-Why branches at all: the point of splitting is that each branch gets its own
-`first_omega_0` / `hidden_omega_0` / depth / width, i.e. its own representable spatial
-bandwidth. A shared trunk forces one bandwidth compromise across outputs whose spectra
-differ (which is what the kx/ky/kz power-spectrum diagnostic measures). Splitting buys
-nothing except through those per-branch knobs.
-
-Note what is deliberately NOT a branch: `*_grad_frob`. The predicted gradient magnitude
-is not a network output -- SirenTV.forward autograd-differentiates a branch's value
-output with respect to position (see compute_grad_frob_hutchinson).
-
-Branch naming and checkpoint compatibility
-------------------------------------------
-Each branch is registered as a submodule under its own `name`, so the resulting
-state_dict keys are chosen by config rather than by position. The legacy wrapper classes
-pass the names the hand-written modules used (`net`, `vt0_net`, `coeff_net`), which is
-what lets checkpoints trained before this refactor load unchanged -- a ModuleList would
-have produced `nets.0.*` and silently broken every existing checkpoint.
+Branches exist so each output gets its own omega_0 / depth / width, i.e. its own spatial
+bandwidth. `*_grad_frob` is not a branch: SirenTV.forward differentiates an output w.r.t. position.
+Each branch is a submodule under its config `name`, so state_dict keys come from the config;
+the wrappers use the legacy names (`net`, `vt0_net`, `coeff_net`) to keep old checkpoints loading.
 """
 
 from __future__ import annotations
@@ -49,11 +24,7 @@ from sirentv.models import MODELS
 
 
 def _as_list(value, n):
-    """Broadcast a scalar to a list of length n; pass a list through, padding by repeat.
-
-    Keeps the legacy wrappers backward compatible: every existing config may give either
-    a bare scalar (applies to all branches) or a per-branch list.
-    """
+    """Broadcast a scalar to length n; pad a shorter list by repeating its last entry."""
     if isinstance(value, (int, float)):
         return [value] * n
     value = list(value)
@@ -70,17 +41,11 @@ class MultiBranchSiren(nn.Module):
         keys             : [str]     output names this branch emits, in slice order
         name             : str       submodule name (default "branch{i}")
         out_widths       : {k: int}  override a key's output width
-        hidden_features  : int       defaults to the top-level value
-        hidden_layers    : int       defaults to the top-level value
-        first_omega_0    : float     defaults to the top-level value
-        hidden_omega_0   : float     defaults to the top-level value
-        outermost_linear : bool      defaults to the top-level value
+        init_output_bias : {k: float} or float, starting bias of the final layer per key
+        hidden_features / hidden_layers / first_omega_0 / hidden_omega_0 / outermost_linear:
+                           per-branch overrides of the top-level values
 
-    The top-level hidden_features/hidden_layers/first_omega_0/hidden_omega_0 act as
-    defaults for branches that do not set their own. Output widths default to 1 for
-    `v`/`t0`, `n_components` for `coeffs` and `n_quantile` for `quantiles`; both
-    representation keys are handled the same way, so a topology written for one works for
-    the other by swapping that key.
+    Output widths default to 1 for `v`/`t0`, `n_components` for `coeffs`, `n_quantile` for `quantiles`.
     """
 
     def __init__(
@@ -121,8 +86,6 @@ class MultiBranchSiren(nn.Module):
             keys = list(spec["keys"])
             if not keys:
                 raise ValueError(f"branch {i} has an empty `keys` list")
-            # A key emitted by two branches would make the output dict order-dependent and
-            # silently drop one of them, so reject it rather than pick a winner.
             dup = seen.intersection(keys)
             if dup:
                 raise ValueError(
@@ -154,42 +117,22 @@ class MultiBranchSiren(nn.Module):
                 spec.get("first_omega_0", first_omega_0),
                 spec.get("hidden_omega_0", hidden_omega_0),
             )
-            # Optional per-key starting offset for this branch's output.
-            #
-            # Why this exists: WeightedPoissonNLLLoss does clamp(inv_xform(pred), min=eps),
-            # and torch.clamp has EXACTLY ZERO gradient below its min. A SIREN's initial
-            # output is centred near 0 with std ~0.01-0.06, and inv_xform maps that straight
-            # onto (or below) eps=1e-8 -- inv_xform(0.00) = 0 and inv_xform(-0.05) is
-            # NEGATIVE. So the v branch can start with every entry in the dead zone, receive
-            # no gradient at all, and sit at the loss floor forever. Measured: 3 of 4 seeds
-            # dead, including seed 0. The 3-branch runs only escaped because they were
-            # unseeded and drew a live init.
-            #
-            # Setting the final bias to roughly the target mean starts the output inside the
-            # live region for ANY seed, and additionally removes the "climb to the target
-            # mean" phase that would otherwise dominate an early-epoch convergence
-            # comparison. Left unset, nothing changes.
+            # Why init_output_bias exists: the Poisson loss clamps inv_xform(pred) at eps, and
+            # clamp has zero gradient below it. A SIREN starts near 0, which inv_xform maps
+            # onto/below eps, so v can start dead and never train (3 of 4 seeds measured).
+            # A bias near the target mean starts it in the live region for any seed.
             self._init_output_bias(net, name, spec.get("init_output_bias"), keys, widths)
-            # add_module rather than a ModuleList: the submodule name (and therefore every
-            # state_dict key) comes from the spec, which is what keeps the legacy wrappers
-            # checkpoint-compatible.
             self.add_module(name, net)
             self._branch_names.append(name)
             self._branch_keys.append(keys)
             self._branch_widths.append(widths)
 
-        # Consumed only for the output_scale length assertion and n_outs (see
-        # SirenTV.out_features), both of which care about the total, not the split.
+        # only the total matters (output_scale length check, n_outs)
         self.out_features = [sum(w) for w in self._branch_widths]
 
     @staticmethod
     def _init_output_bias(net, branch_name, bias_spec, keys, widths):
-        """Set the final layer's bias per OUTPUT KEY, in the same slice order forward uses.
-
-        bias_spec is a {key: value} mapping, so a branch emitting several keys can offset
-        them independently and any key left out keeps slar's default init. A bare scalar is
-        accepted too and applies to every key this branch emits.
-        """
+        """Set the final layer's bias per output key ({key: value}, or a scalar for every key)."""
         if bias_spec is None:
             return
         if isinstance(bias_spec, (int, float)):
@@ -201,8 +144,7 @@ class MultiBranchSiren(nn.Module):
                 f"branch does not emit (it emits {keys})"
             )
 
-        # outermost_linear=True gives a bare nn.Linear; otherwise the last entry is a
-        # SineLayer wrapping one. Reaching through .linear covers both.
+        # outermost_linear=True gives a bare nn.Linear, otherwise a SineLayer wrapping one
         final = net.net[-1]
         linear = final if isinstance(final, nn.Linear) else getattr(final, "linear", None)
         if linear is None or linear.bias is None:
@@ -220,7 +162,7 @@ class MultiBranchSiren(nn.Module):
 
     @property
     def branch_topology(self):
-        """[(name, keys)] -- handy for logging which topology a run actually built."""
+        """[(name, keys)] of the built branches."""
         return list(zip(self._branch_names, self._branch_keys))
 
     def forward(self, x, *args, **kwargs):
@@ -232,8 +174,7 @@ class MultiBranchSiren(nn.Module):
             offset = 0
             for key, width in zip(keys, widths):
                 chunk = y[..., offset:offset + width]
-                # scalar outputs are (B, N_pmt), matching what the losses and the dataset
-                # targets expect -- not (B, N_pmt, 1)
+                # scalar outputs are (B, N_pmt), like the targets
                 out[key] = chunk.squeeze(-1) if width == 1 else chunk
                 offset += width
         return out

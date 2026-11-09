@@ -7,26 +7,14 @@ from sirentv.loss.builder import LOSSES
 
 @LOSSES.register_module()
 class WeightedReconstructedQuantileLoss(nn.Module):
-    """
-    Weighted L2 on a quantile-function-domain target, with a per-bin weight proportional to the
-    local density of the TARGET's own adjacent-bin spacing (f(Q(u)) ~ 1/spacing), raised to
-    `power`. This is a purely physical-importance weight -- fast-rising, information-dense
-    regions of the waveform matter more -- not a confidence weight: there is deliberately no N
-    (photon count) or u(1-u) factor here, since photon-count confidence is handled entirely by
-    the separate visibility (Poisson NLL) loss.
+    """L2 in quantile-function space, each bin weighted by the target's local density (1/spacing)**power.
 
-    If pca_mean/pca_components are given, pred[key]/target[key] are treated as PCA coefficients
-    and reconstructed into quantile-function space (mean + coeffs @ components, in whatever
-    domain the basis itself was fit in -- e.g. log-quantile -- no extra inverse transform)
-    before the weight and loss are computed. This is what makes the same loss usable for both:
-      - PCA-coefficient supervision: key="coeffs", pca_mean/pca_components given.
-      - Direct quantile-function supervision: key="quantiles", no basis -- pred/target are
-        already in quantile-function space, so this reduces to plain density-weighted L2.
-
-    The density weight is detached and computed from the target only (a fixed importance
-    multiplier reflecting the true physical signal, not the model's current prediction), and
-    normalized to a mean of 1.0 per sample so the overall loss magnitude stays comparable to an
-    unweighted baseline.
+    The weight is physical importance (fast-rising parts of the waveform), not photon-count
+    confidence, which the visibility loss handles. It is detached, computed from the target
+    only, and normalized to mean 1 per sample.
+    With pca_mean/pca_components, pred[key]/target[key] are PCA coefficients and are first
+    reconstructed (mean + coeffs @ components, in the basis' own domain); coeff_mean/coeff_std
+    undo normalize_coeffs first. Without a basis, key="quantiles" is used directly.
     """
 
     def __init__(
@@ -52,9 +40,6 @@ class WeightedReconstructedQuantileLoss(nn.Module):
         self.eps = float(eps)
         self.pca_mean = pca_mean
         self.pca_components = pca_components
-        # only needed/used when normalize_coeffs is on for this run -- pred[key]/target[key]
-        # are then NORMALIZED coefficients ((raw - mean)/std), which must be denormalized back
-        # to raw scale before reconstruct_aligned_raw's mean + coeffs @ components is valid
         self.coeff_mean = coeff_mean
         self.coeff_std = coeff_std
 
@@ -96,14 +81,7 @@ class WeightedReconstructedQuantileLoss(nn.Module):
         else:
             w = weight.get(self.key, 1.0) if isinstance(weight, dict) else weight
             if isinstance(w, torch.Tensor) and self.pca_mean is not None and w.shape[-1] != pred_time.shape[-1]:
-                # a per-sample weight for `key` (e.g. coeffs_weight, from normalize_coeffs /
-                # coeff_weight_power) is defined in the PRE-reconstruction, per-component space
-                # -- it can't be validly applied to the RECONSTRUCTED per-bin quantity, so
-                # ignore it here rather than silently broadcasting into the wrong thing (or
-                # crashing). Component-space reweighting and reconstruction-space density
-                # weighting are two different axes that were never meant to combine -- this
-                # loss is specifically the "replace coefficient-space weighting with bin-space
-                # density weighting" design, not an addition to it.
+                # a per-component coefficient weight has no meaning per reconstructed bin
                 sample_weight = torch.ones_like(pred_time)
             else:
                 sample_weight = w.to(device) if isinstance(w, torch.Tensor) else torch.full_like(pred_time, w)

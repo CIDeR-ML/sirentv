@@ -1,15 +1,18 @@
-import os
-from functools import partial
 import glob
+import importlib
+import os
+from abc import ABC, abstractmethod
+from functools import partial
+
 import numpy as np
 import torch
 
-import importlib
-from abc import ABC, abstractmethod
-
 wandb = None
 
+
 class Logger(ABC):
+    """Base: logdir handling and the logger.analysis metric functions (from sirentv.analysis)."""
+
     @abstractmethod
     def record(self, keys: list, vals: list):
         pass
@@ -26,43 +29,82 @@ class Logger(ABC):
     def write(self):
         pass
 
+    @property
+    def log_every_nsteps(self):
+        return self._log_every_nsteps
+
+    @property
+    def logfile(self):
+        return self._logfile
+
+    @property
+    def logdir(self):
+        return self._logdir
+
+    def _init_logdir(self, cfg, log_cfg):
+        """rank 0: create run_dir/dir_name/version-XX; other ranks get None."""
+        if self.rank != 0:
+            self._logdir = self._logfile = None
+            return
+        dir_name = log_cfg.get("dir_name", "logs")
+        if not os.path.isabs(dir_name):
+            dir_name = os.path.join(log_cfg.get("run_dir", "./"), dir_name)
+        self._logdir = self.make_logdir(dir_name)
+        self._logfile = os.path.join(self._logdir, cfg.get("file_name", "log.csv"))
+
+    @staticmethod
+    def make_logdir(dir_name):
+        """Create and return dir_name/version-XX, XX one above the highest existing version."""
+        versions = [
+            int(d.split("-")[-1])
+            for d in glob.glob(os.path.join(dir_name, "version-[0-9]*"))
+        ]
+        ver = max(versions) + 1 if versions else 0
+        logdir = os.path.join(dir_name, "version-%02d" % ver)
+        os.makedirs(logdir)
+        return logdir
+
+    def _init_analysis(self, log_cfg, tag):
+        """{func_suffix: partial(sirentv.analysis.func, **kwargs)} from logger.analysis, rank 0 only.
+
+        Entries are a list of {func, suffix, **kwargs} or a {func: kwargs} dict. The config
+        itself is left untouched, so the saved train_cfg.yaml stays runnable.
+        """
+        self._analysis_dict = {}
+        if self.rank != 0:
+            return
+        analysis_cfg = log_cfg.get("analysis", [])
+        if isinstance(analysis_cfg, dict):
+            analysis_cfg = [{"func": k, **v} for k, v in analysis_cfg.items()]
+        for item in analysis_cfg:
+            item = dict(item)
+            func = item.pop("func")
+            suffix = item.pop("suffix", "")
+            if suffix:
+                suffix = f"_{suffix}"
+            print(f"[{tag}] adding analysis function:", func + suffix)
+            self._analysis_dict[func + suffix] = partial(
+                getattr(importlib.import_module("sirentv.analysis"), func), **item
+            )
+
+    def record(self, keys: list, vals: list):
+        """Register key/value pairs for the next write (rank 0 only)."""
+        if self.rank == 0:
+            for key, val in zip(keys, vals):
+                self._dict[key] = val
+
 
 class WandbLogger(Logger):
-    """
-    Logger class to log training progress using Weights & Biases (wandb).
-    """
+    """Logs to Weights & Biases (logger.project / name / entity), on rank 0."""
 
     def __init__(self, cfg, rank=0):
-        """
-        Constructor
-
-        Parameters
-        ----------
-        cfg : dict
-            A collection of configuration parameters. 'project' and 'name' specify
-            the wandb project and run name respectively.
-        rank : int
-            Global rank of this process
-        """
         self.rank = rank
-
         log_cfg = cfg.get("logger", dict())
         self.project = log_cfg.get("project", "default-project")
         self.name = log_cfg.get("name", None)
         self.entity = log_cfg.get("entity", None)
         self._log_every_nsteps = log_cfg.get("log_every_nsteps", 1)
-
-        if self.rank == 0:
-            run_dir = log_cfg.get("run_dir", "./")
-            dir_name = log_cfg.get("dir_name", "logs")
-            if not os.path.isabs(dir_name):
-                dir_name = os.path.join(run_dir, dir_name)
-            self._logdir = self.make_logdir(dir_name)
-            self._wandb_rundir = run_dir
-            self._logfile = os.path.join(self._logdir, cfg.get("file_name", "log.csv"))
-        else:
-            self._logdir = None
-            self._logfile = None
+        self._init_logdir(cfg, log_cfg)
 
         if self.rank == 0:
             global wandb
@@ -70,75 +112,25 @@ class WandbLogger(Logger):
                 import wandb
             wandb.require("core")
 
-            # Initialize wandb
-            proj_cfg = dict(
-                project=self.project,
-                name=self.name,
-                config=cfg,
-            )
+            proj_cfg = dict(project=self.project, name=self.name, config=cfg)
             if self.entity:
                 proj_cfg["entity"] = self.entity
-            wandb.init(**proj_cfg, dir=self._wandb_rundir, settings=wandb.Settings(start_method="fork"))
+            wandb.init(**proj_cfg, dir=log_cfg.get("run_dir", "./"), settings=wandb.Settings(start_method="fork"))
             self.wandb = wandb
             print(f"[WandbLogger] Initialized wandb project: {self.project}")
         else:
             self.wandb = None
 
         self._dict = {}
-        self._analysis_dict = {}
-
-        for kwargs in log_cfg.get("analysis", []):
-            func = kwargs.pop("func", "")
-            suffix = kwargs.pop("suffix", "")
-            if suffix:
-                suffix = f"_{suffix}"
-            if self.rank == 0:
-                print("[WandbLogger] adding analysis function:", func+suffix)
-
-            self._analysis_dict[func + suffix] = partial(
-                getattr(importlib.import_module("sirentv.analysis"), func), **kwargs
-            )
-
-    def record(self, keys: list, vals: list):
-        """
-        Function to register key-value pair to be logged.
-        Only rank 0 actually records.
-
-        Parameters
-        ----------
-        keys : list
-            A list of parameter names to be logged.
-
-        vals : list
-            A list of parameter values to be logged.
-        """
-        if self.rank == 0:
-            for i, key in enumerate(keys):
-                self._dict[key] = vals[i]
+        self._init_analysis(log_cfg, "WandbLogger")
 
     def commit(self, iteration):
-        """Commit all pending logs to wandb"""
+        """Commit all pending logs to wandb."""
         if iteration % self._log_every_nsteps == 0 and self.wandb is not None:
             self.wandb.log({}, step=iteration, commit=True)
 
     def step(self, iteration, label=None, pred=None):
-        """
-        Function to take an iteration step during training/inference. If this step is
-        subject for logging, this function logs the parameters registered through the record function.
-        Per-rank analysis logging.
-
-        Parameters
-        ----------
-        iteration : int
-            The current iteration for the step. If it's not modulo the specified steps to
-            record a log, the function does nothing.
-
-        label : torch.Tensor
-            The target values (labels) for the model run for training/inference.
-
-        pred : torch.Tensor
-            The predicted values from the model run for training/inference.
-        """
+        """Every log_every_nsteps: log the analysis metrics of (label, pred), then write."""
         if iteration == 0 or iteration % self._log_every_nsteps != 0:
             return
 
@@ -162,18 +154,7 @@ class WandbLogger(Logger):
         self.write()
 
     def plot(self, iteration, inferred: dict):
-        """
-        Log a plot of x vs y at the given iteration.
-
-        Parameters
-        ----------
-        iteration : int
-            Training iteration or epozch.
-        inferred : dict[torch.Tensor]
-        kind : str
-            Type of plot: "line" or "scatter" (default).
-        """
-
+        """Log visibility / PDF / CDF figures of an infer_fn output (x_value, visibility, pdf, cdf[, t0, position])."""
         if self.rank != 0 or inferred is None:
             return
 
@@ -186,19 +167,12 @@ class WandbLogger(Logger):
             'pdf': inferred['pdf'].detach().cpu(),
             'cdf': inferred['cdf'].detach().cpu(),
         }
-        if 'position' in inferred and inferred['position'] is not None:
-            data['position'] = inferred['position'].detach().cpu()
-        else:
-            data['position'] = None
-        if 't0' in inferred and inferred['t0'] is not None:
-            data['t0'] = inferred['t0'].detach().cpu()
-        else:
-            data['t0'] = None
+        data['position'] = inferred['position'].detach().cpu() if inferred.get('position') is not None else None
+        data['t0'] = inferred['t0'].detach().cpu() if inferred.get('t0') is not None else None
 
         import matplotlib.pyplot as plt
         from matplotlib.gridspec import GridSpec
 
-        # Build subtitle from position
         subtitle = ""
         if data['position'] is not None:
             pos = data['position'].numpy()
@@ -214,16 +188,11 @@ class WandbLogger(Logger):
         v_pred = visibility[:, 1]
         pos_mask = (v_target > 0) & (v_pred > 0)
         if not pos_mask.any():
-            # v_target is fixed ground truth for this diagnostic voxel, so this can only mean
-            # v_pred is non-positive (or NaN, which also fails ">0") for EVERY PMT here -- a
-            # real, worth-knowing-about model issue, but this plot is a monitoring aid, not the
-            # training loop itself: crashing the whole run (and losing everything trained so
-            # far) over a diagnostic plot failing is strictly worse than just skipping this one
-            # plot and letting training continue.
+            # a monitoring plot must never crash the run: skip it and say why
             print(f"[WandbLogger.plot] iteration {iteration}: skipping visibility plot, "
                   f"no (target, pred) pair is both positive (v_pred range "
                   f"[{np.nanmin(v_pred):.3g}, {np.nanmax(v_pred):.3g}] -- check for NaN/collapse)")
-            ax.set_title(f"PMT Visibility (skipped: v_pred non-positive/NaN for every PMT)")
+            ax.set_title("PMT Visibility (skipped: v_pred non-positive/NaN for every PMT)")
         else:
             ax.scatter(v_target[pos_mask], v_pred[pos_mask], s=10, alpha=0.6, zorder=3)
 
@@ -236,7 +205,7 @@ class WandbLogger(Logger):
                 upper = t_line * (2 + b) / (2 - b)
                 lower = t_line * (2 - b) / (2 + b)
                 ax.fill_between(t_line, lower, upper, alpha=0.10, color=color,
-                                label=f"\u00b1{bias_pct}% bias")
+                                label=f"±{bias_pct}% bias")
             ax.set_xscale("log")
             ax.set_yscale("log")
             ax.set_xlim(vmin, vmax)
@@ -316,78 +285,22 @@ class WandbLogger(Logger):
         plt.close(fig_pdf)
         plt.close(fig_cdf)
 
-
     def close(self):
-        """
-        Finish the wandb run.
-        """
         if self.wandb is not None:
             self.wandb.finish()
 
     def write(self):
-        """
-        Log the key-value pairs provided through the record function to wandb.
-        """
+        """Send the recorded key/value pairs to wandb (uncommitted)."""
         if self.wandb is not None:
             self.wandb.log(self._dict, commit=False)
-            self._dict = {}  # Clear dict after logging
+            self._dict = {}
 
     def save(self, path):
-        """
-        Save the wandb run to a file.
-        """
         if self.wandb is not None:
             self.wandb.save(path)
 
-    @property
-    def logfile(self):
-        return self._logfile
-
-    @property
-    def logdir(self):
-        return self._logdir
-
-    def make_logdir(self, dir_name):
-        """
-        Create a log directory
-
-        Parameters
-        ----------
-        dir_name : str
-            The directory name for a log file. There will be a sub-directory named version-XX where XX is
-            the lowest integer such that a subdirectory does not yet exist.
-
-        Returns
-        -------
-        str
-            The created log directory path.
-        """
-        versions = [
-            int(d.split("-")[-1])
-            for d in glob.glob(os.path.join(dir_name, "version-[0-9]*"))
-        ]
-        ver = 0
-        if len(versions):
-            ver = max(versions) + 1
-        logdir = os.path.join(dir_name, "version-%02d" % ver)
-        os.makedirs(logdir)
-
-        return logdir
-    
     def log_grad_norms(self, iteration, net, norm_type=2.0, log_per_layer=False):
-        """Log gradient norms to wandb. Call after backward() on rank 0 only.
-
-        Parameters
-        ----------
-        iteration : int
-            Current training iteration.
-        net : nn.Module
-            The model (unwrapped, not DDP wrapper).
-        norm_type : float
-            Norm type (default 2.0 for L2).
-        log_per_layer : bool
-            If True, also log per-layer gradient norms.
-        """
+        """Log the total (and optionally per-parameter) gradient norm of the unwrapped net, after backward()."""
         if self.wandb is None:
             return
 
@@ -409,180 +322,56 @@ class WandbLogger(Logger):
             for name, param in net.named_parameters():
                 if param.grad is not None:
                     grad_norm = torch.norm(param.grad, norm_type)
-                    clean_name = name.replace('.', '/')
-                    log_dict[f"grad_norm/layers/{clean_name}"] = grad_norm.item()
+                    log_dict[f"grad_norm/layers/{name.replace('.', '/')}"] = grad_norm.item()
 
         self.wandb.log(log_dict, step=iteration, commit=False)
 
+
 class CSVLogger(Logger):
-    """
-    Logger class to store training progress in a CSV file.
-    """
+    """Writes the recorded values to run_dir/dir_name/version-XX/file_name, on rank 0."""
 
     def __init__(self, cfg, rank=0):
-        """
-        Constructor
-
-        Parameters
-        ----------
-        cfg : dict
-            A collection of configuration parameters. `dir_name` and `file_name` specify
-            the output log file location. `analysis` specifies analysis function(s) to be
-            created from the analysis module and run during the training.
-        rank : int
-            Global rank of this process
-        """
-
         self.rank = rank
-
         log_cfg = cfg.get("logger", dict())
         self._log_every_nsteps = log_cfg.get("log_every_nsteps", 10)
+        self._init_logdir(cfg, log_cfg)
         if self.rank == 0:
-            run_dir = log_cfg.get("run_dir", "./")
-            dir_name = log_cfg.get("dir_name", "logs")
-            if not os.path.isabs(dir_name):
-                dir_name = os.path.join(run_dir, dir_name)
-            self._logdir = self.make_logdir(dir_name)
-            self._logfile = os.path.join(self._logdir, cfg.get("file_name", "log.csv"))
             print("[CSVLogger] output log directory:", self._logdir)
             print(f"[CSVLogger] recording a log every {self._log_every_nsteps} steps")
-        else:
-            self._logdir = None
-            self._logfile = None
 
         self._fout = None
         self._str = None
         self._dict = {}
-        self._analysis_dict = {}
-
-        if self.rank == 0:
-            analysis_cfg = log_cfg.get("analysis", [])
-            if isinstance(analysis_cfg, dict):
-                analysis_cfg = [{"func": k, **v} for k, v in analysis_cfg.items()]
-            for item in analysis_cfg:
-                item = dict(item)
-                key = item.pop("func")
-                print("[CSVLogger] adding analysis function:", key)
-                suffix = item.pop("suffix", "")
-                if suffix:
-                    suffix = f"_{suffix}"
-                self._analysis_dict[key + suffix] = partial(
-                    getattr(importlib.import_module("sirentv.analysis"), key), **item
-                )
-
-    @property
-    def logfile(self):
-        return self._logfile
-
-    @property
-    def logdir(self):
-        return self._logdir
-
-    def make_logdir(self, dir_name):
-        """
-        Create a log directory
-
-        Parameters
-        ----------
-        dir_name : str
-            The directory name for a log file. There will be a sub-directory named version-XX where XX is
-            the lowest integer such that a subdirectory does not yet exist.
-
-        Returns
-        -------
-        str
-            The created log directory path.
-        """
-        versions = [
-            int(d.split("-")[-1])
-            for d in glob.glob(os.path.join(dir_name, "version-[0-9]*"))
-        ]
-        ver = 0
-        if len(versions):
-            ver = max(versions) + 1
-        logdir = os.path.join(dir_name, "version-%02d" % ver)
-        os.makedirs(logdir)
-
-        return logdir
-
-    def record(self, keys: list, vals: list):
-        """
-        Function to register key-value pair to be stored
-
-        Parameters
-        ----------
-        keys : list
-            A list of parameter names to be stored in a log file.
-
-        vals : list
-            A list of parameter values to be stored in a log file.
-        """
-        if self.rank == 0:
-            for i, key in enumerate(keys):
-                self._dict[key] = vals[i]
+        self._init_analysis(log_cfg, "CSVLogger")
 
     def step(self, iteration, label=None, pred=None):
-        """
-        Function to take a iteration step during training/inference. If this step is
-        subject for logging, this function 1) runs analysis methods and 2) write the
-        parameters registered through the record function to an output log file.
-
-        Parameters
-        ----------
-        iteration : int
-            The current iteration for the step. If it's not modulo the specified steps to
-            record a log, the function does nothing.
-
-        label : torch.Tensor
-            The target values (labels) for the model run for training/inference.
-
-        pred : torch.Tensor
-            The predicted values from the model run for training/inference.
-
-        """
+        """Every log_every_nsteps: record the analysis metrics of (label, pred), then write."""
         if self.rank != 0:
             return
 
         if not iteration % self._log_every_nsteps == 0:
             return
 
-        if not None in (label, pred):
+        if None not in (label, pred):
             for key, f in self._analysis_dict.items():
                 self.record([key], [f(label, pred)])
         self.write()
 
     def write(self):
-        """
-        Function to write the key-value pairs provided through the record function
-        to an output log file.
-        """
+        """Append one row (the header comes from the first write's keys)."""
         if self.rank != 0:
             return
         if self._str is None:
             self._fout = open(self._logfile, "w")
-            self._str = ""
-            for i, key in enumerate(self._dict.keys()):
-                if i:
-                    self._fout.write(",")
-                    self._str += ","
-                self._fout.write(key)
-                self._str += "{:f}"
-            self._fout.write("\n")
-            self._str += "\n"
+            self._fout.write(",".join(self._dict.keys()) + "\n")
+            self._str = ",".join(["{:.4e}"] * len(self._dict)) + "\n"
         self._fout.write(self._str.format(*(self._dict.values())))
         self.flush()
 
     def flush(self):
-        """
-        Flush the output file stream.
-        """
         if self._fout:
             self._fout.flush()
 
     def close(self):
-        """
-        Close the output file.
-        """
         if self._str is not None:
             self._fout.close()
-
