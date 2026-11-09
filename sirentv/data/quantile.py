@@ -391,6 +391,15 @@ class QuantilePLibDataset(Dataset):
             indices = all_idx[::subsample_factor]
         else:
             indices = torch.arange(effective, dtype=torch.long)
+        # data.x_min [mm]: keep only voxels with x >= x_min, e.g. -2160 for the active TPC volume
+        # (the LUT grid runs past the PMT plane at x = -2170 mm). Unset = every voxel.
+        x_min = data_cfg.get("x_min")
+        if x_min is not None:
+            keep = torch.from_numpy(self._quantile_plib.pos[indices.numpy(), 0] >= float(x_min))
+            if rank == 0:
+                print(f"[QuantilePLibDataset] data.x_min = {float(x_min):g} mm: keeping "
+                      f"{int(keep.sum())} of {len(indices)} voxels")
+            indices = indices[keep]
 
         self.indices = indices
 

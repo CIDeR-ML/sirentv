@@ -440,6 +440,8 @@ def evaluate_pca(
                 "pmt_pos": torch.as_tensor(cplib.pmt_pos, dtype=torch.float32).cpu(),
                 "n_quantile": n_quantile,
                 "n_positions": all_pred_vis_tensor.shape[0],
+                # data.x_min the voxels were cut at [mm]; None = every LUT voxel
+                "x_min": cfg.get("data", {}).get("x_min"),
                 "normalize_coeffs": normalize_coeffs,
                 "threshold": threshold,
                 # the n_photon used to normalize target visibility (vis_raw / n_photon) --

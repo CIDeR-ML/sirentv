@@ -382,6 +382,8 @@ def evaluate_quantile(
                 "threshold": threshold,
                 "pmt_pos": torch.as_tensor(qlib.pmt_pos, dtype=torch.float32).cpu(),
                 "wall_ranges": qlib.meta.ranges.cpu(),
+                # data.x_min the voxels were cut at [mm]; None = every LUT voxel
+                "x_min": cfg.get("data", {}).get("x_min"),
             },
         }
 

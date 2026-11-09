@@ -419,6 +419,12 @@ def main():
              "this, any grad-supervised config picks its cache up automatically and pays for "
              "spectra you may not want. The v/t0/representation spectra are unaffected.",
     )
+    parser.add_argument(
+        "--x-min", type=float, default=None,
+        help="Evaluate only voxels with x >= this [mm] (sets data.x_min), e.g. -2160 for the "
+             "active TPC volume, leaving out the LUT voxels behind the PMT plane. Every "
+             "statistic, per-voxel array, spatial slice and spectrum then covers just those voxels.",
+    )
     args = parser.parse_args()
 
     # Check if running in distributed mode (torchrun sets these env vars)
@@ -447,6 +453,8 @@ def main():
 
     with open(args.config, "r") as f:
         cfg = yaml.safe_load(f)
+    if args.x_min is not None:
+        cfg.setdefault("data", {})["x_min"] = args.x_min
 
     # Resolved once: an explicit --grad-cache wins, the config's own cache is the fallback,
     # and --no-grad-spectra suppresses both. Passing None is what the evaluators read as
