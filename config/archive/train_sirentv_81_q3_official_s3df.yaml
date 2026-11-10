@@ -1,0 +1,128 @@
+data:
+  dataset:
+    type: QuantilePLibDataset
+  loader:
+    batch_size: 256
+    drop_last: true
+    load_pos: true
+    num_workers: 16
+    pin_memory: true
+    prefetch_factor: 4
+    shuffle: true
+  n_pmt: 81
+  target_keys:
+  - v
+  - t0
+  - quantiles
+  weight:
+    quantiles:
+      enable: false
+    t0:
+      enable: false
+    v:
+      enable: true
+      factor: 5000.0
+      threshold: 1.0e-08
+debug_timing: false
+device:
+  type: cuda
+logger:
+  analysis:
+  - key: v_linear
+    threshold: 1.0e-06
+  - key: t0
+    signed: true
+    threshold: 0.01
+  dir_name: logs_train_sirentv_81_q3_official
+  entity: junjiex-stanford-university
+  file_name: log.csv
+  grad_norm:
+    enabled: true
+    log_frequency: 77
+    log_per_layer: true
+  infer_fn:
+    type: QuantileInfer
+  log_every_nsteps: 77
+  name: train_sirentv_81_q3_official
+  project: sirentv_production
+  run_dir: /sdf/data/neutrino/junjie/SIREN/cider-ml/logs
+  type: wandb
+model:
+  ckpt_file: null
+  mode: quantile_cdf
+  network:
+    branches:
+    - first_omega_0: 30.0
+      hidden_features: 256
+      hidden_layers: 9
+      hidden_omega_0: 30.0
+      init_output_bias:
+        v: 0.57
+      keys:
+      - v
+      name: v_net
+    - first_omega_0: 15.0
+      hidden_features: 256
+      hidden_layers: 9
+      hidden_omega_0: 15.0
+      keys:
+      - t0
+      name: t0_net
+    - first_omega_0: 120.0
+      hidden_features: 512
+      hidden_layers: 6
+      hidden_omega_0: 120.0
+      keys:
+      - quantiles
+      name: quantile_net
+    in_features: 6
+    n_quantile: 256
+    outermost_linear: true
+    type: MultiBranchSiren
+    use_CDF: false
+    xform_vis: &id001
+      eps: 1.0e-08
+      sin_out: false
+      vmax: 1.0
+  output_scale:
+    fix: true
+photonlib:
+  combine_every_quantile: 2
+  device: cpu
+  filepath: /sdf/data/neutrino/pubdata/lut/optical/consolidated/full_wvfm_plib_b05_quantile_prod_lite_fixed.h5
+  lazy: true
+  mode: log_quantile
+  n_photon: 3.0e7
+physics:
+  R_index: 1.233
+train:
+  clip_grad:
+    quantile_net: 1.0
+    t0_net: 1.0
+    v_net: 1.0
+  loss:
+  - key: quantiles
+    mask_key: quantiles_mask
+    type: WeightedL2Loss
+    weight: 1.0
+  - key: v
+    type: WeightedPoissonNLLLoss
+    weight: 1.0e-07
+  - key: t0
+    type: SmoothL1Loss
+    weight: 1.0
+  max_epochs: 600
+  optimizer_class: AdamW
+  optimizer_param:
+    lr: 1.0e-05
+  reduction: sum
+  regularization: null
+  resume: true
+  save_every_epochs: 100
+  save_every_iterations: -1
+  scheduler_class: CosineAnnealingLR
+  scheduler_param:
+    T_max: 2000
+    eta_min: 1.0e-07
+  seed: 0
+transform_vis: *id001

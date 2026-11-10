@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+os.environ.setdefault("MPLBACKEND", "Agg")
+
 import time
 from contextlib import nullcontext
 
@@ -17,46 +19,77 @@ from sirentv.training.utils import (
     backward_step,
     build_logger,
     build_losses,
-    build_regularizer,
     build_weight_fn,
     compute_loss,
+    resolve_config,
     unwrap_net,
 )
 from sirentv.utils.comm import create_ddp_model
 from sirentv.utils.log import WandbLogger
 
 
-def train(cfg: dict):
-    """
-    Unified training loop for all SirenTV modes (waveform, PCA, etc.).
+def _sync():
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
 
-    The loop is 100% generic — mode-specific behavior is resolved at setup time
-    via config-driven registries for datasets, models, losses, and inference.
+
+def _grad_supervision_warmup(train_cfg):
+    """train.grad_supervision_keys as {key: start}: a list means start at 0, a dict gives per-key starts.
+
+    A start delay matters for coeffs/quantiles: the aggregate estimator weights by the model's
+    own predicted visibility, which is meaningless until v has trained.
     """
-    # --- Distributed setup ---
+    keys_cfg = train_cfg.get("grad_supervision_keys", [])
+    if isinstance(keys_cfg, dict):
+        return {k: int(v) for k, v in keys_cfg.items()}
+    return {k: 0 for k in keys_cfg}
+
+
+def train(cfg: dict):
+    """Training loop shared by every mode; datasets, models, losses and inference come from the config."""
     rank = dist.get_rank() if dist.is_initialized() else 0
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     is_distributed = world_size > 1
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    DEVICE = torch.device(f"cuda:{local_rank}") if torch.cuda.is_available() else torch.device("cpu")
 
-    if torch.cuda.is_available():
-        DEVICE = torch.device(f"cuda:{local_rank}")
-    else:
-        DEVICE = torch.device("cpu")
+    # "high" = TF32 matmuls (fast on A100); "highest" = strict fp32. Runs are not bit-comparable across settings.
+    matmul_precision = cfg.get("device", {}).get("matmul_precision", "high")
+    torch.set_float32_matmul_precision(matmul_precision)
+    if rank == 0:
+        print(f"[train] float32 matmul precision: {matmul_precision}")
 
     iteration_ctr = 0
     epoch_ctr = 0
 
-    # --- Model ---
+    # train.seed unset = unseeded weight init
+    seed = cfg.get("train", {}).get("seed")
+    if seed is not None:
+        import random
+
+        import numpy as np
+
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        if rank == 0:
+            print(f"[train] seed set to {seed}")
+
     net = SirenTV(cfg).to(DEVICE)
     if is_distributed:
         net = create_ddp_model(net, device_ids=[local_rank])
-    net = torch.compile(net)
 
-    # --- Data (registry-based, config-driven) ---
+    train_cfg = cfg.get("train", {})
+    if train_cfg.get("grad_supervision_keys", []):
+        if rank == 0:
+            print("[train] grad_supervision_keys configured -- skipping torch.compile "
+                  "(AOTAutograd does not support the double backward it needs)")
+    else:
+        net = torch.compile(net)
+
     dl = create_dataloader(cfg, rank=rank, world_size=world_size)
 
-    # --- Optimizer ---
     opt, sch, epoch = optimizer_factory(
         list(p for p in net.parameters() if p.requires_grad), cfg
     )
@@ -65,24 +98,25 @@ def train(cfg: dict):
         epoch_ctr = int(epoch)
         if rank == 0:
             print(f"[train] resuming from iteration {iteration_ctr}, epoch {epoch_ctr}")
+        # restore the lr the scheduler implies at this epoch
+        if sch is not None:
+            restored = sch.get_last_lr()
+            for group, lr in zip(opt.param_groups, restored):
+                group["lr"] = lr
+            if rank == 0:
+                print(f"[train] restored scheduler lr: {restored}")
 
-    # --- Losses, regularizer, logger (all config-driven) ---
     loss_fns = build_losses(cfg)
-    regularizer = build_regularizer(cfg)
     logger = build_logger(cfg, net, rank=rank)
     weight_fn = build_weight_fn(cfg)
-
-    # --- Inference/plotting (registry-based, config-driven) ---
     infer = build_infer_fn(cfg, net, dl, DEVICE)
 
-    # --- Save config ---
     if rank == 0:
         with open(os.path.join(logger.logdir, "train_cfg.yaml"), "w") as f:
             yaml.safe_dump(cfg, f)
 
-    # --- Training hyperparameters ---
-    train_cfg = cfg.get("train", {})
-    epoch_max = train_cfg.get("max_epochs", int(1e20))
+    # max_epochs counts epochs in THIS session, on top of a resumed epoch
+    epoch_max = epoch_ctr + train_cfg.get("max_epochs", int(1e20))
     iteration_max = train_cfg.get("max_iterations", int(1e20))
     save_every_iterations = train_cfg.get("save_every_iterations", -1)
     save_every_epochs = train_cfg.get("save_every_epochs", -1)
@@ -90,34 +124,38 @@ def train(cfg: dict):
 
     amp = train_cfg.get("amp", False)
     grad_clip_max_norm = train_cfg.get("clip_grad", None)
-    if amp:
-        scaler = torch.amp.GradScaler("cuda")
-    else:
-        scaler = None
+    scaler = torch.amp.GradScaler("cuda") if amp else None
 
-    # Gradient norm logging config
     grad_norm_cfg = cfg.get("logger", {}).get("grad_norm", {})
     log_grad_norm = grad_norm_cfg.get("enabled", False)
     grad_norm_type = grad_norm_cfg.get("norm_type", 2.0)
     grad_norm_per_layer = grad_norm_cfg.get("log_per_layer", False)
     grad_norm_frequency = grad_norm_cfg.get("log_frequency", 1)
 
-    # Unwrap model once (stable for lifetime of training)
+    plot_every_nsteps = cfg.get("logger", {}).get("plot_every_nsteps")
+    if plot_every_nsteps is None or int(plot_every_nsteps) <= 0:
+        plot_every_nsteps = max(1, len(dl))
+    plot_every_nsteps = int(plot_every_nsteps)
+    if rank == 0:
+        print(f"[train] diagnostics/plot cadence: every {plot_every_nsteps} iterations "
+              f"({len(dl)} iterations/epoch)")
+
     net_module = unwrap_net(net)
 
-    # Physics constants for t0 computation (if applicable)
-    tick_size = cfg.get("photonlib", {}).get("time_tick_size", 0.1)
-    lAr_r_index = cfg.get("physics", {}).get("R_index", 1.233)
-    speed_of_light = 299.792458 / lAr_r_index
-    _has_load_pos = hasattr(net_module, "load_pos") and net_module.load_pos
-    if _has_load_pos:
-        _pmt_pos = net_module.pmt_coords.to(DEVICE)
+    # Keys whose `{key}_grad_frob` the model also computes, for WeightedGradFrobLoss.
+    grad_supervision_warmup = _grad_supervision_warmup(train_cfg)
+    grad_supervision_warmup_unit = train_cfg.get("grad_supervision_warmup_unit", "epoch")
+    assert grad_supervision_warmup_unit in ("epoch", "iteration"), (
+        f"grad_supervision_warmup_unit must be 'epoch' or 'iteration', got {grad_supervision_warmup_unit!r}"
+    )
+    # per-PMT (default) costs O(n_pmt) backward passes and can OOM; aggregate is O(1)
+    grad_supervision_aggregate = bool(train_cfg.get("grad_supervision_aggregate", False))
+    _grad_supervision_announced = set()
 
     if rank == 0:
         print(f"[train] max iterations {iteration_max}, max epochs {epoch_max}")
         print(f"[train] distributed: {is_distributed}, world_size: {world_size}")
 
-    # --- Training loop ---
     stop_training = False
     losses_display = [float("inf")] * len(loss_fns)
 
@@ -136,39 +174,38 @@ def train(cfg: dict):
         for batch_idx, data in enumerate(pbar):
             iteration_ctr += 1
 
-            # --- Unpack standardized batch ---
             x = data["position"].to(DEVICE, non_blocking=True)
             target = {k: v.to(DEVICE, non_blocking=True) for k, v in data["target"].items()}
             meta = {k: v.to(DEVICE, non_blocking=True) for k, v in data.get("meta", {}).items()}
             weights = weight_fn(target)
 
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
+            _sync()
             data_loading_time = time.time() - data_loading_start
 
-            # --- Forward pass ---
             opt.zero_grad()
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
+            _sync()
             forward_start = time.time()
 
             with (torch.autocast(device_type=DEVICE.type, dtype=torch.bfloat16) if amp else nullcontext()):
                 fwd_kwargs = {}
-                if data.get("return_gradients", False):
-                    fwd_kwargs["return_gradients"] = True
+                _warmup_progress = epoch_ctr if grad_supervision_warmup_unit == "epoch" else iteration_ctr
+                active_grad_keys = [k for k, warmup in grad_supervision_warmup.items() if _warmup_progress >= warmup]
+                if rank == 0:
+                    for k in active_grad_keys:
+                        if k not in _grad_supervision_announced:
+                            _grad_supervision_announced.add(k)
+                            print(
+                                f"[train] gradient supervision on '{k}' starts now "
+                                f"(warmup={grad_supervision_warmup[k]} {grad_supervision_warmup_unit}s passed)"
+                            )
+                if active_grad_keys:
+                    fwd_kwargs["grad_keys"] = active_grad_keys
+                    fwd_kwargs["grad_aggregate"] = grad_supervision_aggregate
                 pred = net(x, **fwd_kwargs)
 
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
+                _sync()
                 forward_time = time.time() - forward_start
 
-                # --- t0 from PMT positions (only if dataset didn't provide t0) ---
-                if _has_load_pos and "t0" in pred and "t0" not in target:
-                    pred["t0"] = pred["t0"] * tick_size
-                    distances = torch.cdist(x, _pmt_pos)
-                    target["t0"] = distances / speed_of_light
-
-                # --- Loss computation ---
                 losses_dict = compute_loss(pred, target, loss_fns, weights)
                 keys, losses_tensor = zip(*losses_dict.items())
                 losses_tensor = torch.stack(losses_tensor)
@@ -182,24 +219,15 @@ def train(cfg: dict):
                 else:
                     raise ValueError(f"Unknown reduction: {reduction}")
 
-                if regularizer is not None:
-                    loss += regularizer(net)
-
             epoch_loss_sum += loss.detach().item()
             epoch_batch_count += 1
 
-            # --- Backward pass ---
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
+            _sync()
             backward_start = time.time()
             backward_step(loss, opt, amp, scaler, grad_clip_max_norm, net)
+            _sync()
+            model_time_iter = forward_time + time.time() - backward_start
 
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            backward_time = time.time() - backward_start
-            model_time_iter = forward_time + backward_time
-
-            # Update display losses
             losses_display = losses_tensor.detach().cpu().tolist()
             pbar.set_postfix_str(", ".join(f"{k}={v:.2e}" for k, v in zip(keys, losses_display)))
 
@@ -212,10 +240,6 @@ def train(cfg: dict):
                     f"mem: {peak_mem:.2f}GB"
                 )
 
-            if "grad_mags_transformed" in target:
-                torch.cuda.empty_cache()
-
-            # --- Logging ---
             if rank == 0:
                 current_lr = opt.param_groups[0]["lr"]
                 logger.record(
@@ -235,7 +259,7 @@ def train(cfg: dict):
                     if log_grad_norm and iteration_ctr % grad_norm_frequency == 0:
                         logger.log_grad_norms(iteration_ctr, net_module, grad_norm_type, grad_norm_per_layer)
 
-                if rank == 0 and iteration_ctr % 10 == 0:
+                if rank == 0 and iteration_ctr % plot_every_nsteps == 0:
                     with torch.no_grad():
                         inferred = infer(net, x, target, meta)
                     logger.plot(iteration_ctr, inferred)
@@ -247,8 +271,12 @@ def train(cfg: dict):
                 if rank == 0:
                     logger.write()
                 logger.commit(iteration_ctr)
+            elif rank == 0 and iteration_ctr % logger.log_every_nsteps == 0:
+                # CSV: one row (losses, lr, analysis metrics) every logger.log_every_nsteps
+                with torch.no_grad():
+                    target_log, pred_log = infer.log_step(pred, target, net, meta)
+                logger.step(iteration_ctr, target_log, pred_log)
 
-            # --- Checkpointing ---
             if rank == 0 and save_every_iterations > 0 and iteration_ctr % save_every_iterations == 0:
                 filename = os.path.join(
                     logger.logdir,
@@ -260,8 +288,7 @@ def train(cfg: dict):
                 stop_training = True
                 break
 
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
+            _sync()
             data_loading_start = time.time()
 
         if stop_training:
@@ -269,13 +296,12 @@ def train(cfg: dict):
 
         if sch is not None:
             epoch_avg_loss = epoch_loss_sum / max(epoch_batch_count, 1)
-            sch.step(epoch_avg_loss)
+            if isinstance(sch, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                sch.step(epoch_avg_loss)
+            else:
+                sch.step()
 
         epoch_ctr += 1
-
-        # Temperature annealing (model-attribute-driven)
-        if hasattr(net_module, "anneal_enabled") and net_module.anneal_enabled:
-            net_module.anneal_temperature(epoch_ctr, epoch_max)
 
         if rank == 0 and (save_every_epochs * epoch_ctr) > 0 and epoch_ctr % save_every_epochs == 0:
             filename = os.path.join(
@@ -313,20 +339,24 @@ def main():
             torch.cuda.set_device(0)
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, required=True)
-    parser.add_argument(
-        "--wandb",
-        action="store_true",
-        default=False,
-        help="Enable Weights & Biases logging (default: off, uses CSV)",
-    )
+    parser.add_argument("--config", type=str, required=True,
+                        help="Config path, or a name in config/ (config/archive/ with --archive)")
+    parser.add_argument("--archive", action="store_true", default=False,
+                        help="Read --config by name from config/archive/")
+    parser.add_argument("--wandb", action="store_true", default=False,
+                        help="Log to Weights & Biases (default: CSV)")
+    parser.add_argument("--resume", action="store_true", default=False,
+                        help="Set train.resume=True (restore optimizer/scheduler/epoch from model.ckpt_file)")
     args = parser.parse_args()
 
-    with open(args.config) as f:
+    with open(resolve_config(args.config, args.archive)) as f:
         cfg = yaml.safe_load(f)
 
     if not args.wandb:
         cfg.setdefault("logger", {})["type"] = "csv"
+
+    if args.resume:
+        cfg.setdefault("train", {})["resume"] = True
 
     train(cfg)
 

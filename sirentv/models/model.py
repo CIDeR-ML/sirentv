@@ -1,6 +1,5 @@
-from typing import Union, Literal
+from typing import Union
 
-import os
 import numpy as np
 import torch
 import h5py
@@ -9,12 +8,13 @@ from photonlib import AABox
 from slar.transform import partial_xform_vis
 
 from sirentv.models.builder import build_model
-from sirentv.utils.transform import cdf_to_pdf, pdf_to_cdf
 from sirentv.data.compressed import CompressedPLib
 
 
 class SirenTV(nn.Module):
-    def __init__(self, cfg: dict, meta=None):
+    """Wraps a registry network: normalizes positions, tiles PMTs, masks out-of-volume points."""
+
+    def __init__(self, cfg: dict, meta=None, weights_only: bool = False):
         super().__init__()
         self.config_model = cfg["model"]
         self.config_data = cfg["data"]
@@ -39,18 +39,17 @@ class SirenTV(nn.Module):
         if ckpt_file:
             print("[SirenTV] loading model_dict from checkpoint", ckpt_file)
             with open(ckpt_file, "rb") as f:
-                model_dict = torch.load(f, map_location="cpu")
+                model_dict = torch.load(f, map_location="cpu", weights_only=weights_only)
                 self.load_model_dict(model_dict)
-            #return
 
-        # Create meta
         if meta is not None:
             self._meta = meta
         elif "compressed_plib" in cfg:
             cplib_cfg = cfg["compressed_plib"]
+            # lazy: only meta/pmt_pos are needed, never the (tens-of-GB) data
             cplib = CompressedPLib.load(
                 cplib_cfg["filepath"],
-                lazy=False,
+                lazy=True,
                 n_components=cplib_cfg.get("n_components"),
             )
             self._meta = cplib.meta
@@ -66,27 +65,9 @@ class SirenTV(nn.Module):
                     self.pmt_coords = torch.tensor(file['pmt_pos'][:], dtype=torch.float32)
                     self.norm_pmt_coords = torch.tensor(file['pmt_norm_pos'][:], dtype=torch.float32)
 
-        # Transform functions
         self._xform_vis, self._inv_xform_vis = partial_xform_vis(self.config_xform)
-
-        # Extensions for visibility model
         self._init_output_scale(self.config_model)
-        self.tick_size = self.config_model.get("tick_size", 0.1) # ns
-
         self.n_pmts: int = self.config_data.get("n_pmt", 81)
-
-        anneal_cfg = self.config_model.get("anneal", {})
-        self.anneal_enabled = anneal_cfg.get("enabled", False)
-        self.current_tau = 1.0
-        if self.anneal_enabled:
-            self.tau_start = anneal_cfg.get("tau_start", 1.0)
-            self.tau_end = anneal_cfg.get("tau_end", 0.01)
-            self.current_tau = self.tau_start
-
-    def anneal_temperature(self, epoch, max_epochs):
-        """Call this at end of each epoch if annealing is enabled"""
-        if self.anneal_enabled:
-            self.current_tau = self.tau_start * (self.tau_end / self.tau_start) ** (epoch / max_epochs)
 
     def to(self, device):
         self._meta.to(device)
@@ -110,27 +91,26 @@ class SirenTV(nn.Module):
     def update_meta(self, ranges: torch.Tensor):
         self._meta.update(ranges)
 
-    def forward(self, x, return_gradients=False):
-        """
-        Parameters
-        ----------
-        x : torch.Tensor
-            Input in unnormalized coordinates.
-        return_gradients: bool
-            Whether to compute the visibility gradient in the forward
-        return_pdf : bool
-            If True, return the PDF of the waveform. If False, return the CDF.
+    def forward(self, x, grad_keys=None, grad_aggregate=False, grad_create_graph=True,
+                grad_pmt_ids=None, grad_n_projections=1):
+        """x: (B, 3) unnormalized positions -> dict of (B, n_pmt, ...) outputs plus "correct_mask".
 
-        Returns
-        -------
-        out : dict
-            Dictionary containing the PDF/CDF of the waveform and the visibility.
-            The keys are "t" and "v".
+        Points outside the volume are masked out and read 0.
+        grad_keys: also return `{key}_grad_frob`, the squared Frobenius norm of d out[key] / d x:
+            grad_aggregate=False: per (voxel, PMT), compute_grad_frob_hutchinson; grad_pmt_ids
+                restricts its per-PMT backward loop (columns follow grad_pmt_ids order; the
+                forward still runs every PMT) and grad_n_projections sets its projections.
+            grad_aggregate=True: one visibility-weighted value per voxel,
+                compute_grad_frob_hutchinson_aggregate (O(1) backward passes).
+        grad_create_graph: keep True for training; False for read-only diagnostics saves memory.
         """
-        #device = x.device
         pos = x.unsqueeze(0) if x.dim() == 1 else x
         mask = self.meta.contain(pos).to(self.device)
-        norm_pos = self.meta.norm_coord(pos[mask]).to(self.device)
+        pos_masked = pos[mask]
+        if grad_keys:
+            # fresh leaf: only d(output)/d(position) is needed
+            pos_masked = pos_masked.detach().requires_grad_(True)
+        norm_pos = self.meta.norm_coord(pos_masked).to(self.device)
         if norm_pos.dim() == 1:
             norm_pos = norm_pos.unsqueeze(0)
         norm_pos = norm_pos.unsqueeze(1).expand(-1, self.n_pmts, -1)
@@ -139,15 +119,30 @@ class SirenTV(nn.Module):
             norm_pmt_tile = self.norm_pmt_coords.to(self.device).unsqueeze(0).expand_as(norm_pos)
             input_to_net = torch.cat([norm_pos, norm_pmt_tile], dim=-1)
 
-        out = self.model(input_to_net, self.current_tau, return_gradients)
+        out = self.model(input_to_net)
+
+        if grad_keys:
+            if grad_aggregate:
+                from sirentv.utils.misc import compute_grad_frob_hutchinson_aggregate
+                # weighted by the PREDICTED visibility (the target side uses the true one)
+                vis_weight = self._inv_xform_vis(out["v"])
+                for key in grad_keys:
+                    out[f"{key}_grad_frob"] = compute_grad_frob_hutchinson_aggregate(
+                        pos_masked, out[key], vis_weight, create_graph=grad_create_graph,
+                    )
+            else:
+                from sirentv.utils.misc import compute_grad_frob_hutchinson
+                for key in grad_keys:
+                    out[f"{key}_grad_frob"] = compute_grad_frob_hutchinson(
+                        pos_masked, out[key], self.n_pmts, create_graph=grad_create_graph,
+                        pmt_ids=grad_pmt_ids, n_projections=grad_n_projections,
+                    )
 
         result = {"correct_mask": mask}
         for key, val in out.items():
-            # grad_mags default to 1.0 (unit gradient) for masked positions
-            default_val = 1.0 if key == "grad_mags_transformed" else 0.0
             buf = torch.full(
                 (pos.shape[0], *val.shape[1:]),
-                default_val,
+                0.0,
                 dtype=torch.float32,
                 device=self.device,
             )
@@ -155,30 +150,6 @@ class SirenTV(nn.Module):
             result[key] = buf
 
         return result
-
-    def visibility(self, x, return_type: Literal["pdf", "cdf"] = "pdf"):
-        out = self.forward(x)
-        t = out['t']
-        v = out['v']
-        mask = out['correct_mask']
-        if self.mode == "cdf" and return_type == "pdf":
-            # if cdf is returned, then it's in linear domain.
-            # we just return pdf via diff/tick size.
-            t = cdf_to_pdf(t, self.tick_size)
-        elif self.mode == "pdf":
-            # if pdf is returned by model, it's NOT in log domain
-            # so we DO NOT need to convert it to linear domain
-            # t[mask] = self._inv_xform_vis(t[mask])
-            if return_type == "cdf":
-                t = pdf_to_cdf(t)
-
-        # TODO: we probably shouldn't use same transform rules
-        # for both v and t as t << v.
-        v[mask] = self._inv_xform_vis(v[mask]) # (B, N_pmt)
-
-        if v.dim() != t.dim():
-            v = v.unsqueeze(-1)
-        return v.expand_as(t) * t # (B, N_pmt, N_time)
 
     def model_dict(self, opt=None, sch=None, epoch=-1, scaler=None):
         model_dict = {
@@ -211,7 +182,6 @@ class SirenTV(nn.Module):
             raise KeyError('The model dictionary is lacking the "model_cfg" data')
 
         self._init_output_scale(self.config_model)
-        self._do_hardsigmoid = self.config_model.get("hardsigmoid", False)
         self._xform_vis, self._inv_xform_vis = partial_xform_vis(self.config_xform)
 
         self._meta = AABox(model_dict["aabox_ranges"])
@@ -284,11 +254,7 @@ class SirenTV(nn.Module):
 
     @property
     def out_features(self):
-        """Number of output features separated by overall PMT visibility and waveform must be set by subclasses
-        
-        Example:
-            out_features = [48, 4800] # 48 PMT visibility and 48x100 waveform features
-        """
+        """Output widths, e.g. [v + t0, n_components]; set by the network."""
         if not hasattr(self, "_out_features"):
             raise NotImplementedError("Number of output features is not set in the model")
         return self._out_features
@@ -302,36 +268,19 @@ class SirenTV(nn.Module):
         return sum(self.out_features) if isinstance(self.out_features, (list, tuple)) else self.out_features
 
     def freeze_all(self):
-        """Unfreeze all parameters in the network"""
         for param in self.model.parameters():
             param.requires_grad = False
+
     def unfreeze_all(self):
-        """Unfreeze all parameters in the network"""
         for param in self.model.parameters():
             param.requires_grad = True
+
     def get_trainable_params(self):
-        """Return only the parameters that require gradients"""
         return filter(lambda p: p.requires_grad, self.model.parameters())
 
-    """
-    def freeze_all_but_(self, part: Literal["timing", "visibility"] = "timing"):
-        self.unfreeze_all()
-        self.encoder.requires_grad_(False)
-        if decoder == "timing":
-            self.vis_decoder.requires_grad_(False)
-        elif decoder == "visibility":
-            self.waveform_decoder.requires_grad_(False)
-        else:
-            raise ValueError(f"Invalid decoder: {decoder}")
-    """
-
     def print_trainable_params(self):
-        """Print the names of trainable parameters"""
         for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                print(f"Trainable: {name}")
-            else:
-                print(f"Frozen: {name}")
+            print(f"{'Trainable' if param.requires_grad else 'Frozen'}: {name}")
 
     def __repr__(self):
         n_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)

@@ -8,3 +8,12 @@ logs*/
 *.out
 *.err
 *.ckpt
+analysis/
+grad_frob_cache/
+config/generated/
+*~
+!tests/bitwise/*.sh
+!tests/*.sh
+!sirentv/scripts/*.sh
+# NERSC handoff note, kept local only
+docs/nersc_bitwise_check.md

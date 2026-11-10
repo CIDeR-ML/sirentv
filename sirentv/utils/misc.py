@@ -1,146 +1,15 @@
-"""
-Misc
+"""Spatial-gradient (Frobenius-norm) estimators for gradient supervision, their cache, and t0_mask.
 
-Author: Xiaoyang Wu (xiaoyang.wu.cs@gmail.com)
-Please cite our work if the code is helpful to you.
+Everything is the SQUARED Frobenius norm sum_k ||d value_k / d position||^2: the Hutchinson
+estimate of it is unbiased at any number of projections, its sqrt is not (Jensen).
 """
 
+import json
 import os
-import warnings
-from collections import abc
+
+import h5py
 import numpy as np
 import torch
-from importlib import import_module
-
-
-class AverageMeter(object):
-    """Computes and stores the average and current value"""
-
-    def __init__(self):
-        self.val = 0
-        self.avg = 0
-        self.sum = 0
-        self.count = 0
-
-    def reset(self):
-        self.val = 0
-        self.avg = 0
-        self.sum = 0
-        self.count = 0
-
-    def update(self, val, n=1):
-        self.val = val
-        self.sum += val * n
-        self.count += n
-        self.avg = self.sum / self.count
-
-
-def intersection_and_union(output, target, K, ignore_index=-1):
-    # 'K' classes, output and target sizes are N or N * L or N * H * W, each value in range 0 to K - 1.
-    assert output.ndim in [1, 2, 3]
-    assert output.shape == target.shape
-    output = output.reshape(output.size).copy()
-    target = target.reshape(target.size)
-    output[np.where(target == ignore_index)[0]] = ignore_index
-    intersection = output[np.where(output == target)[0]]
-    area_intersection, _ = np.histogram(intersection, bins=np.arange(K + 1))
-    area_output, _ = np.histogram(output, bins=np.arange(K + 1))
-    area_target, _ = np.histogram(target, bins=np.arange(K + 1))
-    area_union = area_output + area_target - area_intersection
-    return area_intersection, area_union, area_target
-
-
-def intersection_and_union_gpu(output, target, k, ignore_index=-1):
-    # 'K' classes, output and target sizes are N or N * L or N * H * W, each value in range 0 to K - 1.
-    assert output.dim() in [1, 2, 3]
-    assert output.shape == target.shape
-    output = output.view(-1)
-    target = target.view(-1)
-    output[target == ignore_index] = ignore_index
-    intersection = output[output == target]
-    area_intersection = torch.histc(intersection, bins=k, min=0, max=k - 1)
-    area_output = torch.histc(output, bins=k, min=0, max=k - 1)
-    area_target = torch.histc(target, bins=k, min=0, max=k - 1)
-    area_union = area_output + area_target - area_intersection
-    return area_intersection, area_union, area_target
-
-
-def make_dirs(dir_name):
-    if not os.path.exists(dir_name):
-        os.makedirs(dir_name, exist_ok=True)
-
-
-def find_free_port():
-    import socket
-
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    # Binding to port 0 will cause the OS to find an available port for us
-    sock.bind(("", 0))
-    port = sock.getsockname()[1]
-    sock.close()
-    # NOTE: there is still a chance the port could be taken by other processes.
-    return port
-
-
-
-
-
-def is_str(x):
-    """Whether the input is an string instance.
-
-    Note: This method is deprecated since python 2 is no longer supported.
-    """
-    return isinstance(x, str)
-
-
-def import_modules_from_strings(imports, allow_failed_imports=False):
-    """Import modules from the given list of strings.
-
-    Args:
-        imports (list | str | None): The given module names to be imported.
-        allow_failed_imports (bool): If True, the failed imports will return
-            None. Otherwise, an ImportError is raise. Default: False.
-
-    Returns:
-        list[module] | module | None: The imported modules.
-
-    Examples:
-        >>> osp, sys = import_modules_from_strings(
-        ...     ['os.path', 'sys'])
-        >>> import os.path as osp_
-        >>> import sys as sys_
-        >>> assert osp == osp_
-        >>> assert sys == sys_
-    """
-    if not imports:
-        return
-    single_import = False
-    if isinstance(imports, str):
-        single_import = True
-        imports = [imports]
-    if not isinstance(imports, list):
-        raise TypeError(f"custom_imports must be a list but got type {type(imports)}")
-    imported = []
-    for imp in imports:
-        if not isinstance(imp, str):
-            raise TypeError(f"{imp} is of type {type(imp)} and cannot be imported.")
-        try:
-            imported_tmp = import_module(imp)
-        except ImportError:
-            if allow_failed_imports:
-                warnings.warn(f"{imp} failed to import and is ignored.", UserWarning)
-                imported_tmp = None
-            else:
-                raise ImportError
-        imported.append(imported_tmp)
-    if single_import:
-        imported = imported[0]
-    return imported
-
-
-class DummyClass:
-    def __init__(self):
-        pass
 
 
 def t0_mask(
@@ -152,19 +21,10 @@ def t0_mask(
         temperature: float = 1.0,
         hard: bool = False,
 ):
-    """
-    Unified time mask with multiple strategies
+    """softmax(t_profile) (cumsum'd if use_CDF), masked by sigmoid((tick - t0) * steepness / temperature).
 
-    Args:
-        n_ticks: number of time ticks
-        t0: (B, n_pmt) start times
-        t_profile: (B, n_pmt, n_ticks) time profile
-        use_CDF: whether to compute cumulative sum
-        steepness: steepness factor for sigmoid (higher = sharper)
-        hard: if True, use straight-through estimator, else just steepness controlled sigmoid
-
-    Returns:
-        out: masked profile (B, n_pmt, n_ticks)
+    t0 (B, n_pmt), t_profile (B, n_pmt, n_ticks) -> (B, n_pmt, n_ticks).
+    hard: straight-through estimator (hard step forward, sigmoid gradient).
     """
     device = t_profile.device
     time_indices = torch.arange(n_ticks, device=device, dtype=torch.float32)[None, None, :]
@@ -172,16 +32,10 @@ def t0_mask(
     logits = (time_indices - t0) * steepness
 
     if hard:
-        # Soft probabilities for gradient
         soft_mask = torch.sigmoid(logits / temperature)
-
-        # Hard threshold for forward pass
         hard_mask = (time_indices >= t0).float()
-
-        # Straight-through estimator: forward uses hard, backward uses soft
         mask = hard_mask - soft_mask.detach() + soft_mask
     else:
-        # Just temperature-scaled sigmoid
         mask = torch.sigmoid(logits / temperature)
 
     out = t_profile.softmax(-1)
@@ -191,106 +45,239 @@ def t0_mask(
 
     return out
 
-def compute_gradients_from_positions(positions, visibility, pmt_idx):
 
-    # Find unique coordinates
+def compute_grad_frob_hutchinson(
+    pos_masked: torch.Tensor, output_val: torch.Tensor, n_pmts: int, create_graph: bool = True,
+    pmt_ids: list[int] | None = None, n_projections: int = 1,
+) -> torch.Tensor:
+    """Per-(voxel, PMT) squared Frobenius norm of d output_val / d pos_masked, Hutchinson-estimated.
+
+    One backward pass per PMT (not per channel): for Rademacher v, E||sum_k v_k grad(out_k)||^2
+    = sum_k ||grad(out_k)||^2. One projection per call is deliberate: each extra one costs a
+    backward pass every step, while a fresh v every step averages over training for free
+    (grad_target_n_projections only controls the target side).
+
+    pos_masked: (n_valid, 3) leaf with requires_grad that output_val was computed from.
+    output_val: (n_valid, n_pmts[, K]).
+    create_graph: True for training (differentiable result); False for read-only use saves memory.
+    pmt_ids: restrict the per-PMT loop (result columns follow this order). None = all PMTs.
+    n_projections: projections per PMT off the same forward pass (diagnostics).
+    Returns (n_valid, n_pmt_sel), or (n_valid, n_pmt_sel, n_projections) when n_projections > 1.
+    """
+    if output_val.dim() == 2:
+        output_val = output_val.unsqueeze(-1)  # (n_valid, n_pmts, 1)
+
+    grad_mags_sq = []
+    for pmt_idx in (pmt_ids if pmt_ids is not None else range(n_pmts)):
+        pmt_val = output_val[:, pmt_idx]  # (n_valid, K)
+        proj_mags = []
+        for _ in range(n_projections):
+            v = torch.randint(0, 2, pmt_val.shape, device=pmt_val.device, dtype=pmt_val.dtype) * 2 - 1
+            proj = (pmt_val * v).sum()
+            grad = torch.autograd.grad(
+                outputs=proj, inputs=pos_masked, create_graph=create_graph, retain_graph=True,
+            )[0]  # (n_valid, 3)
+            proj_mags.append(grad.norm(dim=-1)**2)
+        grad_mags_sq.append(proj_mags[0] if n_projections == 1 else torch.stack(proj_mags, dim=-1))
+
+    return torch.stack(grad_mags_sq, dim=1)
+
+
+def compute_grad_frob_hutchinson_aggregate(
+    pos_masked: torch.Tensor, output_val: torch.Tensor, vis_weight: torch.Tensor,
+    create_graph: bool = True,
+) -> torch.Tensor:
+    """Visibility-weighted aggregate over PMTs in ONE backward pass (when per-PMT OOMs): (n_valid,).
+
+    proj = sum_{pmt,k} sqrt(w_pmt) v_{pmt,k} out_{pmt,k} gives
+    E||grad proj||^2 = sum_pmt w_pmt sum_k ||grad out_{pmt,k}||^2.
+    vis_weight (n_valid, n_pmts) is detached, so the loss can't shrink it instead of matching.
+    """
+    if output_val.dim() == 2:
+        output_val = output_val.unsqueeze(-1)  # (n_valid, n_pmts, 1)
+
+    sqrt_w = vis_weight.detach().clamp(min=0).sqrt().unsqueeze(-1)  # (n_valid, n_pmts, 1)
+    v = torch.randint(0, 2, output_val.shape, device=output_val.device, dtype=output_val.dtype) * 2 - 1
+    proj = (sqrt_w * v * output_val).sum()
+    grad = torch.autograd.grad(outputs=proj, inputs=pos_masked, create_graph=create_graph)[0]  # (n_valid, 3)
+    return grad.norm(dim=-1)**2
+
+
+def _shifted(arr: np.ndarray, axis: int, offset: int, pad_value) -> np.ndarray:
+    """result[i] = arr[i + offset] along `axis`, pad_value out of bounds (no wraparound)."""
+    result = np.full_like(arr, pad_value)
+    n = arr.shape[axis]
+    src = [slice(None)] * arr.ndim
+    dst = [slice(None)] * arr.ndim
+    if offset > 0:
+        src[axis] = slice(offset, n)
+        dst[axis] = slice(0, n - offset)
+    else:
+        src[axis] = slice(0, n + offset)
+        dst[axis] = slice(-offset, n)
+    result[tuple(dst)] = arr[tuple(src)]
+    return result
+
+
+def _masked_finite_diff(grid: np.ndarray, valid: np.ndarray, spacing: float, axis: int) -> np.ndarray:
+    """Finite difference of grid (..., K) along `axis` that never reads an invalid neighbour.
+
+    Centred where both neighbours are valid (identical to np.gradient on clean data), one-sided
+    toward the single valid neighbour otherwise, 0 at invalid centres or isolated points.
+    Array edges count as invalid. valid: (nx, ny, nz), shared across K.
+    """
+    f_plus = _shifted(grid, axis, 1, np.nan)
+    f_minus = _shifted(grid, axis, -1, np.nan)
+    v_plus = _shifted(valid, axis, 1, False)[..., None]
+    v_minus = _shifted(valid, axis, -1, False)[..., None]
+    v_self = valid[..., None]
+
+    can_center = v_self & v_plus & v_minus
+    can_forward = v_self & v_plus & ~v_minus
+    can_backward = v_self & v_minus & ~v_plus
+
+    with np.errstate(invalid="ignore"):  # NaN padding outside each branch
+        out = np.where(can_center, (f_plus - f_minus) / (2 * spacing), 0.0)
+        out = np.where(can_forward, (f_plus - grid) / spacing, out)
+        out = np.where(can_backward, (grid - f_minus) / spacing, out)
+    return out
+
+
+def compute_grad_frob_target(positions: np.ndarray, values: np.ndarray, valid: np.ndarray | None = None) -> np.ndarray:
+    """Exact finite-difference squared Frobenius norm per (voxel, PMT): (N, n_pmt).
+
+    positions (N, 3) on a regular grid, any row order; values (N, n_pmt[, K]).
+    valid (N,) or (N, n_pmt): invalid entries are skipped as neighbours (_masked_finite_diff).
+    Validity is per (voxel, PMT): a zero-photon pair's coefficients/quantiles are meaningless
+    even where the voxel is fine for other PMTs. None = plain np.gradient.
+    Loops over PMTs (memory O(N K) per step), vectorized over K.
+    """
+    if values.ndim == 2:
+        values = values[..., None]  # (N, n_pmt, 1)
+    n_pmt, K = values.shape[1], values.shape[2]
+
     x_unique = np.unique(positions[:, 0])
     y_unique = np.unique(positions[:, 1])
     z_unique = np.unique(positions[:, 2])
-
     nx, ny, nz = len(x_unique), len(y_unique), len(z_unique)
+    dx = x_unique[1] - x_unique[0] if nx > 1 else 1.0
+    dy = y_unique[1] - y_unique[0] if ny > 1 else 1.0
+    dz = z_unique[1] - z_unique[0] if nz > 1 else 1.0
 
-    dx = x_unique[1] - x_unique[0]
-    dy = y_unique[1] - y_unique[0]
-    dz = z_unique[1] - z_unique[0]
-
-    #print(f"Grid: {nx} x {ny} x {nz}, spacing: ({dx:.4f}, {dy:.4f}, {dz:.4f})")
-
-    # Vectorized index lookup
     ix = np.searchsorted(x_unique, positions[:, 0])
     iy = np.searchsorted(y_unique, positions[:, 1])
     iz = np.searchsorted(z_unique, positions[:, 2])
 
-    # Fill grid
-    vis_grid = np.zeros((nx, ny, nz))
-    vis_pmt = visibility[:, pmt_idx]
-    vis_grid[ix, iy, iz] = vis_pmt
+    valid_per_pmt = None
+    if valid is not None:
+        valid_per_pmt = np.broadcast_to(valid[:, None] if valid.ndim == 1 else valid, (positions.shape[0], n_pmt))
 
-    # Compute gradients
-    grad_x_grid, grad_y_grid, grad_z_grid = np.gradient(vis_grid, dx, dy, dz)
+    grad_frob_sq = np.zeros((positions.shape[0], n_pmt), dtype=np.float32)
+    for pmt_idx in range(n_pmt):
+        grid = np.zeros((nx, ny, nz, K), dtype=np.float64)
+        grid[ix, iy, iz, :] = values[:, pmt_idx, :]
+        if valid_per_pmt is None:
+            gx, gy, gz = np.gradient(grid, dx, dy, dz, axis=(0, 1, 2))
+        else:
+            valid_grid = np.zeros((nx, ny, nz), dtype=bool)
+            valid_grid[ix, iy, iz] = valid_per_pmt[:, pmt_idx]
+            gx = _masked_finite_diff(grid, valid_grid, dx, axis=0)
+            gy = _masked_finite_diff(grid, valid_grid, dy, axis=1)
+            gz = _masked_finite_diff(grid, valid_grid, dz, axis=2)
+        grad_mag_sq = gx[ix, iy, iz, :] ** 2 + gy[ix, iy, iz, :] ** 2 + gz[ix, iy, iz, :] ** 2  # (N, K)
 
-    # Extract gradients at original positions
-    grad_x_flat = grad_x_grid[ix, iy, iz]
-    grad_y_flat = grad_y_grid[ix, iy, iz]
-    grad_z_flat = grad_z_grid[ix, iy, iz]
-    grad_mag = np.sqrt(grad_x_flat ** 2 + grad_y_flat ** 2 + grad_z_flat ** 2)
+        grad_frob_sq[:, pmt_idx] = grad_mag_sq.sum(axis=-1)
 
-    return grad_x_flat, grad_y_flat, grad_z_flat, grad_mag, vis_grid, (nx, ny, nz), (dx, dy, dz)
+    return grad_frob_sq
 
 
-def predict_gradient_magnitudes(
-        pred_vis: torch.Tensor,
-        positions: torch.Tensor,
-) -> torch.Tensor:
+def compute_grad_frob_target_exact_projected(
+    fine_positions: np.ndarray, read_values_fn, n_pmt: int, n_channels: int,
+    n_projections: int = 10, seed: int | None = 0, chunk_size: int | None = 200000,
+    valid: np.ndarray | None = None, device: str | torch.device | None = None,
+    projection_batch_size: int | None = None,
+) -> np.ndarray:
+    """compute_grad_frob_target for a K-channel field without ever holding (N, n_pmt, K) in memory.
+
+    Each chunk read is projected by one FIXED Rademacher matrix R (K, n_projections) to
+    (chunk, n_pmt, M); the finite-difference norm of the projections, divided by M, is an
+    unbiased estimate of the squared Frobenius norm at native resolution.
+    The target is computed once, so unlike the model side it gets no averaging over steps:
+    use several projections. K = 1 (v) is exact with one.
+
+    read_values_fn(chunk_idx) -> (len(chunk_idx), n_pmt, n_channels) raw values.
+    chunk_size: voxels per read (None = one read). valid: see compute_grad_frob_target.
+    device: run the projection matmul there (e.g. "cuda"); the finite difference stays numpy.
+    projection_batch_size: projections held at once; (N, n_pmt, 100) is ~52 GB and gets
+        SIGKILLed silently. Batches sum to exactly the same estimate.
+    Returns (N, n_pmt) float32.
     """
-    Compute gradient magnitudes of predicted visibility w.r.t. positions via autograd
+    rng = np.random.default_rng(seed)
+    R_full = (rng.integers(0, 2, size=(n_channels, n_projections)) * 2 - 1).astype(np.float32)  # Rademacher
 
-    Args:
-        pred_vis: (B, n_pmts) predicted visibility values
-        positions: (B, 3) input positions - must have requires_grad=True
+    use_gpu = device is not None and str(device) != "cpu"
 
-    Returns:
-        grad_mag: (B, n_selected_pmts) gradient magnitudes ||∇vis||
-    """
-    if not positions.requires_grad:
-        positions = positions.requires_grad_(True)
+    n = fine_positions.shape[0]
+    size = n if chunk_size is None else chunk_size
+    batch = n_projections if projection_batch_size is None else min(projection_batch_size, n_projections)
 
-    if not pred_vis.requires_grad:
-        raise RuntimeError(
-            "pred_vis does not require gradients. "
-            "This suggests the model is not using positions to compute visibility. "
-            "Check that positions has requires_grad=True before the forward pass."
-        )
+    sum_sq = np.zeros((n, n_pmt), dtype=np.float64)
+    n_batches = -(-n_projections // batch)  # ceil div
+    for batch_idx, m_start in enumerate(range(0, n_projections, batch)):
+        if n_batches > 1:
+            print(f"  [compute_grad_frob_target_exact_projected] projection batch "
+                  f"{batch_idx + 1}/{n_batches} ...", flush=True)
+        m_end = min(m_start + batch, n_projections)
+        R = R_full[:, m_start:m_end]
+        m_here = m_end - m_start
+        R_t = torch.from_numpy(R).to(device) if use_gpu else None
 
-    n_pmts = pred_vis.shape[1]
+        projected = np.empty((n, n_pmt, m_here), dtype=np.float32)
+        for s in range(0, n, size):
+            e = min(s + size, n)
+            chunk_values = read_values_fn(np.arange(s, e))  # (chunk, n_pmt, K)
+            if use_gpu:
+                chunk_t = torch.from_numpy(np.asarray(chunk_values, dtype=np.float32)).to(device)
+                projected[s:e] = torch.einsum("cpk,km->cpm", chunk_t, R_t).cpu().numpy()
+            else:
+                projected[s:e] = np.einsum("cpk,km->cpm", chunk_values, R)
 
-    pmt_indices = list(range(n_pmts))
+        grad_frob_batch = compute_grad_frob_target(fine_positions, projected, valid=valid)  # (N, n_pmt)
+        sum_sq += grad_frob_batch.astype(np.float64)
 
-    # Process in chunks to avoid memory buildup
-    chunk_size = 5  # Process 5 PMTs at a time
-    all_grad_mags = []
+    return (sum_sq / n_projections).astype(np.float32)
 
-    for chunk_start in range(0, len(pmt_indices), chunk_size):
-        chunk_end = min(chunk_start + chunk_size, len(pmt_indices))
-        chunk_indices = pmt_indices[chunk_start:chunk_end]
 
-        chunk_grads = []
+# Bump when the MEANING of cached arrays changes in code (config changes are caught by the meta).
+GRAD_CACHE_FORMAT_VERSION = 2  # 1: sqrt'd Frobenius-norm magnitude; 2: squared (no sqrt)
 
-        for i, pmt_idx in enumerate(chunk_indices):
-            vis_pmt = pred_vis[:, pmt_idx]
 
-            is_last = (chunk_start + i == len(pmt_indices) - 1)
+def _grad_cache_meta_key(meta: dict) -> str:
+    return json.dumps(meta, sort_keys=True)
 
-            grad = torch.autograd.grad(
-                outputs=vis_pmt.sum(),
-                inputs=positions,
-                create_graph=False,
-                retain_graph=True if (i < len(pmt_indices) - 1) else False,
-                allow_unused=True
-            )[0]
 
-            if grad is None:
-                raise RuntimeError(f"Gradient is None for PMT {pmt_idx}")
+def load_grad_frob_cache(cache_file: str | None, keys, meta: dict) -> dict | None:
+    """{key: (N_total, n_pmt)} for every LUT voxel from `cache_file`, or None if the file is
+    missing, a key is absent, or its meta differs from `meta` in any way."""
+    if not cache_file or not os.path.exists(cache_file):
+        return None
+    with h5py.File(cache_file, "r") as f:
+        if f.attrs.get("meta_json") != _grad_cache_meta_key(meta):
+            return None
+        out = {}
+        for key in keys:
+            if key not in f:
+                return None
+            out[key] = f[key][:]
+        return out
 
-            grad_mag = torch.norm(grad, dim=-1)
-            chunk_grads.append(grad_mag)
 
-        # Stack this chunk
-        chunk_result = torch.stack(chunk_grads, dim=1)
-        all_grad_mags.append(chunk_result)
-
-        # Clear chunk memory
-        del chunk_grads
-        torch.cuda.empty_cache()
-
-    return torch.cat(all_grad_mags, dim=1)
+def save_grad_frob_cache(cache_file: str, arrays: dict, meta: dict) -> None:
+    """Write full-LUT gradient targets with their meta, overwriting `cache_file`."""
+    parent = os.path.dirname(cache_file)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with h5py.File(cache_file, "w") as f:
+        f.attrs["meta_json"] = _grad_cache_meta_key(meta)
+        for key, arr in arrays.items():
+            f.create_dataset(key, data=arr, compression="gzip", compression_opts=4)

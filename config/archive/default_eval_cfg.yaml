@@ -1,0 +1,110 @@
+compressed_plib:
+  device: cpu
+  evr_weight_coeffs: false
+  filepath: /sdf/data/neutrino/youngsam/compressed_plib_b04_quantile_log_n50.h5
+  lazy: true
+  n_components: 50
+  n_photon: 1.5e7
+  normalize_coeffs: false
+photonlib:
+  filepath: /sdf/data/neutrino/pubdata/lut/optical/consolidated/full_wvfm_plib_b03_uncompressed_fixed.h5
+  lazy: True
+data:
+  dataset:
+    type: CompressedPLibDataset
+  loader:
+    batch_size: 512
+    drop_last: true
+    load_pos: true
+    num_workers: 8
+    pin_memory: true
+    shuffle: true
+  n_pmt: 81
+  use_gradient_supervision: false
+  weight:
+    coeffs:
+      enable: false
+    t0:
+      enable: false
+    v:
+      enable: true
+      factor: 5000.0
+      threshold: 1.0e-08
+device:
+  type: cuda
+logger:
+  analysis:
+  - func: bias
+    key: coeffs
+    suffix: coeffs
+    threshold: null
+  - func: bias
+    key: v_linear
+    suffix: vis
+    threshold: 1.0e-06
+  - func: abs_bias
+    key: t0
+    signed: true
+    suffix: t0
+    threshold: 0.01
+  dir_name: logs_pca_81
+  entity: junjiex-stanford-university
+  file_name: log.csv
+  grad_norm:
+    enabled: true
+    log_frequency: 77
+    log_per_layer: true
+  infer_fn:
+    type: PCAInfer
+  log_every_nsteps: 77
+  name: pca_siren_81_raw_1024
+  project: sirentv-pca-81
+  type: csv
+model:
+  ckpt_file: '/sdf/group/neutrino/youngsam/sirentv/logs_pca_81/version-67/iteration-1558000-epoch-2000.ckpt'
+  mode: pca_cdf
+  network:
+    first_omega_0: 30.0
+    hidden_features: 512
+    hidden_layers: 6
+    hidden_omega_0: 30.0
+    in_features: 6
+    n_components: 50
+    outermost_linear: true
+    type: PcaSiren
+    use_CDF: false
+    xform_vis: &id001
+      eps: 1.0e-08
+      sin_out: false
+      vmax: 1.0
+  output_scale:
+    fix: true
+physics:
+  R_index: 1.233
+train:
+  seed: 0
+  clip_grad: 1.0
+  loss:
+  - key: coeffs
+    type: WeightedL2Loss
+    weight: 1.0
+  - key: v
+    type: SmoothL1Loss
+    weight: 1.0
+  - key: t0
+    type: SmoothL1Loss
+    weight: 1.0
+  max_epochs: 2000
+  optimizer_class: AdamW
+  optimizer_param:
+    lr: 1.0e-05
+  reduction: sum
+  regularization: null
+  resume: false
+  save_every_epochs: 100
+  save_every_iterations: -1
+  scheduler_class: CosineAnnealingLR
+  scheduler_param:
+    T_max: 2000
+    eta_min: 1.0e-07
+transform_vis: *id001

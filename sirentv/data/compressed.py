@@ -1,28 +1,24 @@
-"""
-Compressed photon library reader and dataset for (vis, t0, PCA coeffs) format.
-"""
+"""Reader and dataset for the PCA-compressed photon library H5 (vis, t0, PCA coeffs)."""
 
 import numpy as np
 import torch
 import h5py
-from torch.utils.data import Dataset, DataLoader, DistributedSampler
+from torch.utils.data import Dataset
 from slar.transform import partial_xform_vis
 from photonlib.meta import VoxelMeta
 
 from sirentv.data.builder import DATASETS
+from sirentv.data.common import grad_target_options, precompute_grad_targets, select_voxel_indices
 
 
 class CompressedPLib:
-    """
-    Reader for compressed waveform photon library H5 (vis, t0, PCA coeffs).
-    """
+    """Reader for the compressed waveform photon library H5 (vis, t0, PCA coeffs)."""
 
-    def __init__(self, filepath, lazy=True, n_components=None, device=None, reflect_x=False, pmt_flip_perm=None):
+    def __init__(self, filepath, lazy=True, n_components=None, device=None):
         self._path = filepath
         self._lazy = lazy
         self._device = device or torch.device("cpu")
         self._file = None
-        self._reflect_x = bool(reflect_x)
 
         with h5py.File(filepath, "r") as f:
             self._n_voxels = f["vis"].shape[0]
@@ -61,45 +57,6 @@ class CompressedPLib:
             ranges = torch.column_stack((min_xyz, max_xyz))
             self.meta = VoxelMeta(numvox, ranges)
 
-            if self._reflect_x:
-                full_min = torch.tensor([min_xyz[0], min_xyz[1], min_xyz[2]])
-                full_max = torch.tensor([-min_xyz[0], max_xyz[1], max_xyz[2]])
-                full_ranges = torch.column_stack((full_min, full_max))
-                self.full_meta = VoxelMeta(numvox, full_ranges)
-                if pmt_flip_perm is not None:
-                    self._pmt_flip_perm = np.asarray(pmt_flip_perm, dtype=np.int64)
-                else:
-                    # Chroma-lar 2-wall: same (y,z) order on both sides. If plib has only one wall
-                    # (all pmt_pos same sign of x), then +x PMT i has same (y,z) as plib PMT i -> identity.
-                    x = self.pmt_pos[:, 0]
-                    all_neg = np.all(x <= 0)
-                    all_pos = np.all(x >= 0)
-                    if all_neg or all_pos:
-                        self._pmt_flip_perm = np.arange(len(self.pmt_pos), dtype=np.int64)
-                    else:
-                        # Both walls in plib: find j at (-px_i, py_i, pz_i) for each i.
-                        reflected = self.pmt_pos.copy()
-                        reflected[:, 0] *= -1
-                        dist = np.sum((self.pmt_pos[:, None, :] - reflected[None, :, :]) ** 2, axis=2)
-                        self._pmt_flip_perm = np.argmin(dist, axis=1)
-                        max_d = np.sqrt(np.max(np.min(dist, axis=1)))
-                        if max_d > 1.0:
-                            import warnings
-                            warnings.warn(
-                                f"reflect_x: auto pmt_flip_perm has max match distance {max_d:.2f} mm; "
-                                "consider passing pmt_flip_perm from geometry."
-                            )
-                        inv = self._pmt_flip_perm[self._pmt_flip_perm]
-                        if not np.array_equal(inv, np.arange(len(self._pmt_flip_perm))):
-                            import warnings
-                            warnings.warn(
-                                "reflect_x: pmt_flip_perm is not an involution (perm[perm[i]] != i); "
-                                "PMT layout may not be x-symmetric. Pass pmt_flip_perm from geometry."
-                            )
-            else:
-                self.full_meta = None
-                self._pmt_flip_perm = None
-
             if "pca_explained_variance_ratio" in f:
                 self.explained_variance_ratio = np.asarray(f["pca_explained_variance_ratio"][:])
             else:
@@ -113,10 +70,7 @@ class CompressedPLib:
         self.coeff_std = None
         self.coeff_mean = None
 
-        self._event_uniq = None
-        self._event_vis = None
-        self._event_t0 = None
-        self._event_coeffs = None
+        self.clear_prefetch()
 
         if lazy:
             self._file = h5py.File(filepath, "r", swmr=True, libver="latest")
@@ -138,8 +92,13 @@ class CompressedPLib:
                 self.coeffs = torch.from_numpy(f["coeffs"][:, :, : self._n_components]).float()
             self._vis = self._t0 = self._coeffs = None
 
-    def compute_coeff_stats(self, chunk_size=5000):
-        """Compute per-component mean and std over all (voxel, PMT) pairs."""
+    def compute_coeff_stats(self, chunk_size=5000, weight_power: int = 1):
+        """Per-component mean/std over all (voxel, PMT) pairs, and coeff_weight_k = K std_k^p / sum_j std_j^p.
+
+        With normalize_coeffs the net penalty on the raw coefficient error is std_k^(p-2):
+        p=2 is the unnormalized loss (= reconstruction error, orthonormal components),
+        p=0 plain normalized MSE, p=1 (default) a 1/std penalty.
+        """
         K = self._n_components
         with h5py.File(self._path, "r") as f:
             ds = f["coeffs"]
@@ -157,6 +116,9 @@ class CompressedPLib:
         std = np.maximum(std, 1e-12)
         self.coeff_mean = torch.from_numpy(mean.astype(np.float32)).to(self._device)
         self.coeff_std = torch.from_numpy(std.astype(np.float32)).to(self._device)
+        # mean weight 1, so the loss scale matches an unweighted run
+        std_pow = self.coeff_std ** weight_power
+        self.coeff_weight = self.coeff_std.numel() * std_pow / std_pow.sum()
         return self.coeff_mean, self.coeff_std
 
     def normalize_coeffs(self, coeffs):
@@ -179,8 +141,8 @@ class CompressedPLib:
         return self._n_voxels
 
     @classmethod
-    def load(cls, filepath, lazy=True, n_components=None, device=None, reflect_x=False, pmt_flip_perm=None):
-        return cls(filepath, lazy=lazy, n_components=n_components, device=device, reflect_x=reflect_x, pmt_flip_perm=pmt_flip_perm)
+    def load(cls, filepath, lazy=True, n_components=None, device=None):
+        return cls(filepath, lazy=lazy, n_components=n_components, device=device)
 
     def _read_slice(self, key, voxel_ids):
         if self._file is None:
@@ -219,78 +181,31 @@ class CompressedPLib:
             coeffs = coeffs[..., : self._n_components]
         return {"vis": vis, "t0": t0, "coeffs": coeffs}
 
-    def contain(self, pos):
-        """Check containment in the (possibly full symmetric) volume."""
-        if self._reflect_x:
-            return self.full_meta.contain(pos)
-        return self.meta.contain(pos)
-
     def clear_prefetch(self):
-        """Clear event-level prefetch cache."""
         self._event_uniq = None
-        self._event_vis = None
-        self._event_t0 = None
-        self._event_coeffs = None
+        self._event_data = None
 
     def prefetch_event(self, positions, device=None):
-        """Prefetch all unique voxels for this event.
-        positions: (N, 3). device: where to store cached tensors (defaults to self._device).
-        Call clear_prefetch() or prefetch_event(None) to clear."""
+        """Cache every field for the unique voxels of `positions` (N, 3), so lookup() on those
+        points reads memory instead of HDF5. None clears the cache."""
         if positions is None:
             self.clear_prefetch()
             return
         dev = device if device is not None else self._device
-        pos = np.atleast_2d(np.asarray(positions, dtype=np.float64))
-        flip = pos[:, 0] > 0 if self._reflect_x else np.zeros(len(pos), dtype=bool)
-        pos_q = pos.copy()
-        pos_q[flip, 0] *= -1
-        vox = self.meta.coord_to_voxel(pos_q).numpy()
-        event_uniq, _ = np.unique(vox, return_inverse=True)
-        if event_uniq.size == 0:
-            self._event_uniq = np.array([], dtype=np.int64)
-            self._event_vis = torch.zeros(0, self._n_pmts, dtype=torch.float32, device=dev)
-            t0_dtype = self.t0.dtype if self.t0 is not None else torch.long
-            self._event_t0 = torch.zeros(0, self._n_pmts, dtype=t0_dtype, device=dev)
-            self._event_coeffs = torch.zeros(0, self._n_pmts, self._n_components, dtype=torch.float32, device=dev)
-            return
-        data = self[event_uniq]
-        self._event_uniq = event_uniq
-        self._event_vis = data["vis"].to(dev)
-        self._event_t0 = data["t0"].to(dev)
-        self._event_coeffs = data["coeffs"].to(dev)
+        vox = self.meta.coord_to_voxel(np.atleast_2d(np.asarray(positions, dtype=np.float64))).numpy()
+        self._event_uniq = np.unique(vox)
+        data = self[self._event_uniq]
+        self._event_data = {k: v.to(dev) for k, v in data.items()}
 
     def lookup(self, pos):
-        """pos: (N, 3) array or tensor -> dict with vis, t0, coeffs. Handles x-reflection and PMT permutation."""
-        pos = np.atleast_2d(np.asarray(pos, dtype=np.float64))
-        flip = pos[:, 0] > 0 if self._reflect_x else np.zeros(len(pos), dtype=bool)
-        pos_q = pos.copy()
-        pos_q[flip, 0] *= -1
-        vox = self.meta.coord_to_voxel(pos_q).numpy()
-
+        """pos: (N, 3) -> {vis, t0, coeffs}, from the prefetch cache when one is set."""
+        vox = self.meta.coord_to_voxel(np.atleast_2d(np.asarray(pos, dtype=np.float64))).numpy()
         if self._event_uniq is not None:
-            inv_b = np.searchsorted(self._event_uniq, vox)
-            dev = self._event_vis.device
-            inv_t = torch.from_numpy(inv_b).long().to(dev)
-            data = {
-                "vis": self._event_vis[inv_t].clone(),
-                "t0": self._event_t0[inv_t].clone(),
-                "coeffs": self._event_coeffs[inv_t].clone(),
-            }
-        else:
-            if self._file is None:
-                vox = torch.from_numpy(vox).long().to(self.vis.device)
-            data = self[vox]
-
-        if np.any(flip):
-            perm = torch.from_numpy(self._pmt_flip_perm).to(data["vis"].device)
-            flip_t = torch.from_numpy(flip).to(data["vis"].device)
-            data["vis"] = data["vis"].clone()
-            data["t0"] = data["t0"].clone()
-            data["coeffs"] = data["coeffs"].clone()
-            data["vis"][flip_t] = data["vis"][flip_t][:, perm]
-            data["t0"][flip_t] = data["t0"][flip_t][:, perm]
-            data["coeffs"][flip_t] = data["coeffs"][flip_t][:, perm, :]
-        return data
+            inv = torch.from_numpy(np.searchsorted(self._event_uniq, vox)).long()
+            return {k: v[inv.to(v.device)].clone() for k, v in self._event_data.items()}
+        if self._file is None:
+            vox = torch.from_numpy(vox).long().to(self.vis.device)
+        return self[vox]
 
     def close(self):
         if self._file is not None:
@@ -352,6 +267,20 @@ class CompressedPLib:
         )
         out = torch.from_numpy(f_flat.reshape(*batch_shape, 1000)).to(device=device, dtype=dtype)
         return out
+
+    def to_linear_time(self, coeffs):
+        """coeffs: (..., K) -> raw linear-ns quantile times (..., n_quantile), the PCA-
+        reconstructed quantile function evaluated at self._u_grid, without interpolating
+        onto a fixed CDF grid. Only valid when self._mode is 'quantile' or 'log_quantile'.
+        """
+        if self._mode not in ("log_quantile", "quantile"):
+            raise RuntimeError(f"to_linear_time only valid for quantile/log_quantile mode, got {self._mode!r}")
+        raw = self.reconstruct_aligned_raw(coeffs)
+        if self._mode == "log_quantile":
+            q = torch.pow(10.0, raw) - self._log_quantile_C
+        else:
+            q = raw
+        return q.clamp(min=0.0)
 
     def reconstruct_aligned_raw(self, coeffs):
         """coeffs: (..., K) -> raw PCA output (..., align_window), no post-processing.
@@ -415,18 +344,15 @@ class CompressedPLib:
             out = out.squeeze(0)
         return out
 
-    def reconstruct_waveform(self, vis, coeffs, t0, n_bins=1000):
-        """Unnormalized waveform: vis * pdf. (..., 81), (..., 81, K), (..., 81) -> (..., 81, n_bins)."""
-        cdf = self.reconstruct_cdf(coeffs, t0, n_bins=n_bins)
-        pdf = torch.diff(cdf, dim=-1, prepend=torch.zeros_like(cdf[..., :1]))
-        vis = vis.to(cdf.device)
-        if vis.dim() == cdf.dim() - 1:
-            vis = vis.unsqueeze(-1)
-        return vis * pdf
 
 @DATASETS.register_module()
 class CompressedPLibDataset(Dataset):
-    """Map-style dataset for CompressedPLib. Returns position + target (vis, log_vis, t0, coeffs)."""
+    """Map-style dataset over CompressedPLib: position -> target (v, t0, coeffs[, coeffs_weight, *_grad_frob]).
+
+    v = xform_vis(vis / n_photon), t0 = log(t0), coeffs normalized when normalize_coeffs.
+    meta carries v_linear (raw counts), t0_raw and voxel_id. photonlib.device: cuda or
+    lazy: false preloads every target; otherwise each batch is one HDF5 read per field.
+    """
 
     def __init__(self, cfg, rank=0, world_size=1):
         self.cfg = cfg
@@ -436,11 +362,8 @@ class CompressedPLibDataset(Dataset):
         filepath = plib_cfg.get("filepath")
         lazy = plib_cfg.get("lazy", True)
         n_components = plib_cfg.get("n_components")
-        vis_eps = plib_cfg.get("vis_eps", 1e-6)
-        self._vis_eps = vis_eps
+        self._vis_eps = plib_cfg.get("vis_eps", 1e-6)
         self._n_photon = float(plib_cfg.get("n_photon", 1.0))
-
-        # Device option: "cuda" to preload everything on GPU
         self._device = torch.device(plib_cfg.get("device", "cpu"))
         self._on_gpu = self._device.type == "cuda"
 
@@ -448,138 +371,136 @@ class CompressedPLibDataset(Dataset):
 
         self._normalize_coeffs = bool(plib_cfg.get("normalize_coeffs", False))
         if self._normalize_coeffs:
-            print("[CompressedPLibDataset] computing per-component coeff stats for normalization ...")
-            self._plib.compute_coeff_stats()
+            coeff_weight_power = plib_cfg.get("weight_power", 1)
+            print("[CompressedPLibDataset] computing per-component coeff stats for normalization "
+                  f"(weight_power={coeff_weight_power}) ...")
+            self._plib.compute_coeff_stats(weight_power=coeff_weight_power)
             print(f"  coeff_std range: [{self._plib.coeff_std.min():.4g}, {self._plib.coeff_std.max():.4g}]")
+            print(f"  coeff_weight range: [{self._plib.coeff_weight.min():.4g}, {self._plib.coeff_weight.max():.4g}]")
 
-        xform_cfg = cfg.get("transform_vis", {})
-        self._xform_vis, self._inv_xform_vis = partial_xform_vis(xform_cfg)
+        self._xform_vis, self._inv_xform_vis = partial_xform_vis(cfg.get("transform_vis", {}))
 
-        data_cfg = cfg.get("data", {})
-        total_voxels = len(self._plib)
-        max_len = data_cfg.get("max_len", -1)
-        if max_len is None or max_len < 0:
-            max_len = total_voxels
-        effective = min(total_voxels, max_len)
-        subsample_factor = data_cfg.get("subsample_factor", 1)
-        if subsample_factor > 1:
-            all_idx = torch.arange(effective, dtype=torch.long)
-            indices = all_idx[::subsample_factor]
-        else:
-            indices = torch.arange(effective, dtype=torch.long)
+        self.indices = select_voxel_indices(
+            cfg.get("data", {}), len(self._plib), self._plib.pos, rank, "CompressedPLibDataset")
 
-        self.indices = indices
+        train_cfg = cfg.get("train", {})
+        self._grad_keys = [k for k in train_cfg.get("grad_supervision_keys", []) if k in ("v", "coeffs")]
+        self._grad_opts = grad_target_options(train_cfg)
+        if self._grad_keys:
+            self._grad_targets = precompute_grad_targets(
+                self._plib, self.indices.numpy(), self._grad_keys, "coeffs",
+                self._read_v, self._read_coeffs, self._plib._n_components,
+                train_cfg, self._grad_opts, self._grad_cache_meta(), self._n_photon,
+                "CompressedPLibDataset",
+            )
 
-        # Precompute all targets on device (GPU or CPU)
         if self._on_gpu or not lazy:
             self._precompute_targets()
 
-    def _precompute_targets(self):
-        """Precompute and store all transformed targets on self._device."""
-        idx = self.indices.numpy()
-        pos_np = self._plib.pos[idx]
-        self._pos = torch.from_numpy(pos_np).float().to(self._device)
+    def _grad_cache_meta(self):
+        """Every config choice the cached gradient targets depend on (a mismatch recomputes them)."""
+        from sirentv.utils.misc import GRAD_CACHE_FORMAT_VERSION
 
-        data = self._plib[idx]
+        xform_cfg = self.cfg.get("transform_vis", {})
+        plib_cfg = self.cfg.get("compressed_plib", self.cfg.get("photonlib", {}))
+        return {
+            "format_version": GRAD_CACHE_FORMAT_VERSION,
+            "lut_filepath": plib_cfg.get("filepath"),
+            "total_voxels": len(self._plib),
+            "n_photon": self._n_photon,
+            "xform_vmax": xform_cfg.get("vmax", 1.0),
+            "xform_eps": xform_cfg.get("eps", 1e-8),
+            "xform_sin_out": xform_cfg.get("sin_out", False),
+            "normalize_coeffs": self._normalize_coeffs,
+            "coeff_weight_power": plib_cfg.get("weight_power", 1) if self._normalize_coeffs else None,
+            "n_components": self._plib._n_components,
+            "n_projections": self._grad_opts["n_projections"],
+            "seed": 0,
+        }
+
+    def _read_v(self, rows):
+        vis_norm = self._plib[rows]["vis"].float() / self._n_photon
+        return self._xform_vis(vis_norm).numpy()[:, :, None]  # (chunk, n_pmt, 1)
+
+    def _read_coeffs(self, rows):
+        coeffs = self._plib[rows]["coeffs"].float()
+        if self._normalize_coeffs:
+            coeffs = self._plib.normalize_coeffs(coeffs)
+        # invalid pairs are already masked out of the finite difference; this keeps NaN out of logs
+        return torch.nan_to_num(coeffs, nan=0.0).numpy()  # (chunk, n_pmt, K)
+
+    def _targets(self, data):
+        """Raw LUT fields -> (v, t0, coeffs) in the network's target domain."""
         vis_raw = data["vis"].float()
         t0_raw = data["t0"].float()
         coeffs = data["coeffs"].float()
-
-        vis_norm = vis_raw / self._n_photon
-        v = self._xform_vis(vis_norm)
-        t0 = torch.log(t0_raw.clamp(min=1e-3))
-
         if self._normalize_coeffs:
             coeffs = self._plib.normalize_coeffs(coeffs)
+        v = self._xform_vis(vis_raw / self._n_photon)
+        t0 = torch.log(t0_raw.clamp(min=1e-3))
+        return vis_raw, t0_raw, v, t0, coeffs
 
+    def _precompute_targets(self):
+        """Store every transformed target on self._device."""
+        idx = self.indices.numpy()
+        self._pos = torch.from_numpy(self._plib.pos[idx]).float().to(self._device)
+        vis_raw, t0_raw, v, t0, coeffs = self._targets(self._plib[idx])
         self._v = v.to(self._device)
         self._t0 = t0.to(self._device)
         self._coeffs = coeffs.to(self._device)
         self._vis_raw = vis_raw.to(self._device)
         self._t0_raw = t0_raw.to(self._device)
-
-        # Free the underlying plib data
         self._plib.close()
         print(f"[CompressedPLibDataset] precomputed {len(self.indices)} voxels on {self._device}")
 
     def __len__(self):
         return len(self.indices)
 
-    def __getitem__(self, idx):
-        if hasattr(self, "_v"):
-            # Precomputed path (GPU or eager CPU)
-            return {
-                "position": self._pos[idx],
-                "target": {
-                    "v": self._v[idx],
-                    "t0": self._t0[idx],
-                    "coeffs": self._coeffs[idx],
-                },
-                "meta": {
-                    "v_linear": self._vis_raw[idx],
-                    "t0_raw": self._t0_raw[idx],
-                },
-            }
+    def _coeffs_weight(self):
+        # (1, K) per-component loss weight, broadcasts against the collated (B, n_pmt, K)
+        return self._plib.coeff_weight.unsqueeze(0).cpu() if self._normalize_coeffs else None
 
-        # Lazy CPU path
-        vox_id = self.indices[idx].item()
-        pos = torch.from_numpy(self._plib.pos[vox_id]).float()
-        data = self._plib[vox_id]
-        vis_raw = data["vis"].float()
-        t0_raw = data["t0"].float()
-        coeffs = data["coeffs"].float()
-
-        if self._normalize_coeffs:
-            coeffs = self._plib.normalize_coeffs(coeffs)
-
-        vis_norm = vis_raw / self._n_photon
-        v = self._xform_vis(vis_norm)
-        t0 = torch.log(t0_raw.clamp(min=1e-3))
-
+    def _sample(self, pos, v, t0, coeffs, vis_raw, t0_raw, voxel_id, grads, coeffs_weight):
+        target = {"v": v, "t0": t0, "coeffs": coeffs}
+        if coeffs_weight is not None:
+            target["coeffs_weight"] = coeffs_weight
+        for key in self._grad_keys:
+            target[f"{key}_grad_frob"] = grads[key]
         return {
             "position": pos,
-            "target": {
-                "v": v,
-                "t0": t0,
-                "coeffs": coeffs,
-            },
-            "meta": {
-                "v_linear": vis_raw,
-                "t0_raw": t0_raw,
-            },
+            "target": target,
+            "meta": {"v_linear": vis_raw, "t0_raw": t0_raw, "voxel_id": voxel_id},
         }
 
+    def __getitem__(self, idx):
+        if hasattr(self, "_v"):
+            return self._sample(
+                self._pos[idx], self._v[idx], self._t0[idx], self._coeffs[idx],
+                self._vis_raw[idx], self._t0_raw[idx], self.indices[idx],
+                {k: self._grad_targets[k][idx] for k in self._grad_keys}, self._coeffs_weight(),
+            )
+        vox_id = self.indices[idx].item()
+        pos = torch.from_numpy(self._plib.pos[vox_id]).float()
+        vis_raw, t0_raw, v, t0, coeffs = self._targets(self._plib[vox_id])
+        return self._sample(pos, v, t0, coeffs, vis_raw, t0_raw, self.indices[idx],
+                            {k: self._grad_targets[k][idx] for k in self._grad_keys}, self._coeffs_weight())
 
-def create_compressed_dataloader(cfg, rank=0, world_size=1):
-    """Create DataLoader for CompressedPLibDataset."""
-    dataset = CompressedPLibDataset(cfg, rank=rank, world_size=world_size)
-    loader_cfg = cfg.get("data", {}).get("loader", {})
-    batch_size = loader_cfg.get("batch_size", 1)
-    num_workers = loader_cfg.get("num_workers", 0)
-    pin_memory = loader_cfg.get("pin_memory", False)
-    drop_last = loader_cfg.get("drop_last", True)
-    shuffle = loader_cfg.get("shuffle", False)
+    def __getitems__(self, indices):
+        """A whole batch with ONE HDF5 read per field (torch >= 2.0 calls this instead of
+        per-index __getitem__). Per-voxel reads of the contiguous coeffs are latency-bound
+        (~11 MB/s measured); one multi-row selection reaches ~1.2 GB/s. Sampling is unchanged."""
+        if hasattr(self, "_v"):
+            return [self[i] for i in indices]
 
-    # GPU data requires num_workers=0 (workers can't access GPU tensors)
-    if dataset._on_gpu:
-        if num_workers > 0:
-            print("[create_compressed_dataloader] forcing num_workers=0 for GPU data")
-        num_workers = 0
-        pin_memory = False
-    sampler = None
-    if world_size > 1:
-        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=shuffle)
-        shuffle = False
-    dl = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        sampler=sampler,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        drop_last=drop_last,
-        persistent_workers=True if num_workers > 0 else False,
-    )
-    if sampler is not None:
-        dl.set_epoch = lambda e: sampler.set_epoch(e)
-    return dl
+        idx = np.asarray(indices)
+        # CompressedPLib sorts/deduplicates the ids for h5py
+        vox = self.indices[torch.as_tensor(idx, dtype=torch.long)].numpy()
+        vis_raw, t0_raw, v, t0, coeffs = self._targets(self._plib[vox])  # (B, n_pmt[, K])
+        pos = torch.from_numpy(self._plib.pos[vox]).float()
+        coeffs_weight = self._coeffs_weight()
+        grads = {k: self._grad_targets[k][idx] for k in self._grad_keys}
+        return [
+            self._sample(pos[j], v[j], t0[j], coeffs[j], vis_raw[j], t0_raw[j], self.indices[idx[j]],
+                         {k: g[j] for k, g in grads.items()}, coeffs_weight)
+            for j in range(idx.shape[0])
+        ]
