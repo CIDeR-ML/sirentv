@@ -16,6 +16,9 @@ import torch
 MAX_REPORT = 20
 # outputs removed on purpose by the refactor: (parent key, key) present only in A
 REMOVED = {("visibility_per_pmt", "std")}
+# run metadata, not numerics: skipped whether missing on either side or different
+# (older checkpoints have no model_cfg["ckpt_file"]; resumed runs point it at another path)
+IGNORED = {("model_cfg", "ckpt_file")}
 
 
 def same_tensor(a, b):
@@ -40,12 +43,13 @@ def diff(a, b, path, out):
             out.append(f"{path}: ndarray differs")
     elif isinstance(a, dict):
         parent = path.rsplit("[", 1)[-1].strip("]'") if path else ""
-        only_a = {k for k in a.keys() - b.keys() if (parent, k) not in REMOVED}
-        only_b = b.keys() - a.keys()
+        skip = lambda k: (parent, k) in IGNORED
+        only_a = {k for k in a.keys() - b.keys() if (parent, k) not in REMOVED and not skip(k)}
+        only_b = {k for k in b.keys() - a.keys() if not skip(k)}
         if only_a or only_b:
             out.append(f"{path}: keys differ, only A {sorted(map(str, only_a))}, "
                        f"only B {sorted(map(str, only_b))}")
-        for k in a.keys() & b.keys():
+        for k in {k for k in a.keys() & b.keys() if not skip(k)}:
             diff(a[k], b[k], f"{path}[{k!r}]", out)
     elif isinstance(a, (list, tuple)):
         if len(a) != len(b):
