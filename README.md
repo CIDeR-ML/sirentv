@@ -40,7 +40,21 @@ torchrun --nproc_per_node=4 sirentv/eval/eval.py --config config/eval_q3_t0align
 
 ## Running jobs on NERSC and S3DF
 
-`sirentv/scripts/submit_nersc.sh` (Perlmutter) and `sirentv/scripts/submit_s3df.sh` are minimal Slurm scripts: one task per GPU on 2 nodes x 4 GPUs, the 8-rank shape the reference configs assume (global batch 4096, memory shard per rank). Set `#SBATCH --account` in the script first, then submit from the repository root. Everything after the config is passed to the module, and `MODULE=sirentv.eval.eval` runs the evaluator instead of training.
+`sirentv/scripts/submit_nersc.sh` (Perlmutter) and `sirentv/scripts/submit_s3df.sh` are minimal Slurm scripts: one task per GPU on 2 nodes x 4 GPUs, the 8-rank shape the reference configs assume (global batch 4096, memory shard per rank). They run inside the `deeplearnphysics/larcv2:ub2204-cu121-torch251-larndsim` image (CUDA 12.1, torch 2.5.1). Install the three packages once into your user site from inside that image, from the directory holding the three clones (the image already has torch, so pip adds only what is missing, such as wandb):
+
+```bash
+# NERSC
+shifterimg pull deeplearnphysics/larcv2:ub2204-cu121-torch251-larndsim
+shifter --image=deeplearnphysics/larcv2:ub2204-cu121-torch251-larndsim \
+    pip install --user -e photonlib -e siren-lartpc -e sirentv
+
+# S3DF: build a .sif once, then point IMAGE at it when submitting
+singularity pull larcv2.sif docker://deeplearnphysics/larcv2:ub2204-cu121-torch251-larndsim
+singularity exec larcv2.sif pip install --user -e photonlib -e siren-lartpc -e sirentv
+export IMAGE=$PWD/larcv2.sif
+```
+
+Set `#SBATCH --account` in the script first, then submit from the repository root. Everything after the config is passed to the module, and `MODULE=sirentv.eval.eval` runs the evaluator instead of training.
 
 ```bash
 # NERSC Perlmutter
